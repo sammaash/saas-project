@@ -1,0 +1,13 @@
+# Multi-tenant SaaS platform — Python requirements (Phase 1).
+#
+# Phase 1 ships the database foundation, access layer and tests only. No web framework, no
+# WhatsApp client and no payment integration are included yet.
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# The [binary] extra ships a bundled libpq, so no separate PostgreSQL client install is
+# needed on Windows, macOS or Linux. Use plain `psycopg` if the system already provides
+# libpq.
+
+psycopg[binary]>=3.1
