@@ -30,7 +30,7 @@ particular one. The first business onboarded simply happens to be the first row.
 
 | Area | Where |
 |---|---|
-| Schema migrations (7 tables) | `db/migrations/` |
+| Schema migrations (7 tables, hardening and provisioning included) | `db/migrations/` |
 | RLS policies | `db/migrations/0011_rls_policies.sql` |
 | Least-privilege grants | `db/migrations/0012_grants.sql` |
 | Tenant context (server-side scoping) | `saas/tenant_context.py` |
@@ -104,10 +104,11 @@ continue if an applied file changes. Add a new migration instead.
 
 `--include-local` applies `db/local/`, which gives `app_backend` a **development-only**
 LOGIN so the tests can connect as the real application role. Never apply it to a shared or
-production database. To start over:
+production database. Reset is restricted to localhost/loopback URLs and requires explicit
+confirmation. To start over:
 
 ```bash
-python db/run_migrations.py --reset --include-local --seed   # DESTRUCTIVE
+python db/run_migrations.py --reset --i-am-sure --include-local --seed
 ```
 
 ### 5. Test
@@ -116,7 +117,9 @@ python db/run_migrations.py --reset --include-local --seed   # DESTRUCTIVE
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Expected: **39 tests, OK**. Tests skip automatically when no database is configured.
+Expected: **56 tests, OK (0 skipped).** Tests skip automatically when no database is configured
+for local convenience. CI requires `SAAS_TEST_DATABASE_URL`, fails if no SaaS tests execute,
+and fails if any SaaS test skips.
 
 ## Layout
 

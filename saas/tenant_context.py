@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 from typing import Any, Iterator
 
+from .config import TENANT_CONTEXT_SETTING
 from .db import connect
 
 # set_config(name, value, is_local) is the parameterised equivalent of SET LOCAL:
@@ -23,7 +24,7 @@ from .db import connect
 # A session-level setting would survive the end of the transaction and leak into the next
 # request served by the same pooled connection -- potentially another tenant's. The
 # transaction-local form is therefore the only form used anywhere in this codebase.
-SET_TENANT_CONTEXT_SQL = "select set_config('app.tenant_id', %s, true)"
+SET_TENANT_CONTEXT_SQL = "select set_config(%s, %s, true)"
 
 
 @contextlib.contextmanager
@@ -41,7 +42,9 @@ def tenant_transaction(tenant_id: str | None, url: str | None = None) -> Iterato
     conn = connect(url)
     try:
         with conn.cursor() as cursor:
-            cursor.execute(SET_TENANT_CONTEXT_SQL, (str(tenant_id),))
+            cursor.execute(
+                SET_TENANT_CONTEXT_SQL, (TENANT_CONTEXT_SETTING, str(tenant_id))
+            )
             # Inside this transaction app.current_tenant_id() returns the value above, so
             # every RLS policy is filtered to this tenant for the rest of the block.
             yield cursor

@@ -15,7 +15,7 @@ import os
 # The role the backend connects as for tenant-scoped queries. It must never be the table
 # owner and must never be Supabase's service_role, because service_role BYPASSES RLS and
 # would make every policy in db/migrations/0011 decorative.
-DEFAULT_APP_ROLE = "app_backend"
+APP_DB_ROLE = "app_backend"
 
 # The setting that carries tenant context. Read by app.current_tenant_id().
 TENANT_CONTEXT_SETTING = "app.tenant_id"
@@ -47,5 +47,5 @@ def require_database_url() -> str:
 
 
 def app_db_role() -> str:
-    """Role name the backend is expected to be using (informational/diagnostic)."""
-    return os.getenv("SAAS_APP_DB_ROLE", DEFAULT_APP_ROLE)
+    """The fixed role required for tenant-scoped SaaS connections."""
+    return APP_DB_ROLE

@@ -19,6 +19,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
@@ -43,7 +44,7 @@ def _psycopg():
     except ModuleNotFoundError:  # pragma: no cover - developer feedback path
         sys.exit(
             "psycopg is not installed. Install the SaaS/development requirements first:\n"
-            "    pip install -r requirements-saas.txt"
+            "    pip install -r requirements.txt"
         )
     return psycopg
 
@@ -169,7 +170,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="DESTRUCTIVE: drop the public and app schemas first (development only)",
+        help="DESTRUCTIVE: drop the public and app schemas first (localhost only)",
+    )
+    parser.add_argument(
+        "--i-am-sure",
+        action="store_true",
+        help="required confirmation for --reset; still restricted to localhost databases",
     )
     parser.add_argument(
         "--status", action="store_true", help="show applied and pending migrations"
@@ -179,11 +185,28 @@ def main(argv: list[str] | None = None) -> int:
     if not args.database_url:
         parser.error("set SAAS_DATABASE_URL or pass --database-url")
 
+    if args.reset and not args.i_am_sure:
+        parser.error("--reset requires the explicit confirmation flag --i-am-sure")
+    if args.reset:
+        try:
+            database_url = urlsplit(args.database_url)
+            hostname = database_url.hostname
+        except ValueError:
+            hostname = None
+        if hostname is None:
+            parser.error("--reset requires a valid localhost database URL")
+        if database_url.query or database_url.fragment:
+            parser.error("--reset refuses URL parameters or fragments that could override the host")
+        if "supabase" in hostname.lower():
+            parser.error("--reset is forbidden for Supabase URLs")
+        if hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+            parser.error("--reset is restricted to localhost/loopback database URLs")
+
     psycopg = _psycopg()
 
     with psycopg.connect(args.database_url) as conn:
         if args.reset:
-            print("!! --reset: dropping schemas public and app (development only)")
+            print("!! --reset: dropping schemas public and app (localhost only)")
             _run_script(
                 conn,
                 "drop schema if exists public cascade; "
