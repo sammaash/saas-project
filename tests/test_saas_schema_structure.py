@@ -36,8 +36,8 @@ except ImportError:  # discovery inside the tests directory
         SaasDatabaseTestCase,
     )
 
-# Every table created in Phase 1.
-PHASE_1_TABLES = (
+# Every table created through the Phase 2 catalogue foundation.
+PLATFORM_TABLES = (
     "tenants",
     "tenant_channels",
     "tenant_users",
@@ -45,6 +45,8 @@ PHASE_1_TABLES = (
     "plans",
     "subscriptions",
     "audit_log",
+    "products",
+    "product_variants",
 )
 
 # Tables that carry a tenant identity in a column named tenant_id. `tenants` is excluded
@@ -68,9 +70,9 @@ APPLICATION_ROLES = ("app_backend", "authenticated")
 
 
 class RlsConfigurationTests(SaasDatabaseTestCase):
-    """Requirement 9: RLS is enabled on every Phase 1 table."""
+    """RLS is enabled on every platform table."""
 
-    def test_rls_is_enabled_on_every_phase_1_table(self):
+    def test_rls_is_enabled_on_every_platform_table(self):
         with self.superuser() as cursor:
             cursor.execute(
                 """
@@ -81,12 +83,12 @@ class RlsConfigurationTests(SaasDatabaseTestCase):
                    and c.relkind = 'r'
                    and c.relname = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             rows = dict(cursor.fetchall())
 
-        missing = [table for table in PHASE_1_TABLES if table not in rows]
-        self.assertEqual(missing, [], f"Phase 1 tables missing from the database: {missing}")
+        missing = [table for table in PLATFORM_TABLES if table not in rows]
+        self.assertEqual(missing, [], f"Platform tables missing from the database: {missing}")
 
         not_enabled = [table for table, enabled in rows.items() if not enabled]
         self.assertEqual(not_enabled, [], f"RLS is not enabled on: {not_enabled}")
@@ -106,11 +108,11 @@ class RlsForceTests(SaasDatabaseTestCase):
                    and c.relkind = 'r'
                    and c.relname = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             forced = {table for table, is_forced in cursor.fetchall() if is_forced}
 
-        expected_forced = set(PHASE_1_TABLES) - set(NOT_FORCED_BY_DESIGN)
+        expected_forced = set(PLATFORM_TABLES) - set(NOT_FORCED_BY_DESIGN)
         self.assertEqual(
             forced,
             expected_forced,
@@ -141,6 +143,31 @@ class RlsForceTests(SaasDatabaseTestCase):
 
 class TenantIdColumnTests(SaasDatabaseTestCase):
     """Requirement 11: tenant_id exists and is NOT NULL on every tenant-owned table."""
+
+    def test_declared_inventory_matches_every_public_tenant_id_column(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                """
+                select table_name, column_name
+                  from information_schema.columns
+                 where table_schema = 'public'
+                   and column_name = 'tenant_id'
+                """
+            )
+            actual = dict(cursor.fetchall())
+
+        declared = {
+            table: column
+            for table, column in TENANT_SCOPED_TABLES
+            if column == "tenant_id"
+        }
+        self.assertEqual(
+            actual,
+            declared,
+            "Every public table with tenant_id must be explicitly listed in "
+            "TENANT_SCOPED_TABLES in tests/saas_test_support.py; update the isolation "
+            "inventory and associated policy/coverage expectations.",
+        )
 
     def test_tenant_id_exists_and_is_not_null_on_every_tenant_owned_table(self):
         with self.superuser() as cursor:
@@ -266,6 +293,45 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
         self.assertFalse(is_super, "app_backend must not be a superuser")
         self.assertFalse(bypasses, "app_backend must not have BYPASSRLS")
 
+    def test_platform_api_role_only_has_the_provisioning_function(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select has_function_privilege("
+                "'saas_platform_admin', "
+                "'app.provision_tenant(text,text,uuid,text,text,uuid)', 'EXECUTE')"
+            )
+            self.assertTrue(cursor.fetchone()[0])
+
+            cursor.execute(
+                """
+                select table_name, privilege_type
+                  from information_schema.role_table_grants
+                 where table_schema = 'public'
+                   and grantee = 'saas_platform_admin'
+                """
+            )
+            self.assertEqual(
+                cursor.fetchall(),
+                [],
+                "The platform API role must use the provisioning function, not direct table grants.",
+            )
+
+            cursor.execute(
+                "select rolcanlogin, rolsuper, rolbypassrls, rolinherit "
+                "from pg_roles where rolname = 'saas_platform_admin'"
+            )
+            self.assertEqual(cursor.fetchone(), (True, False, False, False))
+
+    def test_subscriptions_have_a_plan_lookup_index(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select indexdef from pg_indexes "
+                "where schemaname = 'public' and indexname = 'subscriptions_plan_idx'"
+            )
+            row = cursor.fetchone()
+        self.assertIsNotNone(row, "subscriptions(plan_id) needs a lookup index")
+        self.assertIn("(plan_id)", row[0])
+
     def test_append_only_tables_have_no_update_or_delete_grants(self):
         with self.superuser() as cursor:
             cursor.execute(
@@ -288,7 +354,7 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
                         f"{grantee} must not hold {privilege} on an append-only table",
                     )
 
-    def test_anon_has_no_privileges_on_phase_1_tables(self):
+    def test_anon_has_no_privileges_on_platform_tables(self):
         with self.superuser() as cursor:
             cursor.execute(
                 """
@@ -298,7 +364,7 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
                    and grantee = 'anon'
                    and table_name = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             self.assertEqual(
                 cursor.fetchall(), [], "anon must have no access to platform tables"

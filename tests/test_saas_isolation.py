@@ -16,13 +16,15 @@ existing unittest discovery run stays green on machines without a database.
 
 from __future__ import annotations
 
+import json
 import unittest
-import urllib.parse
 
 try:  # `tests` is a package when run as `python -m unittest tests.test_...`
     from .saas_test_support import (
         OUTSIDER_USER_ID,
+        INVITED_USER_ID,
         PLAN_ID,
+        SECONDARY_OWNER_USER_ID,
         TENANT_ONE_CHANNEL_ID,
         TENANT_ONE_ID,
         TENANT_ONE_NAME,
@@ -34,13 +36,16 @@ try:  # `tests` is a package when run as `python -m unittest tests.test_...`
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
         TENANT_TWO_PHONE_NUMBER_ID,
+        app_backend_test_url,
         SaasDatabaseTestCase,
         test_database_url,
     )
 except ImportError:  # ...and a plain directory under `discover -s tests`
     from saas_test_support import (  # type: ignore[no-redef]
         OUTSIDER_USER_ID,
+        INVITED_USER_ID,
         PLAN_ID,
+        SECONDARY_OWNER_USER_ID,
         TENANT_ONE_CHANNEL_ID,
         TENANT_ONE_ID,
         TENANT_ONE_NAME,
@@ -52,6 +57,7 @@ except ImportError:  # ...and a plain directory under `discover -s tests`
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
         TENANT_TWO_PHONE_NUMBER_ID,
+        app_backend_test_url,
         SaasDatabaseTestCase,
         test_database_url,
     )
@@ -81,21 +87,7 @@ def _app_backend_url() -> str | None:
     role that is subject to RLS) and scope the transaction with set_config. Requires
     db/local/0001_local_app_backend_login.sql, which is development/CI only.
     """
-    base = test_database_url()
-    if not base:
-        return None
-
-    parts = urllib.parse.urlsplit(base)
-    if not parts.hostname:
-        return None
-
-    netloc = f"app_backend:dev_app_backend_password@{parts.hostname}"
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
-
-    return urllib.parse.urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-    )
+    return app_backend_test_url()
 
 
 class TenantIsolationTests(SaasDatabaseTestCase):
@@ -110,6 +102,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "tenant_settings": 1,
             "subscriptions": 1,
             "audit_log": 1,  # tenant row only; the platform row must not appear
+            "products": 11,
+            "product_variants": 33,
         }
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute("select name, slug from public.tenants")
@@ -130,6 +124,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "tenant_settings": 1,
             "subscriptions": 1,
             "audit_log": 0,  # none seeded for tenant 002; tenant 001's row stays invisible
+            "products": 0,
+            "product_variants": 0,
         }
         with self.user(TENANT_TWO_OWNER_USER_ID) as cursor:
             cursor.execute("select name from public.tenants")
@@ -274,6 +270,36 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             )
             self.assertEqual(cursor.rowcount, 0)
 
+    def test_invited_member_cannot_read_tenant_data(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "insert into public.tenant_users (tenant_id, user_id, role, status) "
+                "values (%s, %s, 'staff', 'invited')",
+                (TENANT_ONE_ID, INVITED_USER_ID),
+            )
+            cursor.execute("set local role authenticated")
+            cursor.execute(
+                "select set_config('request.jwt.claims', %s, true)",
+                (json.dumps({"sub": INVITED_USER_ID}),),
+            )
+            cursor.execute("select app.is_tenant_member(%s)", (TENANT_ONE_ID,))
+            self.assertFalse(cursor.fetchone()[0])
+            for table in ("tenants", "tenant_channels", "tenant_settings", "subscriptions"):
+                with self.subTest(table=table):
+                    cursor.execute(f"select count(*) from public.{table}")
+                    self.assertEqual(cursor.fetchone()[0], 0)
+
+            cursor.execute("select status from public.tenant_users")
+            self.assertEqual(cursor.fetchall(), [("invited",)])
+
+    def test_owner_cannot_move_a_row_to_another_tenant(self):
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "update public.tenant_channels set tenant_id = %s where id = %s",
+                    (TENANT_TWO_ID, TENANT_ONE_CHANNEL_ID),
+                )
+
     def test_outsider_sees_nothing_at_all(self):
         with self.user(OUTSIDER_USER_ID) as cursor:
             for table, _tenant_column in TENANT_SCOPED_TABLES:
@@ -296,11 +322,15 @@ class RoutingTests(SaasDatabaseTestCase):
         from saas import routing
 
         self.assertEqual(
-            routing.resolve_tenant_id_by_phone_number_id(TENANT_ONE_PHONE_NUMBER_ID),
+            routing.resolve_tenant_id_by_phone_number_id(
+                TENANT_ONE_PHONE_NUMBER_ID, _app_backend_url()
+            ),
             TENANT_ONE_ID,
         )
         self.assertEqual(
-            routing.resolve_tenant_id_by_phone_number_id(TENANT_TWO_PHONE_NUMBER_ID),
+            routing.resolve_tenant_id_by_phone_number_id(
+                TENANT_TWO_PHONE_NUMBER_ID, _app_backend_url()
+            ),
             TENANT_TWO_ID,
         )
 
@@ -310,7 +340,9 @@ class RoutingTests(SaasDatabaseTestCase):
         self.assertIsNone(routing.resolve_tenant_id_by_phone_number_id(None))
         self.assertIsNone(routing.resolve_tenant_id_by_phone_number_id(""))
         self.assertIsNone(
-            routing.resolve_tenant_id_by_phone_number_id("dev-phone-id-not-onboarded-999")
+            routing.resolve_tenant_id_by_phone_number_id(
+                "dev-phone-id-not-onboarded-999", _app_backend_url()
+            )
         )
 
     def test_routing_returns_none_for_a_disabled_channel(self):
@@ -340,7 +372,9 @@ class RoutingTests(SaasDatabaseTestCase):
                 "update public.tenants set status = 'suspended' where id = %s", (TENANT_TWO_ID,)
             )
             self.assertEqual(
-                routing.resolve_tenant_id_by_phone_number_id(TENANT_TWO_PHONE_NUMBER_ID),
+                routing.resolve_tenant_id_by_phone_number_id(
+                    TENANT_TWO_PHONE_NUMBER_ID, _app_backend_url()
+                ),
                 TENANT_TWO_ID,
             )
 
@@ -395,6 +429,127 @@ class ConstraintTests(SaasDatabaseTestCase):
                 (TENANT_ONE_ID, PLAN_ID),
             )
             self.assertEqual(cursor.rowcount, 1)
+
+    def test_multiple_active_owners_can_be_reduced_to_one(self):
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
+            cursor.execute(
+                "insert into public.tenant_users (tenant_id, user_id, role, status) "
+                "values (%s, %s, 'owner', 'active')",
+                (TENANT_ONE_ID, SECONDARY_OWNER_USER_ID),
+            )
+            cursor.execute(
+                "delete from public.tenant_users where tenant_id = %s and user_id = %s",
+                (TENANT_ONE_ID, SECONDARY_OWNER_USER_ID),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            cursor.execute(
+                "select count(*) from public.tenant_users "
+                "where tenant_id = %s and role = 'owner' and status = 'active'",
+                (TENANT_ONE_ID,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_final_active_owner_cannot_be_removed_or_demoted(self):
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
+            with self.assertRaises(Exception) as caught:
+                cursor.execute(
+                    "delete from public.tenant_users where tenant_id = %s and user_id = %s",
+                    (TENANT_ONE_ID, TENANT_ONE_OWNER_USER_ID),
+                )
+            self.assertEqual(getattr(caught.exception, "sqlstate", None), "23514")
+
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
+            with self.assertRaises(Exception) as caught:
+                cursor.execute(
+                    "update public.tenant_users set status = 'disabled' "
+                    "where tenant_id = %s and user_id = %s",
+                    (TENANT_ONE_ID, TENANT_ONE_OWNER_USER_ID),
+                )
+            self.assertEqual(getattr(caught.exception, "sqlstate", None), "23514")
+
+    def test_inactive_plan_is_hidden_from_users_but_resolvable_by_backend(self):
+        with self.superuser() as cursor:
+            cursor.execute("update public.plans set is_active = false where id = %s", (PLAN_ID,))
+            cursor.execute("set local role authenticated")
+            cursor.execute(
+                "select set_config('request.jwt.claims', %s, true)",
+                (json.dumps({"sub": TENANT_ONE_OWNER_USER_ID}),),
+            )
+            cursor.execute("select id from public.plans where id = %s", (PLAN_ID,))
+            self.assertEqual(cursor.fetchall(), [])
+
+            cursor.execute("reset role")
+            cursor.execute("set local role app_backend")
+            cursor.execute("select set_config('app.tenant_id', %s, true)", (TENANT_ONE_ID,))
+            cursor.execute(
+                "select p.code from public.subscriptions s "
+                "join public.plans p on p.id = s.plan_id where s.tenant_id = %s",
+                (TENANT_ONE_ID,),
+            )
+            self.assertEqual(cursor.fetchall(), [("starter",)])
+
+    def test_platform_provisioning_creates_tenant_owner_settings_and_audit_atomically(self):
+        owner_id = "dddddddd-0000-4000-8000-000000000001"
+        with self.superuser() as cursor:
+            cursor.execute("set local role saas_platform_admin")
+            cursor.execute(
+                "select app.provision_tenant(%s, %s, %s, %s, %s, %s)",
+                ("Provisioned Test", "provisioned-test", owner_id, "Africa/Nairobi", "KES", PLAN_ID),
+            )
+            tenant_id = cursor.fetchone()[0]
+
+            cursor.execute("reset role")
+            cursor.execute("select name from public.tenants where id = %s", (tenant_id,))
+            self.assertEqual(cursor.fetchone(), ("Provisioned Test",))
+            cursor.execute(
+                "select role, status from public.tenant_users "
+                "where tenant_id = %s and user_id = %s",
+                (tenant_id, owner_id),
+            )
+            self.assertEqual(cursor.fetchone(), ("owner", "active"))
+            cursor.execute("select currency from public.tenant_settings where tenant_id = %s", (tenant_id,))
+            self.assertEqual(cursor.fetchone(), ("KES",))
+            cursor.execute(
+                "select action from public.audit_log "
+                "where tenant_id = %s and action = 'tenant.provisioned'",
+                (tenant_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("tenant.provisioned",))
+            cursor.execute(
+                "select count(*) from public.subscriptions "
+                "where tenant_id = %s and plan_id = %s",
+                (tenant_id, PLAN_ID),
+            )
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_platform_provisioning_rolls_back_everything_on_failure(self):
+        owner_id = "dddddddd-0000-4000-8000-000000000002"
+        with self.superuser() as cursor:
+            cursor.execute("savepoint before_provisioning_failure")
+            cursor.execute("set local role saas_platform_admin")
+            with self.assertRaises(Exception):
+                cursor.execute(
+                    "select app.provision_tenant(%s, %s, %s, %s, %s, %s)",
+                    (
+                        "Atomic Failure",
+                        "atomic-failure",
+                        owner_id,
+                        "Africa/Nairobi",
+                        "KES",
+                        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    ),
+                )
+            cursor.execute("rollback to savepoint before_provisioning_failure")
+            cursor.execute("select count(*) from public.tenants where slug = 'atomic-failure'")
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_tenant_role_cannot_call_platform_provisioning(self):
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "select app.provision_tenant(%s, %s, %s)",
+                    ("Client Tenant", "client-tenant", TENANT_ONE_OWNER_USER_ID),
+                )
 
 class AuditLogTests(SaasDatabaseTestCase):
     """Append-only audit trail, including platform-level (tenant-less) events."""
@@ -499,6 +654,22 @@ class TenantContextHelperTests(SaasDatabaseTestCase):
                     "db/local/0001_local_app_backend_login.sql first"
                 )
             raise
+
+    def test_database_connection_rejects_superuser_and_accepts_app_backend(self):
+        from saas import db
+
+        with self.assertRaisesRegex(RuntimeError, "expected session and current role"):
+            db.connect(test_database_url())
+
+        url = _app_backend_url()
+        self.assertIsNotNone(url)
+        conn = db.connect(url)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("select current_user, session_user")
+                self.assertEqual(cursor.fetchone(), ("app_backend", "app_backend"))
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

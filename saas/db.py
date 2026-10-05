@@ -1,7 +1,7 @@
 """PostgreSQL connections for the Phase 1 SaaS layer.
 
 psycopg is imported inside functions rather than at module import, so a missing driver
-(or a machine that has never installed ``requirements-saas.txt``) cannot break anything
+(or a machine that has never installed ``requirements.txt``) cannot break anything
 that merely imports this package.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from .config import database_url, require_database_url
+from .config import app_db_role, require_database_url
 
 # Roles this helper will switch to. Restricted to a constant set because SET ROLE cannot
 # be parameterised -- the value is interpolated into SQL, so it must never come from a
@@ -30,10 +30,61 @@ def connect(url: str | None = None) -> Any:
     except ModuleNotFoundError as error:  # pragma: no cover - developer feedback path
         raise RuntimeError(
             "psycopg is not installed. Install the SaaS/development requirements first:\n"
-            "    pip install -r requirements-saas.txt"
+            "    pip install -r requirements.txt"
         ) from error
 
-    return psycopg.connect(url or require_database_url())
+    conn = psycopg.connect(url or require_database_url())
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                                select current_user,
+                                             session_user,
+                                             role.rolsuper,
+                                             role.rolbypassrls,
+                       exists (
+                           select 1
+                                                         from pg_catalog.pg_class relation
+                                                         join pg_catalog.pg_namespace namespace
+                                                             on namespace.oid = relation.relnamespace
+                                                        where namespace.nspname = 'public'
+                                                            and relation.relkind in ('r', 'p')
+                                                            and relation.relowner = role.oid
+                                             ),
+                                             exists (
+                                                         select 1
+                                                             from pg_catalog.pg_roles elevated
+                                                            where (elevated.rolsuper
+                                                                         or elevated.rolbypassrls
+                                                                         or elevated.rolname = 'service_role')
+                                                                and pg_catalog.pg_has_role(
+                                                                        role.oid, elevated.oid, 'MEMBER'
+                                                                )
+                       )
+                  from pg_catalog.pg_roles role
+                 where role.rolname = current_user
+                """
+            )
+            row = cursor.fetchone()
+        if (
+            row is None
+            or row[0] != app_db_role()
+            or row[1] != app_db_role()
+            or row[2]
+            or row[3]
+            or row[4]
+            or row[5]
+        ):
+            actual_role = row[0] if row else "unknown"
+            raise RuntimeError(
+                f"Unsafe SaaS database connection: expected session and current role "
+                f"{app_db_role()!r}, without superuser, BYPASSRLS, public-table ownership, "
+                f"or elevated-role membership; got {actual_role!r}."
+            )
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
 @contextmanager

@@ -2,10 +2,10 @@
 
 A multi-tenant SaaS platform for small businesses that take orders over WhatsApp.
 
-**Status: Phase 1 — platform foundation and isolation layer.** This repository currently
-contains the database foundation, the tenant-scoped access layer and the isolation test
-suite. There is no web application, no WhatsApp integration and no billing yet: those are
-later phases. See [`docs/PHASE_1_SAAS_FOUNDATION.md`](docs/PHASE_1_SAAS_FOUNDATION.md).
+**Status: Phase 1 foundation plus Phase 2 catalogue schema/data-access library.** This
+repository still has no Flask HTTP service, dashboard, WhatsApp runtime, order processing,
+or billing implementation. See [`docs/PHASE_1_SAAS_FOUNDATION.md`](docs/PHASE_1_SAAS_FOUNDATION.md)
+and [`docs/PHASE_2_CATALOGUE_STAGING.md`](docs/PHASE_2_CATALOGUE_STAGING.md).
 
 ---
 
@@ -30,13 +30,13 @@ particular one. The first business onboarded simply happens to be the first row.
 
 | Area | Where |
 |---|---|
-| Schema migrations (7 tables) | `db/migrations/` |
+| Schema migrations (7 tables, hardening and provisioning included) | `db/migrations/` |
 | RLS policies | `db/migrations/0011_rls_policies.sql` |
 | Least-privilege grants | `db/migrations/0012_grants.sql` |
 | Tenant context (server-side scoping) | `saas/tenant_context.py` |
 | Membership + routing helpers | `db/migrations/0010_membership_and_routing_helpers.sql` |
 | Inbound WhatsApp routing abstraction | `saas/routing.py` |
-| Development seed data | `db/seeds/dev_seed.sql` |
+| Development seed data | `db/seeds/0001_dev_seed.sql` |
 | Isolation + structural tests | `tests/` |
 | CI | `.github/workflows/saas-isolation.yml` |
 
@@ -44,6 +44,20 @@ particular one. The first business onboarded simply happens to be the first row.
 
 `tenants`, `tenant_channels`, `tenant_users`, `tenant_settings`, `plans`, `subscriptions`,
 `audit_log`.
+
+Phase 2 adds `products` and `product_variants` as tenant-owned catalogue tables. This
+repository still does not contain a Flask HTTP service, dashboard, WhatsApp runtime, or
+order-processing application; it remains a SaaS database/access foundation and catalogue
+service library.
+
+### Phase 2 catalogue layer
+
+| Area | Where |
+|---|---|
+| Catalogue schema and forced RLS | `db/migrations/0017_catalogue.sql`, `db/migrations/0018_catalogue_rls_and_grants.sql` |
+| Cindy Bakes catalogue-only seed | `db/seeds/0002_cindy_bakes_catalogue.sql` |
+| Tenant-scoped catalogue data service | `saas/catalogue.py` |
+| SaaS staging scope and current runtime boundary | `docs/PHASE_2_CATALOGUE_STAGING.md` |
 
 `plans` is platform-owned and therefore has no `tenant_id`. `audit_log` is append-only and
 its `tenant_id` is nullable, because platform-level events have no tenant.
@@ -104,10 +118,11 @@ continue if an applied file changes. Add a new migration instead.
 
 `--include-local` applies `db/local/`, which gives `app_backend` a **development-only**
 LOGIN so the tests can connect as the real application role. Never apply it to a shared or
-production database. To start over:
+production database. Reset is restricted to localhost/loopback URLs and requires explicit
+confirmation. To start over:
 
 ```bash
-python db/run_migrations.py --reset --include-local --seed   # DESTRUCTIVE
+python db/run_migrations.py --reset --i-am-sure --include-local --seed
 ```
 
 ### 5. Test
@@ -116,7 +131,9 @@ python db/run_migrations.py --reset --include-local --seed   # DESTRUCTIVE
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Expected: **39 tests, OK**. Tests skip automatically when no database is configured.
+Expected: **56 tests, OK (0 skipped).** Tests skip automatically when no database is configured
+for local convenience. CI requires `SAAS_TEST_DATABASE_URL`, fails if no SaaS tests execute,
+and fails if any SaaS test skips.
 
 ## Layout
 

@@ -1,8 +1,9 @@
-# Phase 1 — Multi-Tenant SaaS Foundation
+# SaaS Foundation — Phase 1 Core and Phase 2 Catalogue
 
-**Scope:** the platform foundation and isolation layer only. No catalogue, customer,
-conversation, message, order, payment or usage tables. No dashboard. No billing. No STK
-push. See [§14 What is deliberately NOT in Phase 1](#14-what-is-deliberately-not-in-phase-1).
+**Scope:** Phase 1 tenancy/security foundations plus the Phase 2 tenant-owned catalogue schema
+and database access library. No customer, conversation, message, order, payment or usage
+tables. No Flask HTTP service, dashboard, WhatsApp runtime, billing or STK push. §14 records
+what was excluded from Phase 1 itself.
 
 **Tenancy model:** one shared PostgreSQL schema + `tenant_id` + Row Level Security. Not
 database-per-tenant. Not schema-per-tenant. There is no per-tenant legacy mode and no
@@ -12,19 +13,9 @@ special case: the first business onboarded is a row like any other.
 
 ## Repository context
 
-This repository (`saas-project`) is the **independent, platform-first** home of the SaaS
-platform. Phase 1 was originally built and verified inside a separate application repository
-(`cindy-bakes-website`); this repository holds the extracted, standalone foundation. That
-application repository was left untouched and is not part of this project.
-
-Two sections below are therefore **historical verification records** from that original
-execution, and they name files that live in the application repository rather than here:
-
-- **§2 Files modified** — records that the origin application was left unchanged.
-- **§13 Confirmation** — records that the origin application's SQLite data was never
-  migrated or deleted.
-
-Everything else describes the foundation that ships in *this* repository.
+This repository contains the independent, platform-first SaaS foundation. Its development
+seed includes synthetic fixture data for two tenants; it does not migrate or manage any
+external application's database or production records.
 
 ---
 
@@ -46,6 +37,12 @@ Everything else describes the foundation that ships in *this* repository.
 | `0010_membership_and_routing_helpers.sql` | `app.is_tenant_member()`, `app.is_tenant_owner()`, `app.resolve_tenant_by_phone_number_id()` |
 | `0011_rls_policies.sql` | ENABLE / FORCE RLS and every policy |
 | `0012_grants.sql` | Least-privilege grants; append-only enforcement |
+| `0013_phase1_security_hardening.sql` | Trusted platform provisioning capability, owner protection, inactive-plan lookup, and subscription plan index |
+| `0014_active_membership_and_owner_lock.sql` | Active-only membership predicates and serialized owner removal |
+| `0015_platform_provisioning_login.sql` | Dedicated platform API role (credential configured out of band) |
+| `0016_provisioner_schema_usage.sql` | Explicit schema access for the provisioning function owner |
+| `0017_catalogue.sql` | Tenant-owned products and product variants |
+| `0018_catalogue_rls_and_grants.sql` | Forced RLS and least-privilege catalogue grants |
 
 ### Local / development (`db/local/`, never applied on Supabase)
 
@@ -57,60 +54,37 @@ Everything else describes the foundation that ships in *this* repository.
 
 | File | Contents |
 |---|---|
-| `dev_seed.sql` | Tenant 001 Cindy Bakes, Tenant 002 Test Bakery, channels, memberships, settings, plan, subscriptions, audit rows |
+| `0001_dev_seed.sql` | Tenant 001 Cindy Bakes, Tenant 002 Test Bakery, channels, memberships, settings, plan, subscriptions, audit rows |
+| `0002_cindy_bakes_catalogue.sql` | Cindy Bakes products and variants only; looks up the existing tenant by slug |
 
 ### Tooling, application layer and tests
 
 | File | Contents |
 |---|---|
-| `db/run_migrations.py` | Migration runner (`--include-local`, `--seed`, `--status`, `--reset`) |
+| `db/run_migrations.py` | Migration runner (`--include-local`, `--seed`, `--status`; confirmed localhost-only `--reset`) |
 | `saas/__init__.py` | Package marker + scope note |
 | `saas/config.py` | Environment configuration |
-| `saas/db.py` | PostgreSQL connections, `set_local_role` |
+| `saas/db.py` | PostgreSQL connections; enforces the non-privileged `app_backend` identity |
 | `saas/tenant_context.py` | **Tenant context implementation** |
 | `saas/routing.py` | `phone_number_id` → `tenant_id` routing |
 | `requirements.txt` | `psycopg[binary]` — the PostgreSQL driver |
 | `tests/saas_test_support.py` | Fixtures, identity-switching helpers, base test case |
-| `tests/test_saas_isolation.py` | **Isolation test suite** (requirements 1–8) |
+| `tests/test_saas_isolation.py` | **Isolation and provisioning test suite** |
 | `tests/test_saas_schema_structure.py` | **Structural tests** (requirements 9–11) |
+| `tests/test_saas_migration_runner.py` | Reset safety and migration checksum tests |
 | `.github/workflows/saas-isolation.yml` | CI: Postgres service container → migrate → seed → test |
 | `docs/PHASE_1_SAAS_FOUNDATION.md` | This document |
 
-## 2. Files modified
+## 2. Scope boundary
 
-**None. This is a new, independent repository, so Phase 1 modifies no pre-existing file
-here.** The foundation was extracted into this repository rather than merged into the
-application repository it came from.
-
-Adaptations made while extracting it — all cosmetic or platform-neutral, none affecting
-behaviour or test outcomes:
-
-| File | Adaptation |
-|---|---|
-| `requirements-saas.txt` → `requirements.txt` | Renamed: this is now the platform's own repository, so the standard filename applies. Its comment no longer refers to another project's deployment |
-| `docs/PHASE_1_SAAS_FOUNDATION.md` | Added this repository-context note; corrected filename references |
-| `.github/workflows/saas-isolation.yml` | Trigger branches reduced to `main`; `requirements.txt` path |
-| `db/seeds/dev_seed.sql` | Tenant names kept (the first business onboarded is "Cindy Bakes", by the approved data decision). Placeholder **business-rule values and greeting text were genericised** so no real business's pricing or branding is baked into the platform's seed data |
-| `saas/__init__.py`, `db/run_migrations.py` | Docstrings rewritten to describe this repository instead of the origin application |
-
-No migration, policy, grant, test assertion or helper function was changed: the SQL and the
-test expectations are byte-identical to the verified Phase 1 artefacts.
-
-> **Historical record (origin application).** Phase 1 was originally executed inside the
-> `cindy-bakes-website` application repository with the instruction that its existing SQLite
-> application keep working exactly as before. There, exactly two files were modified
-> additively (`.env.example`, `README.md`) and **no existing Python file was changed** —
-> verified with `git diff --stat HEAD -- '*.py' requirements.txt Procfile railway.toml
-> nixpacks.toml vercel.json templates src`. Untouched there:
-> `whatsapp_webhook.py`, `database.py`, `whatsapp_database.py`, `admin_routes.py`,
-> `admin_dashboard.py`, `agent.py`, `whatsapp_agent_service.py`, `verify_payment.py`,
-> `payment_deadline_job.py`, `notifications.py`, `invoice.py`, `invoice_delivery.py`,
-> `pricing.py`, `catalog.py`, `business_rules.py`, `order.py`, `delivery.py`, `web_chat.py`,
-> `app.py`, and every template.
+This repository contains database migrations, SaaS connection/context/routing helpers,
+the tenant-aware catalogue data service, development seed data, tests, and CI. It does not
+contain a dashboard, Flask HTTP service, WhatsApp runtime, or customer, conversation, order,
+payment, or usage implementation.
 
 ## 3. Database migration files
 
-Twelve migrations, applied in order by `db/run_migrations.py`. They use **only standard
+Eighteen migrations, applied in order by `db/run_migrations.py`. They use **only standard
 PostgreSQL**: no `auth` schema references, no Supabase-specific extensions, no shims. The
 same files run unchanged on local PostgreSQL, in CI and on Supabase.
 
@@ -239,7 +213,8 @@ resolves a tenant from a phone number.
 
 ## 7. Seed data
 
-`db/seeds/dev_seed.sql` — idempotent, deterministic UUIDs, obviously fake identifiers.
+`db/seeds/0001_dev_seed.sql` — idempotent, deterministic UUIDs, obviously fake identifiers.
+`db/seeds/0002_cindy_bakes_catalogue.sql` — idempotent, Cindy Bakes catalogue only.
 
 | | Tenant 001 | Tenant 002 |
 |---|---|---|
@@ -321,16 +296,9 @@ added later without isolation coverage fails the suite rather than slipping thro
 - Grants: `app_backend` is neither superuser nor `BYPASSRLS`; no UPDATE/DELETE grant on
   append-only tables; `anon` has nothing; `tenants` is not writable by dashboard sessions.
 
-**Results obtained on PostgreSQL 16.4:**
-
-```text
-python -m unittest discover -s tests -p "test_saas_*.py"   ->  Ran 39 tests ... OK
-python -m unittest discover -s tests -p "test_*.py"         ->  Ran 8 tests ... OK (skipped=10)
-```
-
-The second line is the existing application suite passing while the ten SaaS test classes
-skip cleanly (no database configured), so a plain `python -m unittest` run on any machine
-stays green.
+Run the full Phase 1 suite against a migrated and seeded PostgreSQL database. The test
+count grows with coverage; CI verifies at least one SaaS test executes and rejects skipped
+SaaS tests.
 
 ## 9. Instructions for running the migrations locally
 
@@ -382,9 +350,10 @@ Expected output of step 7:
 ```text
 apply  0001_extensions_and_helpers.sql
 ...
-apply  0012_grants.sql
+apply  0018_catalogue_rls_and_grants.sql
 local  0001_local_app_backend_login.sql
-seed   dev_seed.sql
+seed   0001_dev_seed.sql
+seed   0002_cindy_bakes_catalogue.sql
 migrations complete
 ```
 
@@ -395,12 +364,12 @@ re-applied each time.
 To start over from scratch:
 
 ```powershell
-python db/run_migrations.py --reset --include-local --seed    # DESTRUCTIVE: drops public + app
+python db/run_migrations.py --reset --i-am-sure --include-local --seed    # localhost only
 ```
 
-> `--reset` drops the `public` and `app` schemas in the database you point it at. It is for
-> disposable development databases only. It has nothing to do with SQLite and cannot touch
-> the existing Cindy Bakes data.
+> `--reset` drops the `public` and `app` schemas. It requires `--i-am-sure` and is refused
+> unless the database URL uses `localhost` or a loopback IP; Supabase and remote URLs are
+> always rejected.
 
 ## 10. Instructions for running the isolation tests
 
@@ -417,7 +386,8 @@ python -m unittest tests.test_saas_schema_structure -v
 python -m unittest discover -s tests -p "test_saas_*.py" -v
 ```
 
-Expected: **39 tests, OK**.
+The suite must run against a migrated and seeded PostgreSQL database. CI fails if the SaaS
+suite is not executed or any SaaS test is skipped.
 
 To confirm the existing application is unaffected:
 
@@ -435,14 +405,12 @@ separate step, so a regression in either layer is caught.
 
 ## 11. Environment variables for local development
 
-All are **optional** for the existing application: if unset, nothing about today's behaviour
-changes. They are backend-only and must never be exposed as `VITE_*` values.
+These are backend-only and must never be exposed as `VITE_*` values.
 
 | Variable | Purpose | Example |
 |---|---|---|
 | `SAAS_DATABASE_URL` | Connection string for tenant-scoped backend queries | `postgresql://app_backend:password@host:5432/cindy_saas` |
-| `SAAS_TEST_DATABASE_URL` | Connection string used by the isolation tests. Falls back to `SAAS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5433/saas_platform` |
-| `SAAS_APP_DB_ROLE` | Informational: the role the backend is expected to use | `app_backend` |
+| `SAAS_TEST_DATABASE_URL` | Connection string used by the isolation tests. CI requires this value; locally it falls back to `SAAS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5433/saas_platform` |
 
 **Which role goes in `SAAS_DATABASE_URL` for a real environment:** `app_backend` — a
 dedicated, non-owner role that is **subject to RLS**. Do **not** use Supabase's
@@ -510,46 +478,11 @@ number is this?", not "may we serve them?"), and it cannot enumerate. Both are a
 starts a tenant transaction, and passes the tenant context into the bot service. The existing
 SQLite write path continues in parallel until a cutover is explicitly planned.
 
-## 13. Confirmation: existing Cindy Bakes production SQLite functionality was NOT migrated or deleted
+## 13. Development data boundary
 
-**Confirmed. Nothing was migrated, moved, replaced, altered or deleted.**
-
-| Item | Status in Phase 1 |
-|---|---|
-| Existing SQLite database file | **Untouched.** Never opened for writing by any Phase 1 code |
-| Existing Cindy Bakes orders | **Not migrated.** No data copied to PostgreSQL |
-| Existing WhatsApp conversations | **Not migrated.** `whatsapp_conversations` data is exactly as it was |
-| `database.py`, `whatsapp_database.py` | **Not modified.** Still the SQLite persistence layer |
-| SQLite → PostgreSQL replacement in production | **Not done.** PostgreSQL is a parallel, dark-launched foundation |
-| Railway production database configuration | **Not changed.** No Railway file or variable touched |
-| WhatsApp credentials | **Not changed** |
-| Existing webhook verification flow | **Not changed** |
-| Production data deleted | **No.** Nothing was deleted anywhere |
-| `Procfile` / `railway.toml` / `nixpacks.toml` / `vercel.json` | **Not modified** |
-| `requirements.txt` | **Not modified in the origin repo** — Phase 1's PostgreSQL driver was added as a separate file there so the production build was untouched |
-
-**Verification evidence collected**
-
-1. `git diff --stat HEAD -- '*.py' requirements.txt Procfile railway.toml nixpacks.toml
-   vercel.json templates src` → no changes to any existing Python file or deployment
-   configuration. The only tracked file Phase 1 changed is `.env.example` (additive comments).
-2. A search across all `*.py` files for `import saas`, `from saas` and `saas.` returns
-   **zero matches** — no existing module references the Phase 1 package, so it cannot execute
-   as part of the running application.
-3. The Flask app factory still builds and exposes all 15 routes: `GET /health`,
-   `POST /api/chat`, `POST /webhook`, `GET /webhook`, and the full `/admin/*` set including
-   `/admin/login`, `/admin/orders/<id>`, `/admin/orders/<id>/verify` and
-   `/admin/orders/<id>/delivery-cost`.
-4. The SQLite path was exercised end to end: `initialize_whatsapp_tables()` created `orders`,
-   `whatsapp_conversations` and `whatsapp_events`; webhook idempotency behaved correctly
-   (`claim_event` returned `True`, then `False` for a duplicate message id); `list_orders()`
-   returned normally.
-5. The existing test suite passes unchanged (`tests/test_agent.py`, `tests/test_order.py`).
-
-**Archived separately.** Per the approved data decisions, Cindy Bakes starts fresh as Tenant
-001 and its existing historical data remains archived separately. Phase 1 creates Tenant 001
-as a **new, empty** tenant in the new schema. The seed data attached to it is development
-fixture data (synthetic settings, a fake phone number), **not** imported production records.
+The seed creates synthetic tenant fixtures for local testing only. It contains no production
+records, real phone-number identifiers, or access tokens. No customer, conversation, order,
+or payment data is modeled in Phase 1.
 
 ## 14. What is deliberately NOT in Phase 1
 

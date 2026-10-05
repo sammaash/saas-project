@@ -22,8 +22,8 @@ Two properties make this safe:
     tests or (in production) between requests on a pooled connection.
   * Every helper rolls its transaction back, so the suite never mutates seeded data.
 
-The suite SKIPS when no database is configured, so a plain `python -m unittest` run on a
-machine without PostgreSQL stays green.
+The suite skips without a database for local convenience. CI sets
+SAAS_REQUIRE_TEST_DATABASE=1, which turns missing configuration into a failure.
 """
 
 from __future__ import annotations
@@ -33,9 +33,10 @@ import json
 import os
 import unittest
 from typing import Any, Iterator
+from urllib.parse import urlsplit, urlunsplit
 
 # ---------------------------------------------------------------------------
-# Deterministic seed identifiers -- kept in step with db/seeds/dev_seed.sql.
+# Deterministic seed identifiers -- kept in step with db/seeds/0001_dev_seed.sql.
 # ---------------------------------------------------------------------------
 TENANT_ONE_ID = "11111111-1111-4111-8111-111111111111"
 TENANT_ONE_NAME = "Cindy Bakes"
@@ -53,6 +54,8 @@ TENANT_TWO_PHONE_NUMBER_ID = "dev-phone-id-testbakery-002"
 TENANT_TWO_OWNER_USER_ID = "bbbbbbbb-0000-4000-8000-000000000001"
 
 OUTSIDER_USER_ID = "cccccccc-0000-4000-8000-000000000001"
+INVITED_USER_ID = "cccccccc-0000-4000-8000-000000000002"
+SECONDARY_OWNER_USER_ID = "aaaaaaaa-0000-4000-8000-000000000003"
 
 PLAN_ID = "d0000000-0000-4000-8000-000000000001"
 SUBSCRIPTION_ONE_ID = "e0000000-0000-4000-8000-000000000001"
@@ -69,6 +72,8 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("tenant_settings", "tenant_id"),
     ("subscriptions", "tenant_id"),
     ("audit_log", "tenant_id"),
+    ("products", "tenant_id"),
+    ("product_variants", "tenant_id"),
 )
 
 # Tables where FORCE ROW LEVEL SECURITY is deliberately NOT applied, because the
@@ -89,7 +94,24 @@ TABLES_WITH_NULLABLE_TENANT_ID = ("audit_log",)
 # ---------------------------------------------------------------------------
 def test_database_url() -> str | None:
     """Connection string for the isolation tests (CI points this at its service container)."""
+    if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
+        return os.getenv("SAAS_TEST_DATABASE_URL")
     return os.getenv("SAAS_TEST_DATABASE_URL") or os.getenv("SAAS_DATABASE_URL")
+
+
+def app_backend_test_url() -> str | None:
+    """Local test DSN for the app_backend role configured by db/local/."""
+    base = test_database_url()
+    if not base:
+        return None
+    parts = urlsplit(base)
+    if not parts.hostname:
+        return None
+    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = f"app_backend:dev_app_backend_password@{hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def database_available() -> bool:
@@ -101,7 +123,7 @@ def _connect(url: str | None = None) -> Any:
         import psycopg  # noqa: PLC0415  (optional dependency, imported lazily)
     except ModuleNotFoundError as error:  # pragma: no cover - developer feedback path
         raise RuntimeError(
-            "psycopg is not installed. Run: pip install -r requirements-saas.txt"
+            "psycopg is not installed. Run: pip install -r requirements.txt"
         ) from error
     return psycopg.connect(url or test_database_url())
 
@@ -172,6 +194,11 @@ class SaasDatabaseTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         if not database_available():
+            if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
+                raise AssertionError(
+                    "SAAS_REQUIRE_TEST_DATABASE=1 but neither "
+                    "SAAS_TEST_DATABASE_URL nor SAAS_DATABASE_URL is configured."
+                )
             raise unittest.SkipTest(
                 "No SAAS_TEST_DATABASE_URL / SAAS_DATABASE_URL configured, so the "
                 "PostgreSQL isolation tests are skipped. See "
