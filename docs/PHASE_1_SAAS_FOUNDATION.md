@@ -1,8 +1,9 @@
-# Phase 1 — Multi-Tenant SaaS Foundation
+# SaaS Foundation — Phase 1 Core and Phase 2 Catalogue
 
-**Scope:** the platform foundation and isolation layer only. No catalogue, customer,
-conversation, message, order, payment or usage tables. No dashboard. No billing. No STK
-push. See [§14 What is deliberately NOT in Phase 1](#14-what-is-deliberately-not-in-phase-1).
+**Scope:** Phase 1 tenancy/security foundations plus the Phase 2 tenant-owned catalogue schema
+and database access library. No customer, conversation, message, order, payment or usage
+tables. No Flask HTTP service, dashboard, WhatsApp runtime, billing or STK push. §14 records
+what was excluded from Phase 1 itself.
 
 **Tenancy model:** one shared PostgreSQL schema + `tenant_id` + Row Level Security. Not
 database-per-tenant. Not schema-per-tenant. There is no per-tenant legacy mode and no
@@ -40,6 +41,8 @@ external application's database or production records.
 | `0014_active_membership_and_owner_lock.sql` | Active-only membership predicates and serialized owner removal |
 | `0015_platform_provisioning_login.sql` | Dedicated platform API role (credential configured out of band) |
 | `0016_provisioner_schema_usage.sql` | Explicit schema access for the provisioning function owner |
+| `0017_catalogue.sql` | Tenant-owned products and product variants |
+| `0018_catalogue_rls_and_grants.sql` | Forced RLS and least-privilege catalogue grants |
 
 ### Local / development (`db/local/`, never applied on Supabase)
 
@@ -51,7 +54,8 @@ external application's database or production records.
 
 | File | Contents |
 |---|---|
-| `dev_seed.sql` | Tenant 001 Cindy Bakes, Tenant 002 Test Bakery, channels, memberships, settings, plan, subscriptions, audit rows |
+| `0001_dev_seed.sql` | Tenant 001 Cindy Bakes, Tenant 002 Test Bakery, channels, memberships, settings, plan, subscriptions, audit rows |
+| `0002_cindy_bakes_catalogue.sql` | Cindy Bakes products and variants only; looks up the existing tenant by slug |
 
 ### Tooling, application layer and tests
 
@@ -73,13 +77,14 @@ external application's database or production records.
 
 ## 2. Scope boundary
 
-This repository contains database migrations, the SaaS connection/context/routing helpers,
-development seed data, tests, and CI. It does not contain a dashboard or transactional
-catalogue, customer, conversation, order, payment, or usage implementation.
+This repository contains database migrations, SaaS connection/context/routing helpers,
+the tenant-aware catalogue data service, development seed data, tests, and CI. It does not
+contain a dashboard, Flask HTTP service, WhatsApp runtime, or customer, conversation, order,
+payment, or usage implementation.
 
 ## 3. Database migration files
 
-Sixteen migrations, applied in order by `db/run_migrations.py`. They use **only standard
+Eighteen migrations, applied in order by `db/run_migrations.py`. They use **only standard
 PostgreSQL**: no `auth` schema references, no Supabase-specific extensions, no shims. The
 same files run unchanged on local PostgreSQL, in CI and on Supabase.
 
@@ -208,7 +213,8 @@ resolves a tenant from a phone number.
 
 ## 7. Seed data
 
-`db/seeds/dev_seed.sql` — idempotent, deterministic UUIDs, obviously fake identifiers.
+`db/seeds/0001_dev_seed.sql` — idempotent, deterministic UUIDs, obviously fake identifiers.
+`db/seeds/0002_cindy_bakes_catalogue.sql` — idempotent, Cindy Bakes catalogue only.
 
 | | Tenant 001 | Tenant 002 |
 |---|---|---|
@@ -344,9 +350,10 @@ Expected output of step 7:
 ```text
 apply  0001_extensions_and_helpers.sql
 ...
-apply  0015_platform_provisioning_login.sql
+apply  0018_catalogue_rls_and_grants.sql
 local  0001_local_app_backend_login.sql
-seed   dev_seed.sql
+seed   0001_dev_seed.sql
+seed   0002_cindy_bakes_catalogue.sql
 migrations complete
 ```
 

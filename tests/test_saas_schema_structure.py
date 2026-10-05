@@ -36,8 +36,8 @@ except ImportError:  # discovery inside the tests directory
         SaasDatabaseTestCase,
     )
 
-# Every table created in Phase 1.
-PHASE_1_TABLES = (
+# Every table created through the Phase 2 catalogue foundation.
+PLATFORM_TABLES = (
     "tenants",
     "tenant_channels",
     "tenant_users",
@@ -45,6 +45,8 @@ PHASE_1_TABLES = (
     "plans",
     "subscriptions",
     "audit_log",
+    "products",
+    "product_variants",
 )
 
 # Tables that carry a tenant identity in a column named tenant_id. `tenants` is excluded
@@ -68,9 +70,9 @@ APPLICATION_ROLES = ("app_backend", "authenticated")
 
 
 class RlsConfigurationTests(SaasDatabaseTestCase):
-    """Requirement 9: RLS is enabled on every Phase 1 table."""
+    """RLS is enabled on every platform table."""
 
-    def test_rls_is_enabled_on_every_phase_1_table(self):
+    def test_rls_is_enabled_on_every_platform_table(self):
         with self.superuser() as cursor:
             cursor.execute(
                 """
@@ -81,12 +83,12 @@ class RlsConfigurationTests(SaasDatabaseTestCase):
                    and c.relkind = 'r'
                    and c.relname = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             rows = dict(cursor.fetchall())
 
-        missing = [table for table in PHASE_1_TABLES if table not in rows]
-        self.assertEqual(missing, [], f"Phase 1 tables missing from the database: {missing}")
+        missing = [table for table in PLATFORM_TABLES if table not in rows]
+        self.assertEqual(missing, [], f"Platform tables missing from the database: {missing}")
 
         not_enabled = [table for table, enabled in rows.items() if not enabled]
         self.assertEqual(not_enabled, [], f"RLS is not enabled on: {not_enabled}")
@@ -106,11 +108,11 @@ class RlsForceTests(SaasDatabaseTestCase):
                    and c.relkind = 'r'
                    and c.relname = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             forced = {table for table, is_forced in cursor.fetchall() if is_forced}
 
-        expected_forced = set(PHASE_1_TABLES) - set(NOT_FORCED_BY_DESIGN)
+        expected_forced = set(PLATFORM_TABLES) - set(NOT_FORCED_BY_DESIGN)
         self.assertEqual(
             forced,
             expected_forced,
@@ -352,7 +354,7 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
                         f"{grantee} must not hold {privilege} on an append-only table",
                     )
 
-    def test_anon_has_no_privileges_on_phase_1_tables(self):
+    def test_anon_has_no_privileges_on_platform_tables(self):
         with self.superuser() as cursor:
             cursor.execute(
                 """
@@ -362,7 +364,7 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
                    and grantee = 'anon'
                    and table_name = any(%s)
                 """,
-                (list(PHASE_1_TABLES),),
+                (list(PLATFORM_TABLES),),
             )
             self.assertEqual(
                 cursor.fetchall(), [], "anon must have no access to platform tables"

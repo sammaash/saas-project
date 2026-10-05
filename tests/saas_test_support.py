@@ -33,9 +33,10 @@ import json
 import os
 import unittest
 from typing import Any, Iterator
+from urllib.parse import urlsplit, urlunsplit
 
 # ---------------------------------------------------------------------------
-# Deterministic seed identifiers -- kept in step with db/seeds/dev_seed.sql.
+# Deterministic seed identifiers -- kept in step with db/seeds/0001_dev_seed.sql.
 # ---------------------------------------------------------------------------
 TENANT_ONE_ID = "11111111-1111-4111-8111-111111111111"
 TENANT_ONE_NAME = "Cindy Bakes"
@@ -71,6 +72,8 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("tenant_settings", "tenant_id"),
     ("subscriptions", "tenant_id"),
     ("audit_log", "tenant_id"),
+    ("products", "tenant_id"),
+    ("product_variants", "tenant_id"),
 )
 
 # Tables where FORCE ROW LEVEL SECURITY is deliberately NOT applied, because the
@@ -94,6 +97,21 @@ def test_database_url() -> str | None:
     if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
         return os.getenv("SAAS_TEST_DATABASE_URL")
     return os.getenv("SAAS_TEST_DATABASE_URL") or os.getenv("SAAS_DATABASE_URL")
+
+
+def app_backend_test_url() -> str | None:
+    """Local test DSN for the app_backend role configured by db/local/."""
+    base = test_database_url()
+    if not base:
+        return None
+    parts = urlsplit(base)
+    if not parts.hostname:
+        return None
+    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = f"app_backend:dev_app_backend_password@{hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def database_available() -> bool:

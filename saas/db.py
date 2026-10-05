@@ -38,16 +38,28 @@ def connect(url: str | None = None) -> Any:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                select current_user, role.rolsuper, role.rolbypassrls,
+                                select current_user,
+                                             session_user,
+                                             role.rolsuper,
+                                             role.rolbypassrls,
                        exists (
                            select 1
-                             from pg_catalog.pg_roles elevated
-                            where (elevated.rolsuper or elevated.rolbypassrls
-                                   or elevated.rolname = 'service_role')
-                              and (elevated.rolname = role.rolname
-                                   or pg_catalog.pg_has_role(
-                                       role.oid, elevated.oid, 'MEMBER'
-                                   ))
+                                                         from pg_catalog.pg_class relation
+                                                         join pg_catalog.pg_namespace namespace
+                                                             on namespace.oid = relation.relnamespace
+                                                        where namespace.nspname = 'public'
+                                                            and relation.relkind in ('r', 'p')
+                                                            and relation.relowner = role.oid
+                                             ),
+                                             exists (
+                                                         select 1
+                                                             from pg_catalog.pg_roles elevated
+                                                            where (elevated.rolsuper
+                                                                         or elevated.rolbypassrls
+                                                                         or elevated.rolname = 'service_role')
+                                                                and pg_catalog.pg_has_role(
+                                                                        role.oid, elevated.oid, 'MEMBER'
+                                                                )
                        )
                   from pg_catalog.pg_roles role
                  where role.rolname = current_user
@@ -57,14 +69,17 @@ def connect(url: str | None = None) -> Any:
         if (
             row is None
             or row[0] != app_db_role()
-            or row[1]
+            or row[1] != app_db_role()
             or row[2]
             or row[3]
+            or row[4]
+            or row[5]
         ):
             actual_role = row[0] if row else "unknown"
             raise RuntimeError(
-                f"Unsafe SaaS database role {actual_role!r}; expected {app_db_role()!r} "
-                "without superuser, service_role, or BYPASSRLS privileges."
+                f"Unsafe SaaS database connection: expected session and current role "
+                f"{app_db_role()!r}, without superuser, BYPASSRLS, public-table ownership, "
+                f"or elevated-role membership; got {actual_role!r}."
             )
     except Exception:
         conn.close()

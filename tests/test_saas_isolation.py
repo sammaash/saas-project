@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import unittest
-import urllib.parse
 
 try:  # `tests` is a package when run as `python -m unittest tests.test_...`
     from .saas_test_support import (
@@ -37,6 +36,7 @@ try:  # `tests` is a package when run as `python -m unittest tests.test_...`
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
         TENANT_TWO_PHONE_NUMBER_ID,
+        app_backend_test_url,
         SaasDatabaseTestCase,
         test_database_url,
     )
@@ -57,6 +57,7 @@ except ImportError:  # ...and a plain directory under `discover -s tests`
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
         TENANT_TWO_PHONE_NUMBER_ID,
+        app_backend_test_url,
         SaasDatabaseTestCase,
         test_database_url,
     )
@@ -86,21 +87,7 @@ def _app_backend_url() -> str | None:
     role that is subject to RLS) and scope the transaction with set_config. Requires
     db/local/0001_local_app_backend_login.sql, which is development/CI only.
     """
-    base = test_database_url()
-    if not base:
-        return None
-
-    parts = urllib.parse.urlsplit(base)
-    if not parts.hostname:
-        return None
-
-    netloc = f"app_backend:dev_app_backend_password@{parts.hostname}"
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
-
-    return urllib.parse.urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-    )
+    return app_backend_test_url()
 
 
 class TenantIsolationTests(SaasDatabaseTestCase):
@@ -115,6 +102,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "tenant_settings": 1,
             "subscriptions": 1,
             "audit_log": 1,  # tenant row only; the platform row must not appear
+            "products": 11,
+            "product_variants": 33,
         }
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute("select name, slug from public.tenants")
@@ -135,6 +124,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "tenant_settings": 1,
             "subscriptions": 1,
             "audit_log": 0,  # none seeded for tenant 002; tenant 001's row stays invisible
+            "products": 0,
+            "product_variants": 0,
         }
         with self.user(TENANT_TWO_OWNER_USER_ID) as cursor:
             cursor.execute("select name from public.tenants")
@@ -667,7 +658,7 @@ class TenantContextHelperTests(SaasDatabaseTestCase):
     def test_database_connection_rejects_superuser_and_accepts_app_backend(self):
         from saas import db
 
-        with self.assertRaisesRegex(RuntimeError, "expected 'app_backend'"):
+        with self.assertRaisesRegex(RuntimeError, "expected session and current role"):
             db.connect(test_database_url())
 
         url = _app_backend_url()
@@ -675,8 +666,8 @@ class TenantContextHelperTests(SaasDatabaseTestCase):
         conn = db.connect(url)
         try:
             with conn.cursor() as cursor:
-                cursor.execute("select current_user")
-                self.assertEqual(cursor.fetchone()[0], "app_backend")
+                cursor.execute("select current_user, session_user")
+                self.assertEqual(cursor.fetchone(), ("app_backend", "app_backend"))
         finally:
             conn.close()
 
