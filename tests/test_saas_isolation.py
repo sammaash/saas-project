@@ -157,14 +157,16 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
     # -- 5: cross-tenant UPDATE affects nothing --------------------------------
     def test_5_tenant_001_cannot_update_tenant_002_records(self):
+        # Since migration 0023 channels are not writable by tenant-facing roles at all.
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
-            cursor.execute(
-                "update public.tenant_channels set display_phone_number = %s "
-                "where tenant_id = %s",
-                ("+254799999999", TENANT_TWO_ID),
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "update public.tenant_channels set display_phone_number = %s "
+                    "where tenant_id = %s",
+                    ("+254799999999", TENANT_TWO_ID),
+                )
 
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute(
                 "update public.tenants set name = 'Hijacked' where id = %s", (TENANT_TWO_ID,)
             )
@@ -177,12 +179,12 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
     # -- 6: cross-tenant DELETE affects nothing --------------------------------
     def test_6_tenant_001_cannot_delete_tenant_002_records(self):
-        # Granted but policy-filtered: the statement succeeds and deletes zero rows.
+        # Channels are not writable by tenant-facing roles (migration 0023).
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
-            cursor.execute(
-                "delete from public.tenant_channels where tenant_id = %s", (TENANT_TWO_ID,)
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "delete from public.tenant_channels where tenant_id = %s", (TENANT_TWO_ID,)
+                )
 
         # `tenants` has neither a DELETE grant nor a DELETE policy, so this raises.
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
@@ -262,13 +264,13 @@ class TenantIsolationTests(SaasDatabaseTestCase):
                 self.count_rows(cursor, "tenant_channels", "tenant_id", TENANT_ONE_ID), 1
             )
 
-            # A member, but not an owner, so the UPDATE policy does not match.
-            cursor.execute(
-                "update public.tenant_channels set display_phone_number = %s "
-                "where tenant_id = %s",
-                ("+254700000009", TENANT_ONE_ID),
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            # A member, but not an owner; channels are not writable by tenant roles at all.
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "update public.tenant_channels set display_phone_number = %s "
+                    "where tenant_id = %s",
+                    ("+254700000009", TENANT_ONE_ID),
+                )
 
     def test_invited_member_cannot_read_tenant_data(self):
         with self.superuser() as cursor:

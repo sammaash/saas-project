@@ -39,9 +39,9 @@ def login():
         return render_template("login.html")
 
     ctx = context()
-    email = (request.form.get("email") or "").strip().lower()
-    key = f"{request.remote_addr}|{email}"
-    if not ctx.limiter.allow(key):
+    email = (request.form.get("email") or "").strip().lower()[:254]
+    ip = request.remote_addr or "unknown"
+    if not ctx.limiter.allow(ip, email):
         flash("Too many attempts. Try again later.", "error")
         return render_template("login.html"), 429
     try:
@@ -53,11 +53,11 @@ def login():
         ):
             raise AuthError(GENERIC_LOGIN_ERROR)
     except AuthError:
-        ctx.limiter.record_failure(key)
+        ctx.limiter.record_failure(ip, email)
         flash(GENERIC_LOGIN_ERROR, "error")
         return render_template("login.html"), 401
 
-    ctx.limiter.reset(key)
+    ctx.limiter.reset(ip, email)
     session.clear()
     session.permanent = True
     session["user_id"] = identity.user_id
@@ -245,9 +245,9 @@ def variant_active(tenant_id, variant_id):
 
 
 # ----------------------------------------------------------------- whatsapp
-def _render_whatsapp(tenant: dict, **extra):
+def _render_whatsapp(tenant: dict):
     channels = channel_service.list_channels(context().settings, tenant["id"])
-    return render_template("tenant_whatsapp.html", tenant=tenant, channels=channels, tab="whatsapp", **extra)
+    return render_template("tenant_whatsapp.html", tenant=tenant, channels=channels, tab="whatsapp")
 
 
 @admin_bp.get("/tenants/<tenant_id>/whatsapp")
@@ -264,6 +264,15 @@ def channel_connect(tenant_id):
                 lambda: channel_service.connect_channel(context().settings, g.admin_id, tenant, _form()))
 
 
+@admin_bp.post("/tenants/<tenant_id>/whatsapp/<channel_id>")
+@admin_required
+def channel_update(tenant_id, channel_id):
+    tenant = _tenant(tenant_id)
+    return _act("admin.tenant_whatsapp", tenant["id"], "Channel saved.",
+                lambda: channel_service.update_channel(
+                    context().settings, g.admin_id, tenant["id"], channel_id, _form()))
+
+
 @admin_bp.post("/tenants/<tenant_id>/whatsapp/<channel_id>/status")
 @admin_required
 def channel_status(tenant_id, channel_id):
@@ -272,21 +281,6 @@ def channel_status(tenant_id, channel_id):
                 lambda: channel_service.set_channel_status(
                     context().settings, g.admin_id, tenant["id"], channel_id,
                     request.form.get("status", "")))
-
-
-@admin_bp.post("/tenants/<tenant_id>/whatsapp/meta/<operation>")
-@admin_required
-def channel_meta(tenant_id, operation):
-    tenant = _tenant(tenant_id)
-    arguments = {k: v for k, v in request.form.items() if k != "csrf_token" and v}
-    try:
-        result = channel_service.run_meta_operation(
-            context().settings, context().meta_provider, g.admin_id, tenant["id"], operation, **arguments
-        )
-    except ServiceError as error:
-        flash(error.message, "error")
-        return _render_whatsapp(tenant), error.status
-    return _render_whatsapp(tenant, meta_result=result, meta_operation=operation)
 
 
 # ------------------------------------------------------------ members etc.

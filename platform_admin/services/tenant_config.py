@@ -30,7 +30,7 @@ def add_member(settings: Settings, admin_id: str, tenant_id: str, form: dict[str
         raise v.ServiceError("Status must be invited or active.")
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         member_id = ta.add_member(user_id, role, status)
-        audit.record(ta, admin_id, "member.added", "tenant_user", member_id,
+        audit.record(settings, admin_id, tenant_id, "member.added", "tenant_user", member_id,
                      {"user_id": user_id, "role": role, "status": status})
 
 
@@ -48,5 +48,5 @@ def set_subscription(
         raise v.ServiceError("Unsupported subscription status.")
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         ta.set_subscription(plan_id, status)
-        audit.record(ta, admin_id, "subscription.updated", "subscription", None,
+        audit.record(settings, admin_id, tenant_id, "subscription.updated", "subscription", None,
                      {"plan_id": plan_id, "status": status})

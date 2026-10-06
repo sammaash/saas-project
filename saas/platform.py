@@ -109,6 +109,64 @@ def list_plans(admin_user_id: str, url: str | None = None) -> list[dict[str, Any
         return _rows(cursor)
 
 
+def create_channel(
+    admin_user_id: str,
+    tenant_id: str,
+    phone_number_id: str,
+    waba_id: str | None = None,
+    display_phone_number: str | None = None,
+    url: str | None = None,
+) -> str:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_create_channel(%s, %s, %s, %s)",
+            (tenant_id, phone_number_id, waba_id, display_phone_number),
+        )
+        return str(cursor.fetchone()[0])
+
+
+def update_channel(
+    admin_user_id: str,
+    channel_id: str,
+    phone_number_id: str,
+    waba_id: str | None = None,
+    display_phone_number: str | None = None,
+    url: str | None = None,
+) -> None:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_update_channel(%s, %s, %s, %s)",
+            (channel_id, phone_number_id, waba_id, display_phone_number),
+        )
+
+
+def set_channel_status(
+    admin_user_id: str, channel_id: str, status: str, url: str | None = None
+) -> str:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute("select app.platform_set_channel_status(%s, %s)", (channel_id, status))
+        return cursor.fetchone()[0]
+
+
+def record_audit(
+    admin_user_id: str,
+    tenant_id: str,
+    action: str,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    url: str | None = None,
+) -> None:
+    """Write a platform-attributed audit event; the database takes the actor from the claims."""
+    from psycopg.types.json import Jsonb  # noqa: PLC0415  (lazy optional dependency)
+
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_record_audit(%s, %s, %s, %s, %s)",
+            (tenant_id, action, entity_type, entity_id, Jsonb(metadata or {})),
+        )
+
+
 def overview(admin_user_id: str, url: str | None = None) -> dict[str, Any]:
     with platform_transaction(admin_user_id, url) as cursor:
         cursor.execute("select app.platform_overview()")

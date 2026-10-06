@@ -92,7 +92,7 @@ def update_profile(settings: Settings, admin_id: str, tenant_id: str, form: dict
         ta.rename(name)
         ta.update_settings(timezone=timezone, currency=currency)
         audit.record(
-            ta, admin_id, "tenant.profile_updated", "tenant", tenant_id,
+            settings, admin_id, tenant_id, "tenant.profile_updated", "tenant", tenant_id,
             {"name": name, "timezone": timezone, "currency": currency},
         )
 
@@ -105,7 +105,7 @@ def update_rules(settings: Settings, admin_id: str, tenant_id: str, form: dict[s
         ta.update_settings(**documents)
         # Section names only: values may be large or sensitive and do not belong in audit.
         audit.record(
-            ta, admin_id, "tenant.rules_updated", "tenant_settings", tenant_id,
+            settings, admin_id, tenant_id, "tenant.rules_updated", "tenant_settings", tenant_id,
             {"sections": sorted(documents)},
         )
 

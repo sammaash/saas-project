@@ -39,7 +39,7 @@ def create_product(settings: Settings, admin_id: str, tenant_id: str, form: dict
     values = _product_values(form)
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         product_id = ta.create_product(**values)
-        audit.record(ta, admin_id, "catalogue.product_created", "product", product_id,
+        audit.record(settings, admin_id, tenant_id, "catalogue.product_created", "product", product_id,
                      {"name": values["name"]})
     return product_id
 
@@ -52,7 +52,7 @@ def update_product(
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         if not ta.update_product(product_id, **values):
             raise v.ServiceError("Product not found.", 404)
-        audit.record(ta, admin_id, "catalogue.product_updated", "product", product_id,
+        audit.record(settings, admin_id, tenant_id, "catalogue.product_updated", "product", product_id,
                      {"name": values["name"]})
 
 
@@ -63,7 +63,7 @@ def set_product_active(
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         if not ta.update_product(product_id, is_active=active):
             raise v.ServiceError("Product not found.", 404)
-        audit.record(ta, admin_id, "catalogue.product_activated" if active
+        audit.record(settings, admin_id, tenant_id, "catalogue.product_activated" if active
                      else "catalogue.product_deactivated", "product", product_id)
 
 
@@ -76,7 +76,7 @@ def create_variant(
         if ta.get_product(product_id) is None:
             raise v.ServiceError("Product not found.", 404)
         variant_id = ta.create_variant(product_id, **values)
-        audit.record(ta, admin_id, "catalogue.variant_created", "product_variant", variant_id,
+        audit.record(settings, admin_id, tenant_id, "catalogue.variant_created", "product_variant", variant_id,
                      {"product_id": product_id, "code": values["code"], "price": str(values["price"])})
     return variant_id
 
@@ -90,7 +90,7 @@ def update_variant(
         previous = ta.get_variant(variant_id)
         if previous is None or not ta.update_variant(variant_id, **values):
             raise v.ServiceError("Variant not found.", 404)
-        audit.record(ta, admin_id, "catalogue.variant_updated", "product_variant", variant_id,
+        audit.record(settings, admin_id, tenant_id, "catalogue.variant_updated", "product_variant", variant_id,
                      {"code": values["code"], "old_price": str(previous["price"]),
                       "price": str(values["price"])})
 
@@ -102,5 +102,5 @@ def set_variant_active(
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         if not ta.update_variant(variant_id, is_active=active):
             raise v.ServiceError("Variant not found.", 404)
-        audit.record(ta, admin_id, "catalogue.variant_activated" if active
+        audit.record(settings, admin_id, tenant_id, "catalogue.variant_activated" if active
                      else "catalogue.variant_deactivated", "product_variant", variant_id)

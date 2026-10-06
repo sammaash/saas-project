@@ -13,8 +13,11 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
+from typing import Callable
+
+from .config import require_https
 
 
 class AuthError(Exception):
@@ -42,8 +45,10 @@ class SupabaseAuthenticator(Authenticator):
         anon_key: str,
         jwt_secret: str | None = None,
         timeout: float = 10.0,
+        allow_http_loopback: bool = False,
     ):
-        self._base = supabase_url.rstrip("/")
+        # The password is posted to this URL, so plain http is refused (config.ConfigError).
+        self._base = require_https(supabase_url, dev_mode=allow_http_loopback)
         self._anon_key = anon_key
         self._jwt_secret = jwt_secret
         self._timeout = timeout
@@ -92,26 +97,82 @@ class SupabaseAuthenticator(Authenticator):
 
 
 class LoginRateLimiter:
-    """Per-key sliding window limiter (process-local; adequate for one admin service)."""
+    """Sliding-window login throttle with bounded memory (process-local).
 
-    def __init__(self, attempts: int = 5, window_seconds: int = 900):
+    Limits failures per ``ip|email``, per IP, and globally. Expired entries are pruned, and
+    the number of tracked keys is capped (oldest evicted), so an attacker cannot grow memory
+    by rotating addresses; the global failure cap bounds what eviction could let through.
+    When the global cap is reached every login is refused until the window passes.
+    """
+
+    def __init__(
+        self,
+        attempts: int = 5,
+        window_seconds: int = 900,
+        per_ip: int = 20,
+        global_failures: int = 200,
+        max_keys: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._attempts = attempts
         self._window = window_seconds
-        self._events: dict[str, deque[float]] = defaultdict(deque)
+        self._per_ip = per_ip
+        self._global_limit = global_failures
+        self._max_keys = max_keys
+        self._clock = clock
+        self._events: "OrderedDict[str, deque[float]]" = OrderedDict()
+        self._global: deque[float] = deque()
         self._lock = threading.Lock()
+        self._last_prune = clock()
 
-    def allow(self, key: str) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            events = self._events[key]
-            while events and now - events[0] > self._window:
-                events.popleft()
-            return len(events) < self._attempts
+    @staticmethod
+    def _keys(ip: str, email: str) -> tuple[str, str]:
+        return f"i:{ip}", f"k:{ip}|{email}"
 
-    def record_failure(self, key: str) -> None:
-        with self._lock:
-            self._events[key].append(time.monotonic())
+    def _expire(self, events: "deque[float]", now: float) -> None:
+        while events and now - events[0] > self._window:
+            events.popleft()
 
-    def reset(self, key: str) -> None:
+    def _prune(self, now: float) -> None:
+        self._expire(self._global, now)
+        for key in [k for k, events in self._events.items() if (self._expire(events, now) or not events)]:
+            del self._events[key]
+        self._last_prune = now
+
+    def tracked_keys(self) -> int:
+        return len(self._events)
+
+    def allow(self, ip: str, email: str) -> bool:
+        now = self._clock()
         with self._lock:
-            self._events.pop(key, None)
+            if now - self._last_prune > self._window / 10:
+                self._prune(now)
+            self._expire(self._global, now)
+            if len(self._global) >= self._global_limit:
+                return False
+            ip_key, pair_key = self._keys(ip, email)
+            for key, limit in ((ip_key, self._per_ip), (pair_key, self._attempts)):
+                events = self._events.get(key)
+                if events is not None:
+                    self._expire(events, now)
+                    if len(events) >= limit:
+                        return False
+            return True
+
+    def record_failure(self, ip: str, email: str) -> None:
+        now = self._clock()
+        with self._lock:
+            self._global.append(now)
+            for key in self._keys(ip, email):
+                events = self._events.setdefault(key, deque())
+                events.append(now)
+                self._events.move_to_end(key)
+            if len(self._events) > self._max_keys:
+                self._prune(now)
+            while len(self._events) > self._max_keys:
+                self._events.popitem(last=False)
+
+    def reset(self, ip: str, email: str) -> None:
+        """A successful login clears the per-address-and-email counter only."""
+        with self._lock:
+            self._events.pop(self._keys(ip, email)[1], None)

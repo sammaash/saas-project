@@ -19,7 +19,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
@@ -35,6 +35,42 @@ create table if not exists public.saas_schema_migrations (
   applied_at timestamptz not null default now()
 );
 """
+
+
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def database_hosts(url: str, environ: dict[str, str] | None = None) -> list[str] | None:
+    """Every host libpq could connect to for ``url``; None when it cannot be determined."""
+    environ = os.environ if environ is None else environ
+    if "://" not in url:
+        return None
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        params = parse_qs(parts.query)
+    except ValueError:
+        return None
+    hosts = [hostname] if hostname else []
+    for key in ("host", "hostaddr"):
+        hosts += [item for value in params.get(key, []) for item in value.split(",")]
+    if not hosts:
+        hosts += [item for item in environ.get("PGHOST", "").split(",") if item]
+        hosts += [item for item in environ.get("PGHOSTADDR", "").split(",") if item]
+    return [host.strip() for host in hosts]
+
+
+def is_local_target(url: str, environ: dict[str, str] | None = None) -> bool:
+    """True only when every possible connection target is loopback or a unix socket."""
+    hosts = database_hosts(url, environ)
+    if hosts is None:
+        return False
+    return all(host.lower() in LOOPBACK_HOSTS or host.startswith("/") for host in hosts)
+
+
+def is_supabase_target(url: str, environ: dict[str, str] | None = None) -> bool:
+    hosts = database_hosts(url, environ) or []
+    return "supabase" in url.lower() or any("supabase" in host.lower() for host in hosts)
 
 
 def _psycopg():
@@ -180,10 +216,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--status", action="store_true", help="show applied and pending migrations"
     )
+    parser.add_argument(
+        "--allow-nonlocal-dev",
+        action="store_true",
+        help="development override: allow --include-local/--seed on a non-loopback host "
+        "(never honoured for Supabase hosts)",
+    )
     args = parser.parse_args(argv)
 
     if not args.database_url:
         parser.error("set SAAS_DATABASE_URL or pass --database-url")
+
+    dev_data = args.include_local or args.seed
+    if dev_data:
+        if is_supabase_target(args.database_url):
+            parser.error(
+                "--include-local/--seed set known development passwords and create fixture "
+                "data; they are forbidden for Supabase databases"
+            )
+        if not is_local_target(args.database_url) and not args.allow_nonlocal_dev:
+            parser.error(
+                "--include-local/--seed are refused for non-local database hosts; pass "
+                "--allow-nonlocal-dev only for a disposable development database"
+            )
 
     if args.reset and not args.i_am_sure:
         parser.error("--reset requires the explicit confirmation flag --i-am-sure")
@@ -220,6 +275,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         apply_migrations(conn)
+
+        if dev_data:
+            # The db/local and db/seeds scripts refuse to run without this session setting.
+            conn.execute("select set_config('saas.allow_dev_data', 'on', false)")
 
         if args.include_local:
             apply_all(conn, LOCAL_DIR, "local")

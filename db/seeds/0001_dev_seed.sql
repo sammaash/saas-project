@@ -23,6 +23,8 @@
 -- ---------------------------------------------------------------------------
 -- Plans (platform-owned: no tenant_id)
 -- ---------------------------------------------------------------------------
+do $$ begin if coalesce(current_setting('saas.allow_dev_data', true), '') <> 'on' then raise exception 'development-only seed: refusing to create fixture tenants without saas.allow_dev_data=on (db/run_migrations.py sets it for local databases only)'; end if; end $$;
+
 insert into public.plans (id, code, name, description, monthly_price, currency, is_active, limits)
 values (
   'd0000000-0000-4000-8000-000000000001',

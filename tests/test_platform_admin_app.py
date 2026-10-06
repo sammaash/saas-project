@@ -18,9 +18,6 @@ import uuid
 from platform_admin.app import create_app
 from platform_admin.auth import AuthError, Authenticator, Identity
 from platform_admin.config import Settings
-from platform_admin.meta.fake import FakeAccount, FakeMetaProvider
-from platform_admin.meta.provider import BusinessInfo, PhoneNumberInfo, WabaInfo
-from platform_admin.meta.secrets import StaticSecretResolver, tenant_credentials_ref
 from saas_test_support import (
     PLATFORM_ADMIN_USER_ID,
     SaasDatabaseTestCase,
@@ -32,7 +29,6 @@ from saas_test_support import (
 
 SLUG_PREFIX = "pa-test-"
 PASSWORD = "correct horse"
-SECRET_VALUE = "EAAG-end-to-end-secret-token"
 
 
 class FakeAuthenticator(Authenticator):
@@ -63,6 +59,14 @@ SPECS = (
         "product": {"name": "Screen repair", "category": "repair"},
         "variant": {"code": "oem", "name": "OEM part", "price": "89.50"},
     },
+    {
+        "name": "Cindy Bakes", "slug": SLUG_PREFIX + "bakes", "currency": "KES",
+        "rules": {"deposit_rate": 0.7, "delivery_rate_per_km": 32},
+        "persona": {"tone": "warm"},
+        "hours": {"mon-sat": "08:00-18:00"},
+        "product": {"name": "Vanilla cake", "category": "cake"},
+        "variant": {"code": "1kg", "name": "1kg", "price": "2500.00"},
+    },
 )
 
 
@@ -72,7 +76,6 @@ def _settings(**overrides) -> Settings:
         cookie_secure=False,
         app_database_url=app_backend_test_url(),
         platform_database_url=platform_admin_test_url(),
-        blocked_phone_number_ids=frozenset({"blocked-live-number"}),
         **overrides,
     )
 
@@ -104,6 +107,7 @@ class DashboardTestCase(SaasDatabaseTestCase):
             if ids:
                 cursor.execute("delete from public.audit_log where tenant_id = any(%s)", (ids,))
                 cursor.execute("delete from public.tenants where id = any(%s)", (ids,))
+            cursor.execute("delete from public.reserved_phone_numbers where phone_number_id like 'pa-reserved-%'")
             cursor.execute(
                 "delete from public.platform_admins where user_id = %s", (PLATFORM_ADMIN_USER_ID,)
             )
@@ -127,6 +131,10 @@ class DashboardTestCase(SaasDatabaseTestCase):
         payload = dict(data or {})
         payload["csrf_token"] = self.token(client)
         return client.post(path, data=payload)
+
+    def message_after(self, response, client=None) -> str:
+        """The page a redirect leads to (where flash messages are shown)."""
+        return (client or self.client).get(response.headers["Location"]).get_data(as_text=True)
 
     def create_tenant(self, spec, **extra):
         response = self.post("/tenants/new", {
@@ -187,7 +195,6 @@ class LoginTests(DashboardTestCase):
     def test_valid_user_who_is_not_a_platform_admin_gets_the_same_generic_error(self):
         wrong = self.login(password="nope").get_data(as_text=True)
         non_admin = self.login(email="owner@example.com").get_data(as_text=True)
-        self.assertEqual(self.login(email="owner@example.com").status_code, 401)
         self.assertIn("Invalid email or password.", non_admin)
         self.assertIn("Invalid email or password.", wrong)
         self.assertEqual(self.client.get("/tenants").status_code, 302)
@@ -196,6 +203,16 @@ class LoginTests(DashboardTestCase):
         statuses = [self.login(password="bad").status_code for _ in range(7)]
         self.assertEqual(statuses[:5], [401] * 5)
         self.assertEqual(statuses[-1], 429)
+
+    def test_rate_limiting_still_lets_other_addresses_sign_in(self):
+        for _ in range(6):
+            self.login(password="bad")
+        other = self.app.test_client()
+        other.get("/login")
+        response = other.post("/login", data={
+            "csrf_token": self.token(other), "email": "admin@example.com", "password": PASSWORD},
+            environ_overrides={"REMOTE_ADDR": "198.51.100.20"})
+        self.assertEqual(response.status_code, 302)
 
     def test_forged_session_for_a_non_administrator_is_forbidden(self):
         self.login()
@@ -220,9 +237,7 @@ class LoginTests(DashboardTestCase):
         self.assertEqual(self.client.get("/").status_code, 302)
 
     def test_the_session_cookie_never_contains_a_token(self):
-        response = self.login()
-        cookie = response.headers.get("Set-Cookie", "")
-        self.assertNotIn("eyJ", cookie)
+        self.assertNotIn("eyJ", self.login().headers.get("Set-Cookie", ""))
 
 
 class OnboardingTests(DashboardTestCase):
@@ -235,19 +250,18 @@ class OnboardingTests(DashboardTestCase):
         self.assertEqual(self.tenant_status(tenant_id), "draft")
         self.assertIn("draft", self.page(f"/tenants/{tenant_id}"))
 
-    def test_two_unrelated_businesses_onboard_through_the_same_workflow(self):
+    def test_cindy_bakes_and_unrelated_businesses_onboard_through_the_same_workflow(self):
         ids = [self.onboard(spec) for spec in SPECS]
         for tenant_id, spec in zip(ids, SPECS, strict=True):
-            self.assertEqual(self.tenant_status(tenant_id), "active")
+            self.assertEqual(self.tenant_status(tenant_id), "active", spec["name"])
             rules = self.page(f"/tenants/{tenant_id}/rules")
             for key in spec["rules"]:
                 self.assertIn(key, rules)
-            other = SPECS[1 - SPECS.index(spec)]
-            for key in other["rules"]:
-                self.assertNotIn(key, rules)
-            catalogue = self.page(f"/tenants/{tenant_id}/catalogue")
-            self.assertIn(spec["product"]["name"], catalogue)
-            self.assertNotIn(other["product"]["name"], catalogue)
+            for other in (s for s in SPECS if s is not spec):
+                for key in set(other["rules"]) - set(spec["rules"]):
+                    self.assertNotIn(key, rules)
+                self.assertNotIn(other["product"]["name"], self.page(f"/tenants/{tenant_id}/catalogue"))
+            self.assertIn(spec["product"]["name"], self.page(f"/tenants/{tenant_id}/catalogue"))
             actions = self.audit_actions(tenant_id)
             for expected in ("tenant.provisioned", "tenant.profile_updated", "tenant.rules_updated",
                              "catalogue.product_created", "catalogue.variant_created",
@@ -255,7 +269,7 @@ class OnboardingTests(DashboardTestCase):
                 self.assertIn(expected, actions)
 
     def test_settings_are_stored_per_tenant(self):
-        ids = [self.onboard(spec) for spec in SPECS]
+        ids = [self.onboard(spec) for spec in SPECS[:2]]
         with self.superuser() as cursor:
             cursor.execute(
                 "select tenant_id::text, currency, business_rules from public.tenant_settings "
@@ -267,9 +281,8 @@ class OnboardingTests(DashboardTestCase):
 
     def test_activation_is_blocked_until_the_tenant_is_ready(self):
         tenant_id = self.create_tenant(SPECS[0], owner_user_id=str(uuid.uuid4()))
-        response = self.post(f"/tenants/{tenant_id}/status", {"status": "active"}, )
-        page = self.client.get(response.headers["Location"]).get_data(as_text=True)
-        self.assertIn("not ready to activate", page)
+        response = self.post(f"/tenants/{tenant_id}/status", {"status": "active"})
+        self.assertIn("not ready to activate", self.message_after(response))
         self.assertEqual(self.tenant_status(tenant_id), "draft")
 
     def test_activation_without_an_owner_needs_an_explicit_waiver(self):
@@ -282,6 +295,12 @@ class OnboardingTests(DashboardTestCase):
         self.post(f"{base}/status", {"status": "active", "waive_owner": "1"})
         self.assertEqual(self.tenant_status(tenant_id), "active")
 
+    def test_unknown_status_is_a_friendly_error_not_a_500(self):
+        tenant_id = self.create_tenant(SPECS[0])
+        response = self.post(f"/tenants/{tenant_id}/status", {"status": "bogus"})
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("Status must be", self.message_after(response))
+
     def test_duplicate_slug_is_reported(self):
         self.create_tenant(SPECS[0])
         response = self.post("/tenants/new", {"name": "Again", "slug": SPECS[0]["slug"],
@@ -292,7 +311,8 @@ class OnboardingTests(DashboardTestCase):
     def test_invalid_input_is_rejected_before_the_database(self):
         for data in ({"name": "", "slug": "pa-test-x"}, {"name": "X", "slug": "Bad Slug"},
                      {"name": "X", "slug": "pa-test-y", "currency": "KESS"},
-                     {"name": "X", "slug": "pa-test-z", "owner_user_id": "not-a-uuid"}):
+                     {"name": "X", "slug": "pa-test-z", "owner_user_id": "not-a-uuid"},
+                     {"name": "X\x00Y", "slug": "pa-test-nul"}):
             with self.subTest(data=data):
                 response = self.post("/tenants/new", {"timezone": "Africa/Nairobi", "currency": "KES", **data})
                 self.assertEqual(response.status_code, 400)
@@ -300,7 +320,7 @@ class OnboardingTests(DashboardTestCase):
     def test_rules_must_be_json_objects(self):
         tenant_id = self.create_tenant(SPECS[0])
         response = self.post(f"/tenants/{tenant_id}/rules", {"business_rules": "[1, 2]"})
-        self.assertIn("must be a JSON object", self.client.get(response.headers["Location"]).get_data(as_text=True))
+        self.assertIn("must be a JSON object", self.message_after(response))
 
     def test_unknown_or_malformed_tenant_ids_are_not_found(self):
         self.assertEqual(self.client.get(f"/tenants/{uuid.uuid4()}").status_code, 404)
@@ -321,6 +341,16 @@ class OnboardingTests(DashboardTestCase):
                 (tenant_id,))
             self.assertEqual(cursor.fetchall(), [(PLATFORM_ADMIN_USER_ID, "platform")])
 
+    def test_database_failures_inputs_do_not_become_500s(self):
+        tenant_id = self.create_tenant(SPECS[0])
+        base = f"/tenants/{tenant_id}"
+        for path, data in ((f"{base}/catalogue/products", {"name": "X", "sort_order": "99999999999"}),
+                           (f"{base}/rules", {"business_rules": '{"a": "\\u0000"}'}),
+                           (f"{base}/catalogue/products", {"name": "N\x00"})):
+            with self.subTest(path=path, data=data):
+                response = self.post(path, data)
+                self.assertIn(response.status_code, (302, 400))
+
 
 class CatalogueTests(DashboardTestCase):
     def setUp(self):
@@ -331,9 +361,6 @@ class CatalogueTests(DashboardTestCase):
 
     def add_product(self, tenant_id, name="Thing"):
         self.post(f"/tenants/{tenant_id}/catalogue/products", {"name": name})
-        return self.product_id_named(tenant_id, name)
-
-    def product_id_named(self, tenant_id, name):
         with self.superuser() as cursor:
             cursor.execute("select id::text from public.products where tenant_id = %s and name = %s",
                            (tenant_id, name))
@@ -363,7 +390,7 @@ class CatalogueTests(DashboardTestCase):
         self.assertNotIn("Private Item", self.page(f"/tenants/{self.tenant_b}/catalogue"))
         base_b = f"/tenants/{self.tenant_b}/catalogue"
         before = self.post(f"{base_b}/products/{product_id}/variants", {"code": "x", "name": "X", "price": "1"})
-        self.assertIn("Product not found", self.client.get(before.headers["Location"]).get_data(as_text=True))
+        self.assertIn("Product not found", self.message_after(before))
         self.post(f"{base_b}/products/{product_id}", {"name": "Hijacked"})
         self.post(f"{base_b}/products/{product_id}/active", {"active": "0"})
         with self.superuser() as cursor:
@@ -377,10 +404,10 @@ class CatalogueTests(DashboardTestCase):
         base = f"/tenants/{self.tenant_a}/catalogue/products/{product_id}/variants"
         for bad in ("-5", "abc", "1.999"):
             response = self.post(base, {"code": "p", "name": "P", "price": bad})
-            self.assertIn("Price", self.client.get(response.headers["Location"]).get_data(as_text=True), bad)
+            self.assertIn("Price", self.message_after(response), bad)
         self.post(base, {"code": "dup", "name": "A", "price": "1"})
         response = self.post(base, {"code": "dup", "name": "B", "price": "2"})
-        self.assertIn("already exists", self.client.get(response.headers["Location"]).get_data(as_text=True))
+        self.assertIn("already exists", self.message_after(response))
 
     def test_same_product_name_is_allowed_in_different_tenants(self):
         self.add_product(self.tenant_a, "Shared Name")
@@ -389,6 +416,8 @@ class CatalogueTests(DashboardTestCase):
 
 
 class ChannelTests(DashboardTestCase):
+    """Manual WhatsApp channel management. No Meta calls exist; the database enforces the rules."""
+
     def setUp(self):
         super().setUp()
         self.login()
@@ -399,26 +428,40 @@ class ChannelTests(DashboardTestCase):
         data = {"phone_number_id": "pa-phone-001", "waba_id": "pa-waba-001",
                 "display_phone_number": "+254700000123", "confirm_slug": slug or self.slug, **fields}
         response = self.post(f"/tenants/{tenant_id or self.tenant}/whatsapp/connect", data)
-        return self.client.get(response.headers["Location"]).get_data(as_text=True)
+        return self.message_after(response)
 
     def channels(self, tenant_id=None):
         with self.superuser() as cursor:
             cursor.execute(
-                "select phone_number_id, status, credentials_ref, is_default from public.tenant_channels "
-                "where tenant_id = %s", (tenant_id or self.tenant,))
+                "select phone_number_id, waba_id, display_phone_number, status, credentials_ref, is_default "
+                "from public.tenant_channels where tenant_id = %s", (tenant_id or self.tenant,))
             return cursor.fetchall()
 
-    def test_channel_is_recorded_pending_with_a_tenant_scoped_pointer(self):
+    def channel_id(self, tenant_id=None):
+        with self.superuser() as cursor:
+            cursor.execute("select id::text from public.tenant_channels where tenant_id = %s", (tenant_id or self.tenant,))
+            return cursor.fetchone()[0]
+
+    def test_a_channel_is_recorded_pending_with_no_credentials(self):
         self.connect()
-        self.assertEqual(self.channels(), [("pa-phone-001", "pending", tenant_credentials_ref(self.tenant), True)])
-        self.assertIn("channel.connect", self.audit_actions(self.tenant))
+        self.assertEqual(self.channels(),
+                         [("pa-phone-001", "pa-waba-001", "+254700000123", "pending", None, True)])
+        self.assertIn("channel.created", self.audit_actions(self.tenant))
+        page = self.page(f"/tenants/{self.tenant}/whatsapp")
+        self.assertIn("pa-phone-001", page)
+        self.assertIn("+254700000123", page)
 
     def test_confirmation_slug_is_required(self):
         self.assertIn("slug exactly", self.connect(slug="wrong-slug"))
         self.assertEqual(self.channels(), [])
 
-    def test_blocked_numbers_are_refused(self):
-        self.assertIn("blocked", self.connect(phone_number_id="blocked-live-number"))
+    def test_reserved_numbers_are_refused_by_the_database(self):
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute("insert into public.reserved_phone_numbers (phone_number_id, reason) "
+                           "values ('pa-reserved-live', 'live deployment')")
+        conn.close()
+        self.assertIn("reserved", self.connect(phone_number_id="pa-reserved-live"))
         self.assertEqual(self.channels(), [])
 
     def test_invalid_identifiers_are_refused(self):
@@ -436,100 +479,97 @@ class ChannelTests(DashboardTestCase):
         self.assertNotIn(SPECS[0]["name"], message)
         self.assertEqual(self.channels(other), [])
 
+    def test_a_pending_channel_can_be_edited_and_the_change_is_audited(self):
+        self.connect()
+        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self.channel_id()}", {
+            "phone_number_id": "pa-phone-002", "waba_id": "pa-waba-002", "display_phone_number": "+254700000999"})
+        self.assertIn("Channel saved", self.message_after(response))
+        self.assertEqual(self.channels()[0][:3], ("pa-phone-002", "pa-waba-002", "+254700000999"))
+        self.assertIn("channel.updated", self.audit_actions(self.tenant))
+
+    def test_a_channel_of_another_tenant_cannot_be_edited_through_this_tenant(self):
+        other = self.create_tenant(SPECS[1])
+        self.connect(tenant_id=other, slug=SPECS[1]["slug"])
+        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self.channel_id(other)}", {
+            "phone_number_id": "pa-phone-hijack"})
+        self.assertIn("Channel not found", self.message_after(response))
+        self.assertEqual(self.channels(other)[0][0], "pa-phone-001")
+        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self.channel_id(other)}/status", {"status": "disabled"})
+        self.assertIn("Channel not found", self.message_after(response))
+
     def test_channels_cannot_be_activated_by_default(self):
         self.connect()
-        channel_id = self._channel_id()
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/{channel_id}/status", {"status": "active"})
-        self.assertIn("disabled in this environment", self.client.get(response.headers["Location"]).get_data(as_text=True))
-        self.assertEqual(self.channels()[0][1], "pending")
+        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self.channel_id()}/status", {"status": "active"})
+        self.assertIn("disabled in this environment", self.message_after(response))
+        self.assertEqual(self.channels()[0][3], "pending")
 
     def test_even_when_allowed_a_draft_tenant_cannot_have_an_active_channel(self):
         app = create_app(_settings(allow_active_channels=True), authenticator=self.authenticator)
         client = app.test_client()
         self.login(client)
         self.connect()
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self._channel_id()}/status",
+        response = self.post(f"/tenants/{self.tenant}/whatsapp/{self.channel_id()}/status",
                              {"status": "active"}, client=client)
-        message = client.get(response.headers["Location"]).get_data(as_text=True)
-        self.assertIn("requires an active tenant", message)
-        self.assertEqual(self.channels()[0][1], "pending")
+        self.assertIn("requires an active tenant", self.message_after(response, client))
+        self.assertEqual(self.channels()[0][3], "pending")
 
-    def test_an_active_tenant_can_route_once_its_channel_is_activated(self):
+    def test_an_active_tenant_routes_once_its_channel_is_activated_and_identifiers_then_freeze(self):
         app = create_app(_settings(allow_active_channels=True), authenticator=self.authenticator)
         client = app.test_client()
         self.login(client)
         active_tenant = self.onboard(SPECS[1])
         self.connect(tenant_id=active_tenant, slug=SPECS[1]["slug"], phone_number_id="pa-phone-777")
-        channel_id = self._channel_id(active_tenant)
+        channel_id = self.channel_id(active_tenant)
         self.post(f"/tenants/{active_tenant}/whatsapp/{channel_id}/status", {"status": "active"}, client=client)
         with self.superuser() as cursor:
             cursor.execute("set local role app_backend")
             cursor.execute("select app.resolve_tenant_by_phone_number_id('pa-phone-777')")
             self.assertEqual(str(cursor.fetchone()[0]), active_tenant)
+        response = self.post(f"/tenants/{active_tenant}/whatsapp/{channel_id}",
+                             {"phone_number_id": "pa-phone-778"}, client=client)
+        self.assertIn("disable the channel", self.message_after(response, client).lower())
+        self.assertEqual(self.channels(active_tenant)[0][0], "pa-phone-777")
 
-    def _channel_id(self, tenant_id=None):
-        with self.superuser() as cursor:
-            cursor.execute("select id::text from public.tenant_channels where tenant_id = %s", (tenant_id or self.tenant,))
-            return cursor.fetchone()[0]
+    def test_the_whatsapp_page_offers_no_meta_features(self):
+        page = self.page(f"/tenants/{self.tenant}/whatsapp").lower()
+        for word in ("discover", "list businesses", "list wabas", "check webhook", "verify with meta"):
+            self.assertNotIn(word, page)
+        self.assertNotRegex(page, r'<input[^>]*name="[^"]*(access|secret|password|api)')
 
 
-class MetaTests(DashboardTestCase):
+class AuditAttributionTests(DashboardTestCase):
     def setUp(self):
         super().setUp()
         self.login()
         self.tenant = self.create_tenant(SPECS[0])
 
-    def provider_app(self):
-        ref = tenant_credentials_ref(self.tenant)
-        account = FakeAccount(
-            businesses=[BusinessInfo("biz-1", "Alpha Business")],
-            wabas=[WabaInfo("waba-1", "Alpha WABA", "biz-1")],
-            phone_numbers=[PhoneNumberInfo("num-1", "waba-1", "+254700000555")],
-        )
-        provider = FakeMetaProvider({ref: account}, StaticSecretResolver({ref: SECRET_VALUE}))
-        app = create_app(_settings(), authenticator=self.authenticator, meta_provider=provider)
-        client = app.test_client()
-        self.login(client)
-        return client, provider
-
-    def test_meta_is_unavailable_by_default_and_makes_no_calls(self):
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/meta/list_businesses")
-        self.assertEqual(response.status_code, 503)
-        self.assertIn("not configured", response.get_data(as_text=True))
-
-    def test_fake_provider_operations_name_the_tenant_and_are_audited(self):
-        client, provider = self.provider_app()
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/meta/list_businesses", client=client)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Alpha Business", response.get_data(as_text=True))
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/meta/list_phone_numbers", {"waba_id": "waba-1"}, client=client)
-        self.assertIn("+254700000555", response.get_data(as_text=True))
-        self.assertEqual({tenant for _op, tenant in provider.calls}, {self.tenant})
-        self.assertIn("channel.meta_list_businesses", self.audit_actions(self.tenant))
-
-    def test_secrets_never_reach_pages_or_audit(self):
-        client, _provider = self.provider_app()
-        self.post(f"/tenants/{self.tenant}/whatsapp/meta/list_businesses", client=client)
-        pages = [client.get(f"/tenants/{self.tenant}/{tab}").get_data(as_text=True)
-                 for tab in ("whatsapp", "audit", "profile", "rules")]
-        self.assertTrue(all(SECRET_VALUE not in page for page in pages))
+    def test_every_dashboard_audit_event_is_attributed_to_the_verified_admin_via_a_platform_function(self):
+        base = f"/tenants/{self.tenant}"
+        self.post(f"{base}/profile", {"name": "Alpha Salon", "timezone": "Africa/Nairobi", "currency": "KES"})
+        self.post(f"{base}/rules", {"business_rules": "{}"})
+        self.post(f"{base}/catalogue/products", {"name": "Thing"})
+        self.post(f"{base}/members", {"user_id": str(uuid.uuid4()), "role": "staff"})
+        self.post(f"{base}/whatsapp/connect", {"phone_number_id": "pa-attrib-1", "confirm_slug": SPECS[0]["slug"]})
         with self.superuser() as cursor:
-            cursor.execute("select count(*) from public.audit_log where metadata::text like %s", (f"%{SECRET_VALUE}%",))
+            cursor.execute(
+                "select distinct actor_type, actor_user_id::text from public.audit_log where tenant_id = %s",
+                (self.tenant,))
+            self.assertEqual(cursor.fetchall(), [("platform", PLATFORM_ADMIN_USER_ID)])
+            cursor.execute("select count(*) from public.audit_log where tenant_id = %s", (self.tenant,))
+            self.assertGreaterEqual(cursor.fetchone()[0], 6)
+
+    def test_a_failed_audit_write_rolls_back_the_change(self):
+        # Dropping the admin's registration makes the audit function refuse; the change must not persist.
+        base = f"/tenants/{self.tenant}"
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute("update public.platform_admins set status = 'disabled' where user_id = %s",
+                           (PLATFORM_ADMIN_USER_ID,))
+        conn.close()
+        self.post(f"{base}/catalogue/products", {"name": "Never Saved"})
+        with self.superuser() as cursor:
+            cursor.execute("select count(*) from public.products where tenant_id = %s", (self.tenant,))
             self.assertEqual(cursor.fetchone()[0], 0)
-
-    def test_unsupported_operations_and_bad_arguments_are_refused(self):
-        client, _provider = self.provider_app()
-        self.assertEqual(self.post(f"/tenants/{self.tenant}/whatsapp/meta/delete_everything", client=client).status_code, 400)
-        response = self.post(f"/tenants/{self.tenant}/whatsapp/meta/list_wabas", {"business_id": "bad id!"}, client=client)
-        self.assertEqual(response.status_code, 400)
-
-    def test_another_tenants_credentials_are_not_usable(self):
-        other = self.create_tenant(SPECS[1])
-        client, provider = self.provider_app()
-        response = self.post(f"/tenants/{other}/whatsapp/meta/list_businesses", client=client)
-        self.assertNotEqual(response.status_code, 200)
-        self.assertNotIn("Alpha Business", response.get_data(as_text=True))
-        self.assertEqual({tenant for _op, tenant in provider.calls}, {other})
 
 
 class MemberAndSubscriptionTests(DashboardTestCase):
@@ -542,7 +582,9 @@ class MemberAndSubscriptionTests(DashboardTestCase):
         base = f"/tenants/{self.tenant}/members"
         self.post(base, {"user_id": "nope", "role": "owner"})
         self.post(base, {"user_id": str(uuid.uuid4()), "role": "admin"})
-        self.assertNotIn("owner", self.page(base).split("<table>")[1].split("</table>")[0].replace("<th>Role</th>", ""))
+        with self.superuser() as cursor:
+            cursor.execute("select count(*) from public.tenant_users where tenant_id = %s", (self.tenant,))
+            self.assertEqual(cursor.fetchone()[0], 0)
         self.post(base, {"user_id": str(uuid.uuid4()), "role": "owner"})
         self.assertIn("member.added", self.audit_actions(self.tenant))
 

@@ -2,18 +2,31 @@
 {% block content %}
 {% from "_macros.html" import csrf_field, tenant_tabs %}
 {{ tenant_tabs(tenant, tab) }}
-<h2>WhatsApp / Meta</h2>
+<h2>WhatsApp channel</h2>
+<p class="muted">Identifiers are entered by hand. Nothing here contacts Meta, and no access token is stored.</p>
 <table>
-  <tr><th>Phone number ID</th><th>WABA ID</th><th>Number</th><th>Status</th><th>Credentials ref</th><th></th></tr>
+  <tr><th>Phone number ID</th><th>WABA ID</th><th>Business number</th><th>Status</th><th>Default</th><th></th></tr>
   {% for c in channels %}
   <tr>
     <td>{{ c.phone_number_id }}</td><td>{{ c.waba_id or '-' }}</td><td>{{ c.display_phone_number or '-' }}</td>
-    <td>{{ c.status }}</td><td>{{ c.credentials_ref or '-' }}</td>
+    <td>{{ c.status }}</td><td>{{ 'yes' if c.is_default else '' }}</td>
     <td>
+      {% if c.status != 'active' %}
+      <details>
+        <summary>Edit</summary>
+        <form method="post" action="{{ url_for('admin.channel_update', tenant_id=tenant.id, channel_id=c.id) }}">
+          {{ csrf_field() }}
+          <label>Phone number ID <input name="phone_number_id" value="{{ c.phone_number_id }}" required></label>
+          <label>WABA ID <input name="waba_id" value="{{ c.waba_id or '' }}"></label>
+          <label>Business number (E.164) <input name="display_phone_number" value="{{ c.display_phone_number or '' }}"></label>
+          <button type="submit">Save channel</button>
+        </form>
+      </details>
+      {% endif %}
       <form method="post" class="inline" action="{{ url_for('admin.channel_status', tenant_id=tenant.id, channel_id=c.id) }}">
         {{ csrf_field() }}
         <select name="status">{% for s in ['pending', 'active', 'disabled'] %}<option {{ 'selected' if s == c.status else '' }}>{{ s }}</option>{% endfor %}</select>
-        <button type="submit">Set</button>
+        <button type="submit">Set status</button>
       </form>
     </td>
   </tr>
@@ -21,30 +34,13 @@
 </table>
 
 <h3>Record a channel</h3>
-<p class="muted">Channels are saved as pending. Only a pointer to credentials is stored, never a token.</p>
+<p class="muted">Saved as pending. A channel can only become active once the tenant is active, and only by a platform administrator.</p>
 <form method="post" action="{{ url_for('admin.channel_connect', tenant_id=tenant.id) }}" class="card narrow">
   {{ csrf_field() }}
   <label>Phone number ID <input name="phone_number_id" required></label>
   <label>WABA ID <input name="waba_id"></label>
-  <label>Display number (E.164) <input name="display_phone_number" placeholder="+254700000000"></label>
+  <label>Business number (E.164) <input name="display_phone_number" placeholder="+254700000000"></label>
   <label>Type the tenant slug to confirm <input name="confirm_slug" required autocomplete="off" placeholder="{{ tenant.slug }}"></label>
   <button type="submit">Save channel</button>
-</form>
-
-<h3>Meta discovery</h3>
-{% if meta_result is defined %}
-<pre>{{ meta_operation }}: {{ meta_result }}</pre>
-{% endif %}
-<form method="post" action="{{ url_for('admin.channel_meta', tenant_id=tenant.id, operation='list_businesses') }}" class="inline">
-  {{ csrf_field() }}<button type="submit">List businesses</button>
-</form>
-<form method="post" action="{{ url_for('admin.channel_meta', tenant_id=tenant.id, operation='list_wabas') }}" class="inline">
-  {{ csrf_field() }}<input name="business_id" placeholder="business id"><button type="submit">List WABAs</button>
-</form>
-<form method="post" action="{{ url_for('admin.channel_meta', tenant_id=tenant.id, operation='list_phone_numbers') }}" class="inline">
-  {{ csrf_field() }}<input name="waba_id" placeholder="WABA id"><button type="submit">List numbers</button>
-</form>
-<form method="post" action="{{ url_for('admin.channel_meta', tenant_id=tenant.id, operation='check_webhook') }}" class="inline">
-  {{ csrf_field() }}<input name="waba_id" placeholder="WABA id"><button type="submit">Check webhook</button>
 </form>
 {% endblock %}

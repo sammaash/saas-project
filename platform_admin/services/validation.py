@@ -22,10 +22,13 @@ class ServiceError(Exception):
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,39}$")
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 TIMEZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*$")
+INT_MAX = 2_147_483_647
 
 
 def text(value: Any, field: str, *, max_length: int = 200, required: bool = True) -> str | None:
     cleaned = (value or "").strip() if isinstance(value, str) or value is None else str(value).strip()
+    if "\x00" in cleaned:
+        raise ServiceError(f"{field} contains an invalid character.")
     if not cleaned:
         if required:
             raise ServiceError(f"{field} is required.")
@@ -79,6 +82,8 @@ def json_object(value: Any, field: str) -> dict[str, Any]:
     raw = (value or "").strip() if isinstance(value, str) or value is None else value
     if raw in ("", None):
         return {}
+    if isinstance(raw, str) and ("\x00" in raw or "\\u0000" in raw.lower()):
+        raise ServiceError(f"{field} contains an invalid character.")
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
@@ -107,8 +112,8 @@ def integer(value: Any, field: str, *, minimum: int = 0, default: int = 0) -> in
         number = int(str(value).strip())
     except ValueError:
         raise ServiceError(f"{field} must be a whole number.") from None
-    if number < minimum:
-        raise ServiceError(f"{field} must be at least {minimum}.")
+    if number < minimum or number > INT_MAX:
+        raise ServiceError(f"{field} must be between {minimum} and {INT_MAX}.")
     return number
 
 
@@ -135,11 +140,20 @@ def translate_db_error(error: Exception) -> ServiceError | None:
             return ServiceError("An active channel requires an active tenant.", 409)
         if message.startswith("tenant must retain"):
             return ServiceError("A tenant must keep at least one active owner.", 409)
+        if message.startswith(("this phone number is reserved", "disable the channel",
+                               "a channel cannot be moved")):
+            return ServiceError(message[0].upper() + message[1:] + ".", 409)
         return ServiceError("A value failed validation.", 400)
     if isinstance(error, pg.InsufficientPrivilege):
         return ServiceError("Not permitted.", 403)
     if isinstance(error, pg.NoDataFound):
-        return ServiceError("Tenant not found.", 404)
+        message = getattr(getattr(error, "diag", None), "message_primary", "") or "not found"
+        return ServiceError(message[0].upper() + message[1:] + ".", 404)
+    if isinstance(error, pg.InvalidParameterValue):
+        message = getattr(getattr(error, "diag", None), "message_primary", "") or "invalid value"
+        return ServiceError(message[0].upper() + message[1:] + ".", 400)
+    if isinstance(error, pg.DataError):
+        return ServiceError("A value is invalid or out of range.", 400)
     return None
 
 

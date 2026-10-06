@@ -1,12 +1,12 @@
-"""Tenant-scoped administration data access (products, settings, members, channels...).
+"""Tenant-scoped administration data access (products, settings, members, channel reads).
 
 Every operation runs through ``tenant_transaction`` as ``app_backend`` with the tenant
 context set by the server, so RLS confines all reads and writes to that one tenant. The
 caller never supplies a tenant id inside a row: every statement filters on
 ``app.current_tenant_id()`` and every insert takes the tenant from it.
 
-``tenant_admin(tenant_id)`` yields a :class:`TenantAdmin`; several operations (including
-the audit record) share one transaction, so a change and its audit row commit together.
+Channels are read-only here and platform-attributed audit events are not written here:
+both go through the ``app.platform_*`` functions (see ``saas.platform``).
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from .tenant_context import tenant_transaction
 SETTINGS_JSON_COLUMNS = ("business_rules", "bot_persona", "business_hours", "configuration")
 PRODUCT_FIELDS = ("name", "description", "category", "sort_order", "attributes", "is_active")
 VARIANT_FIELDS = ("code", "name", "price", "attributes", "sort_order", "is_active")
-CHANNEL_STATUSES = ("pending", "active", "disabled")
 
 
 def _jsonb(value: Any) -> Any:
@@ -219,35 +218,6 @@ class TenantAdmin:
             "where tenant_id = app.current_tenant_id() order by is_default desc, created_at"
         )
 
-    def create_channel(
-        self,
-        phone_number_id: str,
-        waba_id: str | None,
-        display_phone_number: str | None,
-        credentials_ref: str | None,
-        is_default: bool,
-    ) -> str:
-        """Insert a channel as ``pending``; activation is a separate, guarded step."""
-        self._cursor.execute(
-            "insert into public.tenant_channels "
-            "(tenant_id, channel_type, phone_number_id, waba_id, display_phone_number, "
-            " status, is_default, credentials_ref) "
-            "values (app.current_tenant_id(), 'whatsapp', %s, %s, %s, 'pending', %s, %s) "
-            "returning id",
-            (phone_number_id, waba_id, display_phone_number, is_default, credentials_ref),
-        )
-        return str(self._cursor.fetchone()[0])
-
-    def set_channel_status(self, channel_id: str, status: str) -> bool:
-        if status not in CHANNEL_STATUSES:
-            raise ValueError(f"Unsupported channel status {status!r}")
-        self._cursor.execute(
-            "update public.tenant_channels set status = %s "
-            "where id = %s and tenant_id = app.current_tenant_id()",
-            (status, channel_id),
-        )
-        return self._cursor.rowcount == 1
-
     # -- subscription / plans ------------------------------------------------
     def list_plans(self) -> list[dict[str, Any]]:
         return self._all(
@@ -287,19 +257,4 @@ class TenantAdmin:
             "created_at from public.audit_log where tenant_id = app.current_tenant_id() "
             "order by created_at desc, id desc limit %s",
             (max(1, min(int(limit), 500)),),
-        )
-
-    def record_audit(
-        self,
-        actor_user_id: str,
-        action: str,
-        entity_type: str | None = None,
-        entity_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        self._cursor.execute(
-            "insert into public.audit_log "
-            "(tenant_id, actor_user_id, actor_type, action, entity_type, entity_id, metadata) "
-            "values (app.current_tenant_id(), %s, 'platform', %s, %s, %s, %s)",
-            (actor_user_id, action, entity_type, entity_id, _jsonb(metadata or {})),
         )
