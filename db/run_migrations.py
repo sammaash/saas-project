@@ -85,6 +85,58 @@ def _psycopg():
     return psycopg
 
 
+PROVISIONER_ROLE = "saas_platform_provisioner"
+
+
+def ensure_provisioner_access(conn) -> bool:
+    """Let a non-superuser migration role own functions as the provisioner (hosted PostgreSQL).
+
+    ``ALTER FUNCTION ... OWNER TO`` and ``CREATE OR REPLACE`` on provisioner-owned functions
+    need SET and INHERIT on that role. On PostgreSQL 16+ (Supabase) a CREATEROLE user that
+    creates a role holds only ADMIN on it, so the runner creates the role with the same
+    attributes migration 0013 uses and grants itself that membership for the run only.
+    A superuser needs nothing. Returns True when a membership was granted (release it after).
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "select rolsuper, current_setting('server_version_num')::int "
+            "from pg_catalog.pg_roles where rolname = current_user"
+        )
+        is_superuser, version = cursor.fetchone()
+        if is_superuser:
+            return False
+        cursor.execute("select 1 from pg_catalog.pg_roles where rolname = %s", (PROVISIONER_ROLE,))
+        if cursor.fetchone() is None:
+            cursor.execute(f"create role {PROVISIONER_ROLE} nologin noinherit nobypassrls")
+        if version >= 160000:
+            cursor.execute(
+                "select pg_catalog.pg_has_role(current_user, %s, 'USAGE') "
+                "and pg_catalog.pg_has_role(current_user, %s, 'SET')",
+                (PROVISIONER_ROLE, PROVISIONER_ROLE),
+            )
+            if cursor.fetchone()[0]:
+                conn.commit()
+                return False
+            cursor.execute(f"grant {PROVISIONER_ROLE} to current_user with inherit true, set true")
+        else:
+            cursor.execute(
+                "select pg_catalog.pg_has_role(current_user, %s, 'MEMBER')", (PROVISIONER_ROLE,)
+            )
+            if cursor.fetchone()[0]:
+                conn.commit()
+                return False
+            cursor.execute(f"grant {PROVISIONER_ROLE} to current_user")
+    conn.commit()
+    return True
+
+
+def release_provisioner_access(conn) -> None:
+    """Drop the temporary membership granted by :func:`ensure_provisioner_access`."""
+    with conn.cursor() as cursor:
+        cursor.execute(f"revoke {PROVISIONER_ROLE} from current_user")
+    conn.commit()
+
+
 def _checksum(sql: str) -> str:
     return hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
 
@@ -274,17 +326,23 @@ def main(argv: list[str] | None = None) -> int:
             print_status(conn)
             return 0
 
-        apply_migrations(conn)
+        granted = ensure_provisioner_access(conn)
+        try:
+            apply_migrations(conn)
 
-        if dev_data:
-            # The db/local and db/seeds scripts refuse to run without this session setting.
-            conn.execute("select set_config('saas.allow_dev_data', 'on', false)")
+            if dev_data:
+                # The db/local and db/seeds scripts refuse to run without this session setting.
+                conn.execute("select set_config('saas.allow_dev_data', 'on', false)")
 
-        if args.include_local:
-            apply_all(conn, LOCAL_DIR, "local")
+            if args.include_local:
+                apply_all(conn, LOCAL_DIR, "local")
 
-        if args.seed:
-            apply_all(conn, SEEDS_DIR, "seed")
+            if args.seed:
+                apply_all(conn, SEEDS_DIR, "seed")
+        finally:
+            if granted:
+                conn.rollback()
+                release_provisioner_access(conn)
 
     print("migrations complete")
     return 0
