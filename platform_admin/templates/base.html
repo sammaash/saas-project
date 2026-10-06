@@ -1,0 +1,31 @@
+{% macro csrf_field() %}<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}Platform Admin{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ url_for('admin.overview') }}">Platform Admin</a>
+  {% if session.get('user_id') %}
+  <nav>
+    <a href="{{ url_for('admin.overview') }}">Overview</a>
+    <a href="{{ url_for('admin.tenants') }}">Tenants</a>
+  </nav>
+  <form method="post" action="{{ url_for('auth.logout') }}" class="inline">
+    {{ csrf_field() }}<button type="submit" class="link">Sign out</button>
+  </form>
+  {% endif %}
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

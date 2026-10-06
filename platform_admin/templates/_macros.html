@@ -1,0 +1,19 @@
+{% macro csrf_field() %}<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% endmacro %}
+
+{% macro tenant_tabs(tenant, tab) %}
+<h1>{{ tenant.name }} <span class="badge {{ tenant.status }}">{{ tenant.status }}</span></h1>
+<p class="muted">{{ tenant.slug }}</p>
+<nav class="tabs">
+  {% for key, label, endpoint in [
+    ('overview', 'Overview', 'admin.tenant_overview'),
+    ('profile', 'Business profile', 'admin.tenant_profile'),
+    ('rules', 'Rules / AI', 'admin.tenant_rules'),
+    ('catalogue', 'Catalogue', 'admin.tenant_catalogue'),
+    ('whatsapp', 'WhatsApp / Meta', 'admin.tenant_whatsapp'),
+    ('members', 'Members', 'admin.tenant_members'),
+    ('subscription', 'Subscription', 'admin.tenant_subscription'),
+    ('audit', 'Audit log', 'admin.tenant_audit')] %}
+    <a href="{{ url_for(endpoint, tenant_id=tenant.id) }}" class="{{ 'active' if tab == key else '' }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+{% endmacro %}

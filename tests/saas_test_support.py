@@ -185,6 +185,51 @@ def as_user(user_id: str | None, url: str | None = None) -> Iterator[Any]:
         conn.close()
 
 
+def platform_admin_test_url() -> str | None:
+    """Local test DSN for the saas_platform_admin login configured by db/local/."""
+    base = test_database_url()
+    if not base:
+        return None
+    parts = urlsplit(base)
+    if not parts.hostname:
+        return None
+    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = f"saas_platform_admin:dev_platform_admin_password@{hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+PLATFORM_ADMIN_USER_ID = "f0000000-0000-4000-8000-000000000001"
+
+
+@contextlib.contextmanager
+def as_platform(
+    user_id: str | None, register: bool = True, url: str | None = None
+) -> Iterator[Any]:
+    """Act as the platform API: saas_platform_admin plus verified JWT claims.
+
+    ``register`` inserts the identity into platform_admins first (rolled back afterwards),
+    so a test can prove both the allowed and the denied case.
+    """
+    conn = _connect(url)
+    try:
+        with conn.cursor() as cursor:
+            if user_id and register:
+                cursor.execute(
+                    "insert into public.platform_admins (user_id) values (%s) "
+                    "on conflict (user_id) do update set status = 'active'",
+                    (user_id,),
+                )
+            cursor.execute("set local role saas_platform_admin")
+            claims = json.dumps({"sub": str(user_id)}) if user_id else "{}"
+            cursor.execute("select set_config('request.jwt.claims', %s, true)", (claims,))
+            yield cursor
+    finally:
+        conn.rollback()
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Base test case
 # ---------------------------------------------------------------------------
