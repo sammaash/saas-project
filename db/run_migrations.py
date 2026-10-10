@@ -215,12 +215,11 @@ def apply_all(conn, directory: Path, label: str) -> None:
         conn.commit()
 
 
+
 def print_status(conn) -> None:
     """Show which migrations are applied and which are pending."""
-    _run_script(conn, LEDGER_SQL)
-    conn.commit()
-
     applied = _applied(conn)
+
     if not applied:
         print("no migrations recorded yet")
     else:
@@ -228,11 +227,29 @@ def print_status(conn) -> None:
         for version in sorted(applied):
             print(f"  {version}  ({applied[version]})")
 
-    pending = [path.name for path in _sql_files(MIGRATIONS_DIR) if path.name not in applied]
+    files = _sql_files(MIGRATIONS_DIR)
+    pending = [
+        path.name for path in files
+        if path.name not in applied
+    ]
+
     if pending:
         print("not applied yet:")
         for name in pending:
             print(f"  {name}")
+
+    mismatches = [
+        (path.name, applied[path.name], _checksum(path.read_text(encoding="utf-8")))
+        for path in files
+        if path.name in applied
+        and applied[path.name] != _checksum(path.read_text(encoding="utf-8"))
+    ]
+
+    if mismatches:
+        print("CHECKSUM MISMATCHES:")
+        for name, recorded, current in mismatches:
+            print(f"  {name}: recorded={recorded}, current={current}")
+
 
 
 def main(argv: list[str] | None = None) -> int:

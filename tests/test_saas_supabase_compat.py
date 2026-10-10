@@ -56,12 +56,14 @@ class DefaultPrivilegeTests(SaasDatabaseTestCase):
                 self.assertEqual(_granted(cursor, "anon", table), set())
             with self.subTest(table=table, role="authenticated"):
                 self.assertEqual(_granted(cursor, "authenticated", table), AUTHENTICATED_EXPECTED.get(table, set()))
+            with self.subTest(table=table, role="service_role"):
+                self.assertEqual(_granted(cursor, "service_role", table), set())
         cursor.execute("select has_column_privilege('authenticated', 'public.tenants', 'name', 'UPDATE')")
         self.assertTrue(cursor.fetchone()[0])
         for column in ("status", "slug", "id"):
             cursor.execute("select has_column_privilege('authenticated', 'public.tenants', %s, 'UPDATE')", (column,))
             self.assertFalse(cursor.fetchone()[0], column)
-        for role in ("anon", "authenticated"):
+        for role in ("anon", "authenticated", "service_role"):
             cursor.execute("select has_sequence_privilege(%s, 'public.audit_log_id_seq', 'USAGE,SELECT,UPDATE')", (role,))
             self.assertFalse(cursor.fetchone()[0], role)
         cursor.execute("select relrowsecurity from pg_class where oid = 'public.saas_schema_migrations'::regclass")
@@ -75,11 +77,21 @@ class DefaultPrivilegeTests(SaasDatabaseTestCase):
         import psycopg  # noqa: PLC0415
 
         with self.superuser() as cursor:
-            cursor.execute("grant all on all tables in schema public to anon, authenticated")
-            cursor.execute("grant all on all sequences in schema public to anon, authenticated")
+            cursor.execute(
+                "do $$ begin "
+                "if not exists (select 1 from pg_roles where rolname = 'service_role') then "
+                "create role service_role nologin; "
+                "end if; "
+                "end $$"
+            )
+            cursor.execute("grant all on all tables in schema public to anon, authenticated, service_role")
+            cursor.execute("grant all on all sequences in schema public to anon, authenticated, service_role")
             cursor.execute("alter table public.saas_schema_migrations disable row level security")
-            cursor.execute("grant all on public.saas_schema_migrations to anon, authenticated")
+            cursor.execute("grant all on public.saas_schema_migrations to anon, authenticated, service_role")
             self.assertGreater(len(_granted(cursor, "anon", "products")), 1, "simulation did not take effect")
+            self.assertGreater(
+                len(_granted(cursor, "service_role", "products")), 1, "simulation did not take effect"
+            )
             sql = HARDENING.read_text(encoding="utf-8")
             for _ in range(repeat):
                 psycopg.ClientCursor(cursor.connection).execute(sql)

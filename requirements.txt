@@ -14,3 +14,6 @@ psycopg[binary]>=3.1
 # Platform admin dashboard (Phase 3): server-rendered Flask app + Supabase JWT verification.
 Flask>=3.0
 PyJWT[crypto]>=2.8
+
+# Production WSGI server for Railway
+gunicorn>=23.0

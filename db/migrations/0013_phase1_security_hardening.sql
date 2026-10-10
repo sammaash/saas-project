@@ -13,8 +13,28 @@ begin
 end
 $$;
 
-alter role saas_platform_admin nologin noinherit nobypassrls;
-alter role saas_platform_provisioner nologin noinherit nobypassrls;
+alter role saas_platform_admin nologin noinherit;
+alter role saas_platform_provisioner nologin noinherit;
+
+-- ALTER ROLE ... NOBYPASSRLS needs superuser, so on hosted PostgreSQL (Supabase) we warn
+-- rather than fail the migration (verify manually in that case). Same pattern as 0002.
+do $$
+begin
+  begin
+    alter role saas_platform_admin nobypassrls;
+  exception
+    when insufficient_privilege then
+      raise notice 'Skipped NOBYPASSRLS on saas_platform_admin (requires superuser). Verify saas_platform_admin does not hold BYPASSRLS.';
+  end;
+
+  begin
+    alter role saas_platform_provisioner nobypassrls;
+  exception
+    when insufficient_privilege then
+      raise notice 'Skipped NOBYPASSRLS on saas_platform_provisioner (requires superuser). Verify saas_platform_provisioner does not hold BYPASSRLS.';
+  end;
+end
+$$;
 
 create index if not exists subscriptions_plan_idx
   on public.subscriptions (plan_id);

@@ -93,6 +93,11 @@ TABLES_WITH_NULLABLE_TENANT_ID = ("audit_log",)
 # Connections and identity switching
 # ---------------------------------------------------------------------------
 def test_database_url() -> str | None:
+
+
+    """Connection string for the isolation tests (CI points this at its service container)."""
+    test_database_url.__test__ = False
+
     """Connection string for the isolation tests (CI points this at its service container)."""
     if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
         return os.getenv("SAAS_TEST_DATABASE_URL")
