@@ -3,6 +3,8 @@
 -- ============================================================================
 -- This script looks up the existing tenant by slug. It never inserts a tenant.
 
+do $$ begin if coalesce(current_setting('saas.allow_dev_data', true), '') <> 'on' then raise exception 'development-only seed: refusing to run without saas.allow_dev_data=on (db/run_migrations.py sets it for local databases only)'; end if; end $$;
+
 with cindy as (
   select id from public.tenants where slug = 'cindy-bakes'
 ), products_to_seed(name, category, sort_order) as (
@@ -38,8 +40,8 @@ with cindy_products as (
     ('Red Velvet','1kg','1 kg',3100.00,1,10),('Red Velvet','2kg','2 kg',4700.00,2,20),('Red Velvet','3kg','3 kg',6000.00,3,30),
     ('Chocolate','1kg','1 kg',3100.00,1,10),('Chocolate','2kg','2 kg',4700.00,2,20),('Chocolate','3kg','3 kg',6000.00,3,30)
 )
-insert into public.product_variants (tenant_id, product_id, code, name, price, attributes, sort_order)
+insert into public.product_variants (tenant_id, product_id, code, name, price, attributes, sort_order, sku)
 select p.tenant_id, p.id, prices.code, prices.variant_name, prices.price,
-       jsonb_build_object('weight_kg', prices.weight_kg), prices.sort_order
+       jsonb_build_object('weight_kg', prices.weight_kg), prices.sort_order,left(p.id::text || '-' || prices.code, 100)
 from cindy_products p join prices on prices.product_name = p.name
 on conflict (tenant_id, product_id, code) do nothing;

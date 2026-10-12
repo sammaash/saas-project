@@ -1,0 +1,177 @@
+{% macro csrf_field() %}<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% endmacro %}
+{% if panel == 'catalogue' %}
+<div class="panel-heading">
+  <div><span class="eyebrow">Interactive message</span><h2>Catalogue</h2></div>
+  <span class="cart-count">{{ cart.item_count }} in cart</span>
+</div>
+{% if catalogue %}
+<div class="product-grid">
+  {% for product in catalogue %}
+  <article class="product-card {% if selected_product_id == product.id %}selected{% endif %}">
+    {% if product.image_url %}
+    <img src="{{ product.image_url }}" alt="{{ product.name }}">
+    {% else %}
+    <div class="product-placeholder" aria-label="No product image available"><span>No image</span></div>
+    {% endif %}
+    <div class="product-body">
+      <h3>{{ product.name }}</h3>
+      {% if product.description %}<p>{{ product.description }}</p>{% endif %}
+      {% if product.category %}<span class="category">{{ product.category }}</span>{% endif %}
+      <form method="post" action="{{ url_for('admin.bot_playground') }}" class="product-detail-action">
+        {{ csrf_field() }}
+        <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+        <input type="hidden" name="product_id" value="{{ product.id }}">
+        <button type="submit" name="action" value="view_product">View product</button>
+      </form>
+      <div class="variant-list">
+        {% for variant in product.variants %}
+        <form method="post" action="{{ url_for('admin.bot_playground') }}" class="variant-row">
+          {{ csrf_field() }}
+          <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+          <input type="hidden" name="product_id" value="{{ product.id }}">
+          <input type="hidden" name="variant_id" value="{{ variant.id }}">
+          <div>
+            <strong>{{ variant.name }}</strong>
+            <span>{{ settings.currency }} {{ '%.2f' | format(variant.price) }}</span>
+            <span>{{ variant.availability | replace('_', ' ') | title }}</span>
+            {% if variant.stock_quantity is not none %}<span>{{ variant.stock_quantity }} configured in stock</span>{% endif %}
+          </div>
+          <label>Qty
+            <input type="number" name="quantity" value="1" min="1" max="99">
+          </label>
+          <button type="submit" name="action" value="add_cart" {{ 'disabled' if variant.availability == 'OUT_OF_STOCK' else '' }}>
+            {{ 'Unavailable' if variant.availability == 'OUT_OF_STOCK' else 'Add to cart' }}
+          </button>
+        </form>
+        {% else %}
+        <p class="muted">No active variants are available.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state"><h2>No active products</h2><p>This tenant has no active catalogue items to display.</p></div>
+{% endif %}
+
+{% elif panel == 'cart' %}
+<div class="panel-heading"><div><span class="eyebrow">Interactive message</span><h2>Demo cart</h2></div></div>
+{% if cart["items"] %}
+<div class="cart-lines">
+  {% for item in cart["items"] %}
+  <form method="post" action="{{ url_for('admin.bot_playground') }}" class="cart-line">
+    {{ csrf_field() }}
+    <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <input type="hidden" name="product_id" value="{{ item.product_id }}">
+    <input type="hidden" name="variant_id" value="{{ item.variant_id }}">
+    <div>
+      <strong>{{ item.product_name }}</strong>
+      <span>{{ item.variant_name }} &middot; {{ cart.currency }} {{ item.unit_price }}</span>
+      {% if item.availability_note %}<span>{{ item.availability_note }}</span>{% endif %}
+    </div>
+    <label>Qty
+      <input type="number" name="quantity" value="{{ item.quantity }}" min="0" max="99">
+    </label>
+    <strong>{{ cart.currency }} {{ item.subtotal }}</strong>
+    <button type="submit" name="action" value="update_cart">Update</button>
+    <button class="link-danger" type="submit" name="action" value="remove_cart">Remove</button>
+  </form>
+  {% endfor %}
+</div>
+<div class="cart-total"><span>Total</span><strong>{{ cart.currency }} {{ cart.total }}</strong></div>
+<div class="panel-actions">
+  <form method="post" action="{{ url_for('admin.bot_playground') }}">
+    {{ csrf_field() }}<input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button class="danger-outline" type="submit" name="action" value="clear_cart">Clear cart</button>
+  </form>
+  <form method="post" action="{{ url_for('admin.bot_playground') }}">
+    {{ csrf_field() }}<input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button type="submit" name="action" value="checkout">Demo checkout</button>
+  </form>
+</div>
+{% else %}
+<div class="empty-state"><h2>Your demo cart is empty</h2><p>Browse the tenant's active catalogue to add an item.</p>
+  <form method="post" action="{{ url_for('admin.bot_playground') }}">
+    {{ csrf_field() }}<input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+    <button type="submit" name="action" value="browse">Browse catalogue</button>
+  </form>
+</div>
+{% endif %}
+
+{% elif panel == 'checkout' %}
+<div class="panel-heading"><div><span class="eyebrow">DEMO &middot; NOT A REAL ORDER</span><h2>Checkout summary</h2></div></div>
+{% if cart["items"] %}
+<div class="checkout-summary">
+  {% for item in cart["items"] %}<p><span>{{ item.quantity }} &times; {{ item.product_name }} &middot; {{ item.variant_name }}</span><strong>{{ cart.currency }} {{ item.subtotal }}</strong></p>{% endfor %}
+  <p class="cart-total"><span>Total</span><strong>{{ cart.currency }} {{ cart.total }}</strong></p>
+</div>
+<div class="configuration-status">
+  <p><strong>Delivery:</strong>
+    {% if checkout.delivery_configured %}Configured{% if checkout.delivery_methods %}: {{ checkout.delivery_methods | join(', ') }}{% endif %}
+    {% else %}    Not configured for this tenant{% endif %}
+  </p>
+  <p><strong>Payment:</strong>
+    {% if checkout.payment_configured %}Configured{% if checkout.payment_methods %}: {{ checkout.payment_methods | join(', ') }}{% endif %}
+    {% else %}    Not configured for this tenant{% endif %}
+  </p>
+</div>
+<form method="post" action="{{ url_for('admin.bot_playground') }}" class="checkout-form">
+  {{ csrf_field() }}
+  <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+  <label>Sample customer name
+    <input name="customer_name" required maxlength="120" autocomplete="off">
+  </label>
+  {% if checkout.delivery_configured %}
+  <label>Sample delivery details
+    <textarea name="delivery_details" required maxlength="500" rows="3"></textarea>
+  </label>
+  {% endif %}
+  <p class="warning-note">Confirmation is a simulation only. It will not create an order, reserve stock, request payment or send a message.</p>
+  <button type="submit" name="action" value="confirm_checkout">Confirm demo checkout</button>
+</form>
+{% else %}
+<div class="empty-state"><h2>Nothing to check out</h2><p>Add an active catalogue variant first.</p></div>
+{% endif %}
+
+{% elif panel == 'confirmation' and result and result.confirmation %}
+<div class="demo-receipt">
+  <span class="demo-label">DEMO &middot; NOT A REAL ORDER</span>
+  <h2>Simulation complete</h2>
+  <p>No order, inventory reservation, payment or WhatsApp message was created.</p>
+  {% for item in result.confirmation.cart["items"] %}
+  <p><span>{{ item.quantity }} &times; {{ item.product_name }} &middot; {{ item.variant_name }}</span><strong>{{ result.confirmation.cart.currency }} {{ item.subtotal }}</strong></p>
+  {% endfor %}
+  <p class="cart-total"><span>Simulated total</span><strong>{{ result.confirmation.cart.currency }} {{ result.confirmation.cart.total }}</strong></p>
+  {% if not result.confirmation.capabilities.delivery_configured %}<p class="warning-note">Delivery has not been configured for this tenant.</p>{% endif %}
+  {% if not result.confirmation.capabilities.payment_configured %}<p class="warning-note">Payment methods have not been configured for this tenant.</p>{% endif %}
+</div>
+
+{% else %}
+<div class="welcome-panel">
+  <span class="eyebrow">WhatsApp-style test journey</span>
+  <h2>Choose a structured action or talk to the assistant</h2>
+  <p>Product selection, prices, totals and demo checkout are handled by server-side code. Free-text messages use the shared AI engine with this tenant's persona, rules, hours and configuration.</p>
+  <div class="menu-list">
+    {% for action, title, description in [
+      ('browse', 'Browse catalogue', 'View active products, variants and server prices.'),
+      ('view_cart', 'View cart', 'Review quantities and calculated totals.'),
+      ('checkout', 'Checkout', 'Preview a test-only checkout journey.'),
+      ('talk', 'Talk to assistant', 'Continue with a free-text AI conversation.')
+    ] %}
+    <form method="post" action="{{ url_for('admin.bot_playground') }}">
+      {{ csrf_field() }}<input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+      <button type="submit" name="action" value="{{ action }}"><strong>{{ title }}</strong><span>{{ description }}</span></button>
+    </form>
+    {% endfor %}
+  </div>
+  <details class="configuration-details">
+    <summary>Tenant context used by the assistant</summary>
+    <p><strong>Currency:</strong> {{ settings.currency }} &middot; <strong>Timezone:</strong> {{ settings.timezone }}</p>
+    <p><strong>Business rules:</strong> {{ settings.business_rules | tojson }}</p>
+    <p><strong>Bot persona:</strong> {{ settings.bot_persona | tojson }}</p>
+    <p><strong>Business hours:</strong> {{ settings.business_hours | tojson }}</p>
+    <p><strong>Configuration:</strong> {{ settings.configuration | tojson }}</p>
+  </details>
+</div>
+{% endif %}

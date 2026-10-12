@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Review</h2>
+<table>
+  {% for check in readiness.checks %}
+  <tr><td>{{ check.label }}{% if not check.required %} <span class="muted">(optional)</span>{% endif %}</td>
+      <td>{{ 'Done' if check.ok else 'Missing' }}</td></tr>
+  {% endfor %}
+</table>
+<h2>Status</h2>
+{% if tenant.status != 'active' %}
+<form method="post" action="{{ url_for('admin.tenant_status', tenant_id=tenant.id) }}" class="card narrow">
+  {{ csrf_field() }}
+  <input type="hidden" name="status" value="active">
+  <label class="check"><input type="checkbox" name="waive_owner" value="1"> Activate without an owner</label>
+  <button type="submit">Activate tenant</button>
+</form>
+{% endif %}
+{% if tenant.status == 'active' %}
+<form method="post" action="{{ url_for('admin.tenant_status', tenant_id=tenant.id) }}" class="inline">
+  {{ csrf_field() }}<input type="hidden" name="status" value="suspended"><button type="submit">Suspend</button>
+</form>
+{% endif %}
+{% endblock %}

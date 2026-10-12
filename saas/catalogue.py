@@ -43,7 +43,8 @@ class CatalogueService:
             select p.id as product_id, p.name as product_name, p.description, p.category,
                    p.attributes as product_attributes, p.sort_order as product_sort_order,
                    v.id as variant_id, v.code as variant_code, v.name as variant_name,
-                   v.price, v.attributes as variant_attributes, v.sort_order as variant_sort_order
+                   v.price, v.attributes as variant_attributes, v.sort_order as variant_sort_order,
+                   v.sku, v.availability, v.stock_quantity, v.reorder_level
             from public.products p
             join public.product_variants v
               on v.product_id = p.id and v.tenant_id = p.tenant_id
@@ -62,7 +63,10 @@ class CatalogueService:
             product["variants"].append({
                 "id": row["variant_id"], "code": row["variant_code"],
                 "name": row["variant_name"], "price": row["price"],
-                "attributes": row["variant_attributes"],
+                "attributes": row["variant_attributes"], "sku": row["sku"],
+                "availability": row["availability"],
+                "stock_quantity": row["stock_quantity"],
+                "reorder_level": row["reorder_level"],
             })
         return list(products.values())
 
@@ -86,7 +90,8 @@ class CatalogueService:
         """Resolve an active weight variant for a tenant-owned product."""
         rows = self._fetchall(
             """
-            select id, product_id, code, name, price, attributes
+            select id, product_id, code, name, price, attributes, sku, availability,
+                   stock_quantity, reorder_level
             from public.product_variants
             where tenant_id = app.current_tenant_id()
               and product_id = %s

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Business profile</h2>
+<form method="post" class="card narrow">
+  {{ csrf_field() }}
+  <label>Business name <input name="name" value="{{ profile.tenant.name }}" required maxlength="200"></label>
+  <label>Timezone <input name="timezone" value="{{ profile.settings.timezone }}" required></label>
+  <label>Currency <input name="currency" value="{{ profile.settings.currency }}" required maxlength="3"></label>
+  <button type="submit">Save profile</button>
+</form>
+{% endblock %}

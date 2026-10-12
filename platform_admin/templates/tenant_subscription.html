@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Subscription</h2>
+{% if data.subscription %}
+<p>Plan: {{ data.subscription.plan_name }} &middot; Status: {{ data.subscription.status }} &middot; Billing: {{ data.subscription.billing_method }}</p>
+{% else %}<p class="muted">No live subscription.</p>{% endif %}
+<form method="post" class="card narrow">
+  {{ csrf_field() }}
+  <label>Plan <select name="plan_id">{% for p in data.plans %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}</select></label>
+  <label>Status <select name="status">{% for s in statuses %}<option>{{ s }}</option>{% endfor %}</select></label>
+  <button type="submit">Save subscription</button>
+</form>
+{% endblock %}

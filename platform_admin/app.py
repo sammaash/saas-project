@@ -1,0 +1,127 @@
+"""Application factory for the private platform admin dashboard."""
+
+from __future__ import annotations
+
+import logging
+import traceback
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING
+
+from flask import Flask, render_template, request
+from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+from . import csrf
+from .auth import AuthError, Authenticator, Identity, LoginRateLimiter, SupabaseAuthenticator
+from .config import Settings
+from .services.validation import ServiceError, translate_db_error
+
+logger = logging.getLogger("platform_admin")
+
+if TYPE_CHECKING:
+    from saas.bot import BotResponseProvider
+
+
+def _log_unexpected_error(error: Exception) -> None:
+    stack = "Traceback (most recent call last):\n" + "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(error.__traceback__)
+    )
+    logger.error(
+        "Unhandled %s endpoint=%s method=%s sqlstate=%s\n%s",
+        type(error).__name__,
+        request.endpoint or "<unknown>",
+        request.method if request else "<unknown>",
+        getattr(error, "sqlstate", None),
+        stack,
+    )
+
+
+class _UnconfiguredAuthenticator(Authenticator):
+    def login(self, email: str, password: str) -> Identity:
+        raise AuthError("Authentication is not configured.")
+
+
+@dataclass
+class PlatformContext:
+    settings: Settings
+    authenticator: Authenticator
+    limiter: LoginRateLimiter
+    bot_provider: BotResponseProvider | None
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    authenticator: Authenticator | None = None,
+    bot_provider: BotResponseProvider | None = None,
+) -> Flask:
+    settings = settings or Settings.from_env()
+    if authenticator is None:
+        if settings.supabase_url and settings.supabase_anon_key:
+            authenticator = SupabaseAuthenticator(
+                settings.supabase_url, settings.supabase_anon_key, settings.supabase_jwt_secret
+            )
+        else:
+            authenticator = _UnconfiguredAuthenticator()
+
+    if bot_provider is None and settings.openai_api_key:
+        from saas.bot import OpenAIChatProvider  # noqa: PLC0415
+
+        bot_provider = OpenAIChatProvider(settings.openai_api_key, settings.openai_model)
+
+    app = Flask(__name__)
+    app.config.update(
+        SECRET_KEY=settings.secret_key,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SECURE=settings.cookie_secure,
+        SESSION_COOKIE_SAMESITE="Strict",
+        PERMANENT_SESSION_LIFETIME=timedelta(minutes=settings.session_minutes),
+        MAX_CONTENT_LENGTH=1024 * 1024,
+    )
+    if settings.trusted_proxies > 0:
+        # Only the configured number of proxies may set X-Forwarded-For; otherwise it is ignored.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=settings.trusted_proxies)
+    app.extensions["platform"] = PlatformContext(
+        settings=settings,
+        authenticator=authenticator,
+        limiter=LoginRateLimiter(),
+        bot_provider=bot_provider,
+    )
+
+    app.before_request(csrf.protect)
+    app.jinja_env.globals["csrf_token"] = csrf.token
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'self'; img-src 'self' https: data:; "
+            "script-src 'self'; connect-src 'self'; form-action 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'"
+        )
+        return response
+
+    @app.errorhandler(ServiceError)
+    def service_error(error: ServiceError):
+        return render_template("error.html", message=error.message), error.status
+
+    @app.errorhandler(Exception)
+    def unexpected_error(error: Exception):
+        if isinstance(error, HTTPException):
+            message = error.description or "Error"
+            return render_template("error.html", message=message), error.code
+        friendly = translate_db_error(error)
+        if friendly is not None:
+            return render_template("error.html", message=friendly.message), friendly.status
+        _log_unexpected_error(error)
+        return render_template("error.html", message="Something went wrong."), 500
+
+    from .routes import register_routes  # noqa: PLC0415  (avoids an import cycle)
+
+    register_routes(app)
+    return app

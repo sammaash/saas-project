@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Business rules / AI behaviour</h2>
+<p class="muted">Each document is a JSON object stored for this tenant only.</p>
+<form method="post" class="card">
+  {{ csrf_field() }}
+  {% for column, label in labels %}
+  <label>{{ label }} <textarea name="{{ column }}" rows="8" spellcheck="false">{{ documents[column] }}</textarea></label>
+  {% endfor %}
+  <button type="submit">Save</button>
+</form>
+{% endblock %}
