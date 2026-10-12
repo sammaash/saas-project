@@ -16,7 +16,13 @@ import jwt
 
 from platform_admin.app import create_app
 from platform_admin.auth import AuthError, Authenticator, Identity, LoginRateLimiter, SupabaseAuthenticator
-from platform_admin.config import ConfigError, Settings
+from platform_admin.config import (
+    REQUIRED_SCHEMA,
+    ConfigError,
+    Settings,
+    missing_schema_objects,
+    verify_database_schema,
+)
 from platform_admin.services import audit
 from platform_admin.services import validation as v
 
@@ -311,6 +317,99 @@ class ConfigTests(unittest.TestCase):
     def test_activating_channels_requires_an_explicit_opt_in(self):
         self.assertTrue(Settings.from_env(self.env(PLATFORM_ALLOW_ACTIVE_CHANNELS="1")).allow_active_channels)
         self.assertFalse(Settings.from_env(self.env(PLATFORM_ALLOW_ACTIVE_CHANNELS="true")).allow_active_channels)
+
+
+class _StubCursor:
+    """Answers the two pg_catalog probes made by missing_schema_objects."""
+
+    def __init__(self, tables):
+        self._tables = tables
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        name = params[0]
+        if sql.startswith("select to_regclass"):
+            self._rows = [(name if name in self._tables else None,)]
+        else:
+            self._rows = [(column,) for column in self._tables.get(name, ())]
+
+    def fetchone(self):
+        return self._rows[0]
+
+    def fetchall(self):
+        return self._rows
+
+
+class _StubConnection:
+    def __init__(self, tables):
+        self._tables = tables
+        self.closed = False
+
+    def cursor(self):
+        return _StubCursor(self._tables)
+
+    def close(self):
+        self.closed = True
+
+
+def _complete_schema():
+    return {table: tuple(columns) for table, columns in REQUIRED_SCHEMA}
+
+
+class RequiredSchemaTests(unittest.TestCase):
+    """Startup must detect an application database that is missing its migrations.
+
+    Regression cover for the staging failure where /tenants/<id> rendered (platform
+    database) while /profile, /catalogue, /quotations and /playground returned 500
+    because migration 0026 had never been applied to the application database.
+    """
+
+    def test_a_fully_migrated_database_reports_nothing_missing(self):
+        self.assertEqual(missing_schema_objects(_StubConnection(_complete_schema())), [])
+
+    def test_the_contract_covers_the_objects_added_by_migration_0026(self):
+        required = dict(REQUIRED_SCHEMA)
+        self.assertIn("catalogue_version", required["public.tenant_settings"])
+        self.assertIn("sku", required["public.product_variants"])
+        self.assertIn("public.quotations", required)
+
+    def test_a_missing_table_is_reported(self):
+        tables = _complete_schema()
+        del tables["public.quotations"]
+        self.assertIn("public.quotations (table)", missing_schema_objects(_StubConnection(tables)))
+
+    def test_a_missing_column_is_reported(self):
+        tables = _complete_schema()
+        tables["public.tenant_settings"] = ()
+        self.assertIn(
+            "public.tenant_settings.catalogue_version (column)",
+            missing_schema_objects(_StubConnection(tables)),
+        )
+
+    def test_startup_fails_closed_and_names_the_missing_objects(self):
+        tables = _complete_schema()
+        del tables["public.quotations"]
+        connection = _StubConnection(tables)
+        settings = Settings.from_env(dict(GOOD_ENV))
+        with patch("saas.db.connect", return_value=connection):
+            with self.assertRaises(ConfigError) as raised:
+                verify_database_schema(settings)
+        message = str(raised.exception)
+        self.assertIn("public.quotations (table)", message)
+        self.assertIn("run_migrations.py", message)
+        self.assertNotIn(settings.app_database_url, message)
+        self.assertTrue(connection.closed)
+
+    def test_startup_succeeds_against_a_migrated_database(self):
+        settings = Settings.from_env(dict(GOOD_ENV))
+        with patch("saas.db.connect", return_value=_StubConnection(_complete_schema())):
+            verify_database_schema(settings)
 
 
 class _AcceptAll(Authenticator):

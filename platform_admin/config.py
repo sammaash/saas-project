@@ -148,3 +148,62 @@ def verify_database_roles(settings: Settings) -> None:
 
     connect(settings.app_database_url).close()
     connect_platform(settings.platform_database_url).close()
+
+
+# Schema the application database must already provide. Each entry is a table and the
+# columns this code selects from it; a table with no columns listed is required to exist.
+# Keep in step with the migrations that introduce them (0017, 0026, 0028).
+REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("public.tenant_settings", ("catalogue_version",)),
+    ("public.product_variants", ("sku", "availability", "stock_quantity", "reorder_level")),
+    ("public.quotations", ()),
+    ("public.quotation_lines", ()),
+    ("public.catalogue_import_batches", ()),
+    ("public.whatsapp_webhook_events", ()),
+    ("public.whatsapp_conversations", ()),
+)
+
+
+def missing_schema_objects(conn) -> list[str]:
+    """Names of required tables/columns the connected database does not provide.
+
+    Reads only ``pg_catalog``, so a missing grant cannot be mistaken for a missing object.
+    """
+    missing: list[str] = []
+    with conn.cursor() as cursor:
+        for table, columns in REQUIRED_SCHEMA:
+            cursor.execute("select to_regclass(%s)", (table,))
+            if cursor.fetchone()[0] is None:
+                missing.append(f"{table} (table)")
+                continue
+            if not columns:
+                continue
+            cursor.execute(
+                "select attname from pg_catalog.pg_attribute "
+                "where attrelid = to_regclass(%s) and attnum > 0 and not attisdropped",
+                (table,),
+            )
+            present = {row[0] for row in cursor.fetchall()}
+            missing += [f"{table}.{name} (column)" for name in columns if name not in present]
+    return missing
+
+
+def verify_database_schema(settings: Settings) -> None:
+    """Fail closed at startup when the application database is missing required migrations.
+
+    Without this check an out-of-date database starts cleanly and then returns an opaque
+    500 from every page that uses the missing objects, which hides the real cause.
+    """
+    from saas.db import connect  # noqa: PLC0415
+
+    conn = connect(settings.app_database_url)
+    try:
+        missing = missing_schema_objects(conn)
+    finally:
+        conn.close()
+    if missing:
+        raise ConfigError(
+            "The application database is missing required schema: "
+            + ", ".join(missing)
+            + ". Apply the pending migrations with db/run_migrations.py before starting."
+        )
