@@ -19,7 +19,10 @@ from .tenant_context import tenant_transaction
 
 SETTINGS_JSON_COLUMNS = ("business_rules", "bot_persona", "business_hours", "configuration")
 PRODUCT_FIELDS = ("name", "description", "category", "sort_order", "attributes", "is_active")
-VARIANT_FIELDS = ("code", "name", "price", "attributes", "sort_order", "is_active")
+VARIANT_FIELDS = (
+    "code", "name", "price", "attributes", "sort_order", "is_active",
+    "sku", "availability", "stock_quantity", "reorder_level",
+)
 
 
 def _jsonb(value: Any) -> Any:
@@ -76,7 +79,7 @@ class TenantAdmin:
     def get_settings(self) -> dict[str, Any] | None:
         return self._one(
             "select timezone, currency, business_rules, bot_persona, business_hours, "
-            "configuration, updated_at from public.tenant_settings "
+            "configuration, catalogue_version, updated_at from public.tenant_settings "
             "where tenant_id = app.current_tenant_id()"
         )
 
@@ -116,7 +119,8 @@ class TenantAdmin:
             "order by sort_order, name"
         )
         variants = self._all(
-            "select id, product_id, code, name, price, attributes, sort_order, is_active "
+            "select id, product_id, code, name, price, attributes, sort_order, is_active, "
+            "sku, availability, stock_quantity, reorder_level "
             "from public.product_variants where tenant_id = app.current_tenant_id() "
             "order by sort_order, name"
         )
@@ -136,7 +140,8 @@ class TenantAdmin:
 
     def get_variant(self, variant_id: str) -> dict[str, Any] | None:
         return self._one(
-            "select id, product_id, code, name, price, attributes, sort_order, is_active "
+            "select id, product_id, code, name, price, attributes, sort_order, is_active, "
+            "sku, availability, stock_quantity, reorder_level "
             "from public.product_variants where id = %s and tenant_id = app.current_tenant_id()",
             (variant_id,),
         )
@@ -176,13 +181,22 @@ class TenantAdmin:
         attributes: dict[str, Any] | None = None,
         sort_order: int = 0,
         is_active: bool = True,
+        sku: str | None = None,
+        availability: str = "IN_STOCK",
+        stock_quantity: int | None = None,
+        reorder_level: int | None = None,
     ) -> str:
         # tenant_id comes from context; the composite FK rejects another tenant's product.
         self._cursor.execute(
             "insert into public.product_variants "
-            "(tenant_id, product_id, code, name, price, attributes, sort_order, is_active) "
-            "values (app.current_tenant_id(), %s, %s, %s, %s, %s, %s, %s) returning id",
-            (product_id, code, name, price, _jsonb(attributes or {}), sort_order, is_active),
+            "(tenant_id, product_id, code, name, price, attributes, sort_order, is_active, "
+            "sku, availability, stock_quantity, reorder_level) "
+            "values (app.current_tenant_id(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "returning id",
+            (
+                product_id, code, name, price, _jsonb(attributes or {}), sort_order,
+                is_active, sku or code, availability, stock_quantity, reorder_level,
+            ),
         )
         return str(self._cursor.fetchone()[0])
 

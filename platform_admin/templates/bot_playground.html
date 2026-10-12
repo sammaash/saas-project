@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Bot Playground &middot; Platform Admin{% endblock %}
+{% block content %}
+<div id="playground-app" data-api-url="{{ url_for('admin.bot_playground_api') }}">
+  <div class="playground-title">
+    <div>
+      <span class="demo-label">DEMO &middot; SAFE TEST MODE</span>
+      <h1>WhatsApp Conversation Simulator</h1>
+      <p class="muted">Catalogue, cart and checkout actions are simulated. Nothing is ordered, paid, reserved or sent to WhatsApp.</p>
+    </div>
+    {% if tenant %}
+    <form method="post" action="{{ url_for('admin.bot_playground') }}">
+      {{ csrf_field() }}
+      <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+      <button class="danger-outline" type="submit" name="start_new" value="1">Reset conversation</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <form method="get" action="{{ url_for('admin.bot_playground') }}" class="tenant-picker">
+    <label>Simulating tenant
+      <select name="tenant_id">
+        {% for entry in tenants %}
+        <option value="{{ entry.id }}" {% if selected_tenant_id and entry.id|string == selected_tenant_id|string %}selected{% endif %}>{{ entry.name }} ({{ entry.slug }})</option>
+        {% else %}
+        <option value="">No tenants available</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Load tenant</button>
+  </form>
+
+  <p id="playground-status" class="playground-status" role="status" aria-live="polite" hidden></p>
+
+  {% if tenant %}
+  <div class="playground-shell">
+    <section class="phone-frame" aria-label="Demo WhatsApp conversation">
+      <header class="wa-header">
+        <div class="business-avatar" aria-hidden="true">{{ tenant.name[:1] | upper }}</div>
+        <div>
+          <strong>{{ tenant.name }}</strong>
+          <span>demo assistant &middot; {{ tenant.status }}</span>
+        </div>
+        <span class="demo-chip">NOT LIVE</span>
+      </header>
+
+      <div id="playground-messages" class="chat-wallpaper">
+        {% include "_bot_playground_messages.html" %}
+      </div>
+
+      <div class="quick-replies" aria-label="Demo menu">
+        {% for action, label in [('browse', 'Browse catalogue'), ('view_cart', 'View cart'), ('checkout', 'Checkout'), ('talk', 'Talk to assistant')] %}
+        <form method="post" action="{{ url_for('admin.bot_playground') }}">
+          {{ csrf_field() }}
+          <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+          <button type="submit" name="action" value="{{ action }}" {% if action == 'view_cart' %}data-cart-button{% endif %}>{{ label }}{% if action == 'view_cart' and cart.item_count %} ({{ cart.item_count }}){% endif %}</button>
+        </form>
+        {% endfor %}
+      </div>
+
+      <form id="playground-message-form" method="post" action="{{ url_for('admin.bot_playground') }}" class="message-composer">
+        {{ csrf_field() }}
+        <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+        <input type="hidden" name="action" value="message">
+        <label class="sr-only" for="customer-message">Customer message</label>
+        <textarea id="customer-message" name="customer_message" rows="1" required maxlength="2000" placeholder="Type a customer message">{{ form_message }}</textarea>
+        <button type="submit" aria-label="Send test message">Send</button>
+      </form>
+    </section>
+
+    <aside id="playground-panel" class="simulator-panel">
+      {% include "_bot_playground_panel.html" %}
+    </aside>
+  </div>
+  {% endif %}
+</div>
+<script src="{{ url_for('static', filename='playground.js') }}" defer></script>
+{% endblock %}

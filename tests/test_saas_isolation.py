@@ -32,6 +32,7 @@ try:  # `tests` is a package when run as `python -m unittest tests.test_...`
         TENANT_ONE_PHONE_NUMBER_ID,
         TENANT_ONE_STAFF_USER_ID,
         TENANT_SCOPED_TABLES,
+        AUTHENTICATED_INACCESSIBLE_TABLES,
         TENANT_TWO_ID,
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
@@ -53,6 +54,7 @@ except ImportError:  # ...and a plain directory under `discover -s tests`
         TENANT_ONE_PHONE_NUMBER_ID,
         TENANT_ONE_STAFF_USER_ID,
         TENANT_SCOPED_TABLES,
+        AUTHENTICATED_INACCESSIBLE_TABLES,
         TENANT_TWO_ID,
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
@@ -104,6 +106,9 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "audit_log": 1,  # tenant row only; the platform row must not appear
             "products": 11,
             "product_variants": 33,
+            "catalogue_import_batches": 0,
+            "quotations": 0,
+            "quotation_lines": 0,
         }
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute("select name, slug from public.tenants")
@@ -111,6 +116,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
             for table, tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     self.assertEqual(
                         self.count_rows(cursor, table, tenant_column, TENANT_ONE_ID),
                         expected_own_rows[table],
@@ -126,6 +133,9 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "audit_log": 0,  # none seeded for tenant 002; tenant 001's row stays invisible
             "products": 0,
             "product_variants": 0,
+            "catalogue_import_batches": 0,
+            "quotations": 0,
+            "quotation_lines": 0,
         }
         with self.user(TENANT_TWO_OWNER_USER_ID) as cursor:
             cursor.execute("select name from public.tenants")
@@ -133,6 +143,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
             for table, tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     self.assertEqual(
                         self.count_rows(cursor, table, tenant_column, TENANT_TWO_ID),
                         expected_own_rows[table],
@@ -143,6 +155,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             for table, tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     self.assertEqual(
                         self.count_rows(cursor, table, tenant_column, TENANT_TWO_ID), 0
                     )
@@ -151,6 +165,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
         with self.user(TENANT_TWO_OWNER_USER_ID) as cursor:
             for table, tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     self.assertEqual(
                         self.count_rows(cursor, table, tenant_column, TENANT_ONE_ID), 0
                     )
@@ -245,6 +261,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
         with self.user(None) as cursor:
             for table, _tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table, role="authenticated"):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     cursor.execute(f"select count(*) from public.{table}")
                     self.assertEqual(cursor.fetchone()[0], 0)
 
@@ -306,6 +324,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
         with self.user(OUTSIDER_USER_ID) as cursor:
             for table, _tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table):
+                    if table in AUTHENTICATED_INACCESSIBLE_TABLES:
+                        continue
                     cursor.execute(f"select count(*) from public.{table}")
                     self.assertEqual(cursor.fetchone()[0], 0)
 
@@ -604,7 +624,4 @@ class TenantContextHelperTests(SaasDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
 

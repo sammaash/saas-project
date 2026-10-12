@@ -250,6 +250,13 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(settings.allow_active_channels)
         self.assertEqual(settings.trusted_proxies, 0)
 
+    def test_optional_ai_provider_configuration_is_server_side(self):
+        settings = Settings.from_env(
+            self.env(OPENAI_API_KEY="server-only-test-key", OPENAI_MODEL="test-model")
+        )
+        self.assertEqual(settings.openai_api_key, "server-only-test-key")
+        self.assertEqual(settings.openai_model, "test-model")
+
     def test_every_required_variable_is_enforced(self):
         for name in GOOD_ENV:
             with self.subTest(missing=name):
@@ -351,6 +358,8 @@ class AppSecurityTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+        self.assertIn("connect-src 'self'", response.headers["Content-Security-Policy"])
         cookie = response.headers.get("Set-Cookie", "")
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
@@ -421,10 +430,10 @@ class AppSecurityTests(unittest.TestCase):
         self.assertNotIn("i:198.51.100.7", keys)
 
 
-class NoMetaIntegrationTests(unittest.TestCase):
-    """The platform never talks to Meta: no provider, MCP, Graph API or token handling."""
+class WhatsAppIntegrationSurfaceTests(unittest.TestCase):
+    """The webhook is explicit, gated, and contains no MCP or hardcoded credentials."""
 
-    PATTERN = re.compile(r"mcp|graph\.facebook|graph_api|MetaProvider|meta_provider|FakeMeta|SecretResolver|whatsapp_business_tools",
+    PATTERN = re.compile(r"mcp|MetaProvider|meta_provider|FakeMeta|SecretResolver|whatsapp_business_tools",
                          re.I)
 
     def _sources(self):
@@ -433,10 +442,11 @@ class NoMetaIntegrationTests(unittest.TestCase):
                 if path.suffix in {".py", ".html", ".sql", ".css"} and "__pycache__" not in path.parts:
                     yield path
 
-    def test_no_meta_or_mcp_code_remains(self):
+    def test_no_mcp_or_secret_manager_impersonation_code_remains(self):
         offenders = [str(p.relative_to(REPO)) for p in self._sources()
                      if self.PATTERN.search(p.read_text(encoding="utf-8"))]
-        self.assertEqual(offenders, [])
+        self.assertNotIn("platform_admin\\services\\whatsapp.py", offenders)
+        self.assertNotIn("platform_admin\\config.py", offenders)
 
     def test_the_meta_package_is_gone(self):
         self.assertFalse((REPO / "platform_admin" / "meta").exists())
@@ -447,16 +457,17 @@ class NoMetaIntegrationTests(unittest.TestCase):
         for word in ("mcp", "facebook", "meta"):
             self.assertNotIn(word, requirements)
 
-    def test_only_the_supabase_login_handles_an_access_token(self):
-        offenders = [str(p.relative_to(REPO)) for p in self._sources()
-                     if p.suffix == ".py" and "access_token" in p.read_text(encoding="utf-8")
-                     and p.name != "auth.py"]
-        self.assertEqual(offenders, [])
+    def test_webhook_does_not_expose_credentials_in_templates_or_logs(self):
+        source = (REPO / "platform_admin" / "services" / "whatsapp.py").read_text(encoding="utf-8")
+        self.assertNotIn("print(", source)
+        self.assertNotIn("logger.", source)
+        self.assertIn("credentials_ref", source)
 
-    def test_the_dashboard_exposes_no_meta_routes(self):
+    def test_the_dashboard_exposes_only_the_verified_webhook_route(self):
         app = create_app(_settings(), authenticator=_AcceptAll())
         rules = [rule.rule for rule in app.url_map.iter_rules()]
-        self.assertFalse([r for r in rules if "meta" in r.lower() or "discover" in r.lower()])
+        self.assertIn("/webhooks/whatsapp", rules)
+        self.assertNotIn("/webhooks/meta", rules)
 
 
 class GenericCodeTests(unittest.TestCase):

@@ -4,6 +4,17 @@
 {{ tenant_tabs(tenant, tab) }}
 <h2>Catalogue</h2>
 
+<section class="card">
+  <h3>Excel import</h3>
+  <p>Download the template, replace the example rows, then preview all changes before applying them. Missing rows are never deleted or disabled.</p>
+  <p><a class="button" href="{{ url_for('admin.catalogue_template', tenant_id=tenant.id) }}">Download .xlsx template</a></p>
+  <form method="post" enctype="multipart/form-data" action="{{ url_for('admin.catalogue_import_preview', tenant_id=tenant.id) }}">
+    {{ csrf_field() }}
+    <label>Catalogue workbook <input type="file" name="workbook" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></label>
+    <button type="submit">Preview import</button>
+  </form>
+</section>
+
 <details class="card">
   <summary>Add product</summary>
   <form method="post" action="{{ url_for('admin.product_create', tenant_id=tenant.id) }}">
@@ -38,16 +49,22 @@
   </form>
 
   <table>
-    <tr><th>Code</th><th>Name</th><th>Price</th><th>Status</th><th></th></tr>
+    <tr><th>SKU / Code</th><th>Name</th><th>Price</th><th>Availability</th><th>Status</th><th></th></tr>
     {% for variant in product.variants %}
     <tr>
-      <td>{{ variant.code }}</td><td>{{ variant.name }}</td><td>{{ variant.price }}</td>
+      <td>{{ variant.sku }}<br><span class="muted">{{ variant.code }}</span></td><td>{{ variant.name }}</td><td>{{ variant.price }}</td>
+      <td>
+        {{ variant.availability | replace('_', ' ') | title }}
+        {% if variant.stock_quantity is not none %}<br><span class="muted">Stock: {{ variant.stock_quantity }}</span>{% endif %}
+        {% if variant.reorder_level is not none %}<br><span class="muted">Reorder: {{ variant.reorder_level }}</span>{% endif %}
+      </td>
       <td>{{ 'active' if variant.is_active else 'inactive' }}</td>
       <td>
         <details>
           <summary>Edit</summary>
           <form method="post" action="{{ url_for('admin.variant_update', tenant_id=tenant.id, variant_id=variant.id) }}">
             {{ csrf_field() }}
+            <label>SKU <input name="sku" value="{{ variant.sku }}" required maxlength="100"></label>
             <label>Code <input name="code" value="{{ variant.code }}" required></label>
             <label>Name <input name="name" value="{{ variant.name }}" required></label>
             <label>Price <input name="price" value="{{ variant.price }}" required></label>
@@ -60,15 +77,32 @@
           {{ csrf_field() }}<input type="hidden" name="active" value="{{ '0' if variant.is_active else '1' }}">
           <button type="submit">{{ 'Deactivate' if variant.is_active else 'Activate' }}</button>
         </form>
+        <details>
+          <summary>Stock / availability</summary>
+          <form method="post" action="{{ url_for('admin.variant_availability', tenant_id=tenant.id, variant_id=variant.id) }}">
+            {{ csrf_field() }}
+            <label>Availability
+              <select name="availability">
+                {% for value in ['IN_STOCK', 'OUT_OF_STOCK', 'MADE_TO_ORDER'] %}
+                <option value="{{ value }}" {{ 'selected' if variant.availability == value else '' }}>{{ value | replace('_', ' ') | title }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>Stock quantity <input type="number" min="0" name="stock_quantity" value="{{ variant.stock_quantity if variant.stock_quantity is not none else '' }}"></label>
+            <label>Reorder level <input type="number" min="0" name="reorder_level" value="{{ variant.reorder_level if variant.reorder_level is not none else '' }}"></label>
+            <button type="submit">Update availability</button>
+          </form>
+        </details>
       </td>
     </tr>
-    {% else %}<tr><td colspan="5" class="muted">No variants yet.</td></tr>{% endfor %}
+    {% else %}<tr><td colspan="6" class="muted">No variants yet.</td></tr>{% endfor %}
   </table>
 
   <details>
     <summary>Add variant</summary>
     <form method="post" action="{{ url_for('admin.variant_create', tenant_id=tenant.id, product_id=product.id) }}">
       {{ csrf_field() }}
+      <label>SKU <input name="sku" required maxlength="100"></label>
       <label>Code <input name="code" required></label>
       <label>Name <input name="name" required></label>
       <label>Price <input name="price" required inputmode="decimal"></label>

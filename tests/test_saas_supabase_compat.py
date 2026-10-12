@@ -24,7 +24,8 @@ PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", 
 PLATFORM_TABLES = (
     "tenants", "tenant_channels", "tenant_users", "tenant_settings", "plans", "subscriptions",
     "audit_log", "products", "product_variants", "platform_admins", "reserved_phone_numbers",
-    "saas_schema_migrations",
+    "catalogue_import_batches", "quotations", "quotation_lines", "whatsapp_webhook_events",
+    "whatsapp_conversations", "saas_schema_migrations",
 )
 AUTHENTICATED_EXPECTED = {
     "tenants": {"SELECT"},
@@ -36,8 +37,12 @@ AUTHENTICATED_EXPECTED = {
     "audit_log": {"SELECT"},
     "products": {"SELECT", "INSERT", "UPDATE", "DELETE"},
     "product_variants": {"SELECT", "INSERT", "UPDATE", "DELETE"},
+    "catalogue_import_batches": {"SELECT"},
+    "quotations": {"SELECT"},
+    "quotation_lines": {"SELECT"},
 }
-HARDENING = REPO / "db" / "migrations" / "0025_supabase_default_privilege_hardening.sql"
+FULL_HARDENING = REPO / "db" / "migrations" / "0029_complete_privilege_hardening.sql"
+HARDENING = REPO / "db" / "migrations" / "0030_catalogue_import_read_privilege.sql"
 
 
 def _granted(cursor, role, table):
@@ -92,9 +97,11 @@ class DefaultPrivilegeTests(SaasDatabaseTestCase):
             self.assertGreater(
                 len(_granted(cursor, "service_role", "products")), 1, "simulation did not take effect"
             )
-            sql = HARDENING.read_text(encoding="utf-8")
+            sql = FULL_HARDENING.read_text(encoding="utf-8")
+            import_read_grant = HARDENING.read_text(encoding="utf-8")
             for _ in range(repeat):
                 psycopg.ClientCursor(cursor.connection).execute(sql)
+                psycopg.ClientCursor(cursor.connection).execute(import_read_grant)
             self._assert_intended_privileges(cursor)
 
     def test_supabase_style_default_grants_are_removed(self):
@@ -156,6 +163,13 @@ class FunctionSecurityTests(SaasDatabaseTestCase):
 
 
 class MigrationPortabilityTests(unittest.TestCase):
+    def test_phase4_hardening_does_not_reference_tables_created_later(self):
+        phase4 = (
+            REPO / "db" / "migrations" / "0027_supabase_phase4_privilege_hardening.sql"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("whatsapp_webhook_events", phase4)
+        self.assertNotIn("whatsapp_conversations", phase4)
+
     """Static checks: nothing may depend on being a PostgreSQL superuser."""
 
     FORBIDDEN = re.compile(

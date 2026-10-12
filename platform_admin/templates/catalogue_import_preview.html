@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Catalogue import preview</h2>
+
+{% if preview.errors %}
+<section class="card">
+  <h3>Import cannot be applied</h3>
+  <p>Correct every row error and upload the workbook again. No catalogue records were changed.</p>
+  <ul>
+    {% for error in preview.errors %}
+    <li>{{ error.message }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% else %}
+<section class="card">
+  <h3>Validated changes</h3>
+  <p>
+    New: {{ preview.counts.new }} · Updates: {{ preview.counts.updates }} ·
+    Availability changes: {{ preview.counts.availability_changes }} ·
+    Unchanged: {{ preview.counts.unchanged }}
+  </p>
+  <form method="post" action="{{ url_for('admin.catalogue_import_apply', tenant_id=tenant.id, batch_id=preview.batch_id) }}">
+    {{ csrf_field() }}
+    <button type="submit">Apply import atomically</button>
+  </form>
+</section>
+{% endif %}
+
+<table>
+  <tr>
+    <th>Row</th><th>SKU</th><th>Product</th><th>Variant</th><th>Price</th>
+    <th>Availability</th><th>Change</th>
+  </tr>
+  {% for row in preview.rows %}
+  <tr>
+    <td>{{ row.row_number }}</td>
+    <td>{{ row.sku }}</td>
+    <td>{{ row.product_name }}</td>
+    <td>{{ row.variant or 'Default' }}</td>
+    <td>{{ row.currency }} {{ row.price }}</td>
+    <td>{{ row.availability | replace('_', ' ') | title }}</td>
+    <td>
+      {{ row.change | title }}
+      {% if row.availability_change %}<span class="badge">availability changed</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p><a href="{{ url_for('admin.tenant_catalogue', tenant_id=tenant.id) }}">Back to catalogue</a></p>
+{% endblock %}

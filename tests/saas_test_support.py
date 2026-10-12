@@ -74,6 +74,17 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("audit_log", "tenant_id"),
     ("products", "tenant_id"),
     ("product_variants", "tenant_id"),
+    ("catalogue_import_batches", "tenant_id"),
+    ("quotations", "tenant_id"),
+    ("quotation_lines", "tenant_id"),
+    ("whatsapp_webhook_events", "tenant_id"),
+    ("whatsapp_conversations", "tenant_id"),
+)
+
+# Webhook processing is backend-only; authenticated dashboard sessions must not be able
+# to inspect or enumerate these tables.
+AUTHENTICATED_INACCESSIBLE_TABLES = frozenset(
+    {"whatsapp_webhook_events", "whatsapp_conversations"}
 )
 
 # Tables where FORCE ROW LEVEL SECURITY is deliberately NOT applied, because the

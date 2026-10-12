@@ -15,6 +15,7 @@
   <nav>
     <a href="{{ url_for('admin.overview') }}">Overview</a>
     <a href="{{ url_for('admin.tenants') }}">Tenants</a>
+    <a href="{{ url_for('admin.bot_playground') }}">Bot Playground</a>
   </nav>
   <form method="post" action="{{ url_for('auth.logout') }}" class="inline">
     {{ csrf_field() }}<button type="submit" class="link">Sign out</button>

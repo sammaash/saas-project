@@ -47,6 +47,11 @@ PLATFORM_TABLES = (
     "audit_log",
     "products",
     "product_variants",
+    "catalogue_import_batches",
+    "quotations",
+    "quotation_lines",
+    "whatsapp_webhook_events",
+    "whatsapp_conversations",
 )
 
 # Tables that carry a tenant identity in a column named tenant_id. `tenants` is excluded

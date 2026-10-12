@@ -10,14 +10,19 @@ generic code path must serve them all.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import unittest
 import uuid
 
+from openpyxl import load_workbook
+
 from platform_admin.app import create_app
 from platform_admin.auth import AuthError, Authenticator, Identity
 from platform_admin.config import Settings
+from platform_admin.services.catalogue_import import template_bytes
+from saas.bot import BotProviderError, BotResponseRequest
 from saas_test_support import (
     PLATFORM_ADMIN_USER_ID,
     SaasDatabaseTestCase,
@@ -29,6 +34,18 @@ from saas_test_support import (
 
 SLUG_PREFIX = "pa-test-"
 PASSWORD = "correct horse"
+
+
+class FakeBotProvider:
+    def __init__(self):
+        self.requests: list[BotResponseRequest] = []
+        self.failure: Exception | None = None
+
+    def generate(self, request: BotResponseRequest) -> str:
+        self.requests.append(request)
+        if self.failure is not None:
+            raise self.failure
+        return f"Grounded AI response: {request.customer_message}"
 
 
 class FakeAuthenticator(Authenticator):
@@ -94,7 +111,10 @@ class DashboardTestCase(SaasDatabaseTestCase):
             "admin@example.com": (PASSWORD, PLATFORM_ADMIN_USER_ID),
             "owner@example.com": (PASSWORD, TENANT_ONE_OWNER_USER_ID),
         })
-        self.app = create_app(_settings(), authenticator=self.authenticator)
+        self.bot_provider = FakeBotProvider()
+        self.app = create_app(
+            _settings(), authenticator=self.authenticator, bot_provider=self.bot_provider
+        )
         self.client = self.app.test_client()
         self.addCleanup(self._cleanup)
 
@@ -110,6 +130,21 @@ class DashboardTestCase(SaasDatabaseTestCase):
             cursor.execute("delete from public.reserved_phone_numbers where phone_number_id like 'pa-reserved-%'")
             cursor.execute(
                 "delete from public.platform_admins where user_id = %s", (PLATFORM_ADMIN_USER_ID,)
+            )
+        conn.close()
+
+    @staticmethod
+    def _delete_exact_test_tenant(tenant_id: str, slug: str) -> None:
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute(
+                "delete from public.audit_log where tenant_id in "
+                "(select id from public.tenants where id = %s and slug = %s)",
+                (tenant_id, slug),
+            )
+            cursor.execute(
+                "delete from public.tenants where id = %s and slug = %s",
+                (tenant_id, slug),
             )
         conn.close()
 
@@ -366,6 +401,30 @@ class CatalogueTests(DashboardTestCase):
                            (tenant_id, name))
             return cursor.fetchone()[0]
 
+    @staticmethod
+    def workbook(
+        *,
+        sku="TEST-SKU-1",
+        product="Imported Item",
+        variant="Default",
+        price="12.50",
+        currency="KES",
+        availability="IN_STOCK",
+    ):
+        workbook = load_workbook(io.BytesIO(template_bytes()))
+        sheet = workbook["Products"]
+        sheet.delete_rows(3)
+        values = (
+            sku, product, variant, "Imported", "Imported safely", price, currency,
+            availability, 5, 2, None,
+        )
+        for column, value in enumerate(values, 1):
+            sheet.cell(2, column).value = value
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return output
+
     def test_products_and_variants_can_be_created_edited_priced_and_toggled(self):
         product_id = self.add_product(self.tenant_a, "Widget")
         base = f"/tenants/{self.tenant_a}/catalogue"
@@ -413,6 +472,157 @@ class CatalogueTests(DashboardTestCase):
         self.add_product(self.tenant_a, "Shared Name")
         self.add_product(self.tenant_b, "Shared Name")
         self.assertIn("Shared Name", self.page(f"/tenants/{self.tenant_b}/catalogue"))
+
+    def test_excel_import_previews_then_atomically_inserts_and_updates_by_sku(self):
+        base = f"/tenants/{self.tenant_a}/catalogue"
+        response = self.post(
+            f"{base}/import/preview",
+            {"workbook": (self.workbook(), "catalogue.xlsx")},
+        )
+        page = response.get_data(as_text=True)
+        self.assertIn("Validated changes", page)
+        self.assertIn("TEST-SKU-1", page)
+        batch_id = re.search(r"/import/([0-9a-f-]{36})/apply", page).group(1)
+        applied = self.post(f"{base}/import/{batch_id}/apply")
+        self.assertIn("Catalogue import applied", self.message_after(applied))
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select price, availability, stock_quantity from public.product_variants "
+                "where tenant_id = %s and sku = 'TEST-SKU-1'",
+                (self.tenant_a,),
+            )
+            self.assertEqual(cursor.fetchone(), (12.5, "IN_STOCK", 5))
+
+        response = self.post(
+            f"{base}/import/preview",
+            {
+                "workbook": (
+                    self.workbook(price="15.75", availability="MADE_TO_ORDER"),
+                    "catalogue.xlsx",
+                )
+            },
+        )
+        page = response.get_data(as_text=True)
+        self.assertIn("availability changed", page)
+        batch_id = re.search(r"/import/([0-9a-f-]{36})/apply", page).group(1)
+        self.post(f"{base}/import/{batch_id}/apply")
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select count(*), min(price), min(availability) "
+                "from public.product_variants where tenant_id = %s and sku = 'TEST-SKU-1'",
+                (self.tenant_a,),
+            )
+            self.assertEqual(cursor.fetchone(), (1, 15.75, "MADE_TO_ORDER"))
+
+    def test_import_validation_rolls_back_and_skus_are_tenant_scoped(self):
+        base_a = f"/tenants/{self.tenant_a}/catalogue"
+        workbook = self.workbook()
+        invalid = load_workbook(workbook)
+        invalid["Products"].append(
+            ("BROKEN", "Broken", None, None, None, "bad", "KES", "IN_STOCK")
+        )
+        content = io.BytesIO()
+        invalid.save(content)
+        content.seek(0)
+        rejected = self.post(
+            f"{base_a}/import/preview",
+            {"workbook": (content, "invalid.xlsx")},
+        )
+        self.assertIn("Import cannot be applied", rejected.get_data(as_text=True))
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select count(*) from public.product_variants where tenant_id = %s "
+                "and sku in ('TEST-SKU-1', 'BROKEN')",
+                (self.tenant_a,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+        for tenant_id, currency, price in (
+            (self.tenant_a, "KES", "10.00"),
+            (self.tenant_b, "USD", "99.00"),
+        ):
+            base = f"/tenants/{tenant_id}/catalogue"
+            preview = self.post(
+                f"{base}/import/preview",
+                {
+                    "workbook": (
+                        self.workbook(currency=currency, price=price),
+                        "catalogue.xlsx",
+                    )
+                },
+            ).get_data(as_text=True)
+            batch_id = re.search(r"/import/([0-9a-f-]{36})/apply", preview).group(1)
+            self.post(f"{base}/import/{batch_id}/apply")
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select tenant_id::text, price from public.product_variants "
+                "where sku = 'TEST-SKU-1' order by tenant_id",
+            )
+            rows = cursor.fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({str(price) for _, price in rows}, {"10.00", "99.00"})
+
+
+class QuotationDashboardTests(DashboardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.login()
+        self.tenant = self.create_tenant(SPECS[0])
+        self.product_id = CatalogueTests.add_product(self, self.tenant, "Quoted Item")
+        self.post(
+            f"/tenants/{self.tenant}/catalogue/products/{self.product_id}/variants",
+            {"sku": "QUOTE-1", "code": "q1", "name": "Standard", "price": "25.00"},
+        )
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select id::text from public.product_variants where product_id = %s",
+                (self.product_id,),
+            )
+            self.variant_id = cursor.fetchone()[0]
+
+    def test_quotation_uses_server_prices_snapshots_values_and_downloads_pdf(self):
+        response = self.post(
+            f"/tenants/{self.tenant}/quotations/new",
+            {
+                "customer_name": "Test Customer",
+                "customer_contact": "customer@example.test",
+                "valid_days": "7",
+                "variant_id": [self.variant_id],
+                "quantity": ["2"],
+                "terms": "Valid while available.",
+                "price": "0.01",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        quotation_id = re.search(
+            r"/quotations/([0-9a-f-]{36})", response.headers["Location"]
+        ).group(1)
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select subtotal, tax_rate, total from public.quotations where id = %s",
+                (quotation_id,),
+            )
+            self.assertEqual(cursor.fetchone(), (50.0, None, 50.0))
+            cursor.execute(
+                "select sku, unit_price, quantity, availability "
+                "from public.quotation_lines where quotation_id = %s",
+                (quotation_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("QUOTE-1", 25.0, 2, "IN_STOCK"))
+        self.post(
+            f"/tenants/{self.tenant}/catalogue/variants/{self.variant_id}",
+            {"sku": "QUOTE-1", "code": "q1", "name": "Standard", "price": "80.00"},
+        )
+        detail = self.page(
+            f"/tenants/{self.tenant}/quotations/{quotation_id}"
+        )
+        self.assertIn("KES 50.00", detail)
+        self.assertIn("Tax is not configured", detail)
+        pdf = self.client.get(
+            f"/tenants/{self.tenant}/quotations/{quotation_id}.pdf"
+        )
+        self.assertEqual(pdf.status_code, 200)
+        self.assertTrue(pdf.data.startswith(b"%PDF-"))
 
 
 class ChannelTests(DashboardTestCase):
@@ -570,6 +780,199 @@ class AuditAttributionTests(DashboardTestCase):
         with self.superuser() as cursor:
             cursor.execute("select count(*) from public.products where tenant_id = %s", (self.tenant,))
             self.assertEqual(cursor.fetchone()[0], 0)
+
+
+class BotPlaygroundTests(DashboardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.login()
+
+    def test_playground_defaults_to_the_saas_test_tenant_when_present(self):
+        with self.superuser() as cursor:
+            cursor.execute("select id::text from public.tenants where slug = 'saas-test'")
+            existing = cursor.fetchone()
+
+        if existing:
+            tenant_id = existing[0]
+        else:
+            tenant_id = self.create_tenant({
+                "name": "saas-test",
+                "slug": "saas-test",
+                "currency": "KES",
+            }, owner_user_id=TENANT_ONE_OWNER_USER_ID)
+            self.addCleanup(self._delete_exact_test_tenant, tenant_id, "saas-test")
+            self.post(f"/tenants/{tenant_id}/profile", {
+                "name": "saas-test",
+                "timezone": "Africa/Nairobi",
+                "currency": "KES",
+            })
+            self.post(f"/tenants/{tenant_id}/rules", {
+                "business_rules": json.dumps({"deposit_rate": 0.25}),
+                "bot_persona": json.dumps({"tone": "friendly", "name": "SaaS Test Bot"}),
+                "business_hours": json.dumps({"mon": "09:00-17:00"}),
+                "configuration": json.dumps({"test_mode": True}),
+            })
+            self.post(
+                f"/tenants/{tenant_id}/catalogue/products",
+                {"name": "Lemon cake", "category": "cake"},
+            )
+            product_id = self.product_id(tenant_id)
+            self.post(f"/tenants/{tenant_id}/catalogue/products/{product_id}/variants", {
+                "code": "std", "name": "Large", "price": "500.00",
+            })
+            self.post(f"/tenants/{tenant_id}/status", {"status": "active"})
+            self.assertEqual(self.tenant_status(tenant_id), "active")
+
+        page = self.page("/playground")
+        self.assertIn("Bot Playground", page)
+        self.assertIn(f'value="{tenant_id}" selected', page)
+
+        catalogue = self.post("/playground", {
+            "tenant_id": tenant_id,
+            "action": "browse",
+        }).get_data(as_text=True)
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select p.name, v.name, v.price, s.currency "
+                "from public.products p "
+                "join public.product_variants v "
+                "on v.tenant_id = p.tenant_id and v.product_id = p.id "
+                "join public.tenant_settings s on s.tenant_id = p.tenant_id "
+                "where p.tenant_id = %s and p.is_active and v.is_active "
+                "order by p.sort_order, p.name, v.sort_order, v.name limit 1",
+                (tenant_id,),
+            )
+            active_catalogue_item = cursor.fetchone()
+        if active_catalogue_item:
+            product_name, variant_name, price, currency = active_catalogue_item
+            self.assertIn(product_name, catalogue)
+            self.assertIn(variant_name, catalogue)
+            self.assertIn(f"{currency} {price:.2f}", catalogue)
+        else:
+            self.assertIn("No active products", catalogue)
+
+    def test_playground_requires_an_authenticated_platform_administrator(self):
+        anonymous = self.app.test_client()
+        response = anonymous.get("/playground")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response.headers["Location"])
+
+    def test_playground_uses_the_selected_tenant_catalogue_and_configuration(self):
+        self.onboard(SPECS[0])
+        other_id = self.onboard(SPECS[1])
+
+        response = self.post("/playground", {
+            "tenant_id": other_id,
+            "customer_message": "Can you repair my screen?",
+        })
+        page = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Grounded AI response", page)
+        request = self.bot_provider.requests[-1]
+        self.assertTrue(request.safe_test_mode)
+        self.assertEqual(request.channel, "admin-playground")
+        self.assertIn(SPECS[1]["product"]["name"], request.system_prompt)
+        self.assertIn(SPECS[1]["persona"]["tone"], request.system_prompt)
+        self.assertIn("warranty_days", request.system_prompt)
+        self.assertNotIn(SPECS[0]["product"]["name"], request.system_prompt)
+
+        catalogue = self.post("/playground", {
+            "tenant_id": other_id,
+            "action": "browse",
+        }).get_data(as_text=True)
+        self.assertIn(SPECS[1]["product"]["name"], catalogue)
+        self.assertIn(SPECS[1]["variant"]["name"], catalogue)
+        self.assertIn("USD 89.50", catalogue)
+        self.assertNotIn(SPECS[0]["product"]["name"], catalogue)
+        self.assertNotIn(SPECS[0]["variant"]["name"], catalogue)
+
+    def test_conversation_history_is_scoped_to_the_selected_tenant(self):
+        first = self.onboard(SPECS[0])
+        second = self.onboard(SPECS[1])
+        self.post("/playground", {"tenant_id": first, "customer_message": "alpha-only-message"})
+        self.post("/playground", {"tenant_id": second, "customer_message": "beta-only-message"})
+
+        first_page = self.page(f"/playground?tenant_id={first}")
+        second_page = self.page(f"/playground?tenant_id={second}")
+        self.assertIn("alpha-only-message", first_page)
+        self.assertNotIn("beta-only-message", first_page)
+        self.assertIn("beta-only-message", second_page)
+        self.assertNotIn("alpha-only-message", second_page)
+
+    def test_start_new_conversation_clears_only_the_selected_tenant(self):
+        first = self.onboard(SPECS[0])
+        second = self.onboard(SPECS[1])
+        self.post("/playground", {"tenant_id": first, "customer_message": "clear-this"})
+        self.post("/playground", {"tenant_id": second, "customer_message": "keep-this"})
+        response = self.post("/playground", {"tenant_id": first, "start_new": "1"})
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("clear-this", self.page(f"/playground?tenant_id={first}"))
+        self.assertIn("keep-this", self.page(f"/playground?tenant_id={second}"))
+
+    def test_playground_rejects_bad_input_without_creating_live_side_effects(self):
+        tenant_id = self.onboard(SPECS[0])
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select "
+                "(select count(*) from public.audit_log where tenant_id = %s), "
+                "(select count(*) from public.tenant_channels where tenant_id = %s), "
+                "(select count(*) from public.subscriptions where tenant_id = %s)",
+                (tenant_id, tenant_id, tenant_id),
+            )
+            before = cursor.fetchone()
+        response = self.post("/playground", {
+            "tenant_id": tenant_id,
+            "customer_message": "x" * 5001,
+        })
+        page = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most 2000", page)
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select "
+                "(select count(*) from public.audit_log where tenant_id = %s), "
+                "(select count(*) from public.tenant_channels where tenant_id = %s), "
+                "(select count(*) from public.subscriptions where tenant_id = %s)",
+                (tenant_id, tenant_id, tenant_id),
+            )
+            self.assertEqual(cursor.fetchone(), before)
+        self.assertEqual(self.bot_provider.requests, [])
+
+    def test_provider_errors_are_useful_and_do_not_leak_details(self):
+        tenant_id = self.onboard(SPECS[0])
+        self.bot_provider.failure = BotProviderError("The AI provider could not generate a response. Try again.")
+        response = self.post(
+            "/playground", {"tenant_id": tenant_id, "customer_message": "Hello"}
+        )
+        self.assertEqual(response.status_code, 502)
+        page = response.get_data(as_text=True)
+        self.assertIn("AI provider could not generate", page)
+        self.assertNotIn("OPENAI_API_KEY", page)
+
+    def test_successful_playground_response_has_no_live_side_effects(self):
+        tenant_id = self.onboard(SPECS[0])
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select "
+                "(select count(*) from public.audit_log where tenant_id = %s), "
+                "(select count(*) from public.tenant_channels where tenant_id = %s), "
+                "(select count(*) from public.subscriptions where tenant_id = %s)",
+                (tenant_id, tenant_id, tenant_id),
+            )
+            before = cursor.fetchone()
+        response = self.post(
+            "/playground", {"tenant_id": tenant_id, "customer_message": "Book this now"}
+        )
+        self.assertEqual(response.status_code, 200)
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select "
+                "(select count(*) from public.audit_log where tenant_id = %s), "
+                "(select count(*) from public.tenant_channels where tenant_id = %s), "
+                "(select count(*) from public.subscriptions where tenant_id = %s)",
+                (tenant_id, tenant_id, tenant_id),
+            )
+            self.assertEqual(cursor.fetchone(), before)
 
 
 class MemberAndSubscriptionTests(DashboardTestCase):

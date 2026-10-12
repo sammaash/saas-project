@@ -79,6 +79,12 @@ class Settings:
     session_minutes: int = 60
     allow_active_channels: bool = False
     trusted_proxies: int = 0
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    whatsapp_verify_token: str | None = None
+    whatsapp_app_secret: str | None = None
+    whatsapp_graph_api_version: str = "v21.0"
+    whatsapp_send_enabled: bool = False
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -125,6 +131,14 @@ class Settings:
             session_minutes=session_minutes,
             allow_active_channels=_flag(environ, "PLATFORM_ALLOW_ACTIVE_CHANNELS"),
             trusted_proxies=trusted_proxies,
+            openai_api_key=environ.get("OPENAI_API_KEY") or None,
+            openai_model=environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
+            whatsapp_verify_token=environ.get("WHATSAPP_VERIFY_TOKEN") or None,
+            whatsapp_app_secret=environ.get("WHATSAPP_APP_SECRET") or None,
+            whatsapp_graph_api_version=(
+                environ.get("WHATSAPP_GRAPH_API_VERSION", "v21.0").strip() or "v21.0"
+            ),
+            whatsapp_send_enabled=_flag(environ, "WHATSAPP_SEND_ENABLED"),
         )
 
 

@@ -23,6 +23,8 @@ def rotate() -> None:
 
 def protect() -> None:
     """Abort with 400 unless the request carries the session's CSRF token."""
+    if request.path == "/webhooks/whatsapp":
+        return
     if request.method in SAFE_METHODS:
         return
     expected = session.get(SESSION_KEY)

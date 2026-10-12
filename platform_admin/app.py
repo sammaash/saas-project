@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from flask import Flask, render_template
 from werkzeug.exceptions import HTTPException
@@ -17,6 +18,9 @@ from .services.validation import ServiceError, translate_db_error
 
 logger = logging.getLogger("platform_admin")
 
+if TYPE_CHECKING:
+    from saas.bot import BotResponseProvider
+
 
 class _UnconfiguredAuthenticator(Authenticator):
     def login(self, email: str, password: str) -> Identity:
@@ -28,12 +32,14 @@ class PlatformContext:
     settings: Settings
     authenticator: Authenticator
     limiter: LoginRateLimiter
+    bot_provider: BotResponseProvider | None
 
 
 def create_app(
     settings: Settings | None = None,
     *,
     authenticator: Authenticator | None = None,
+    bot_provider: BotResponseProvider | None = None,
 ) -> Flask:
     settings = settings or Settings.from_env()
     if authenticator is None:
@@ -43,6 +49,11 @@ def create_app(
             )
         else:
             authenticator = _UnconfiguredAuthenticator()
+
+    if bot_provider is None and settings.openai_api_key:
+        from saas.bot import OpenAIChatProvider  # noqa: PLC0415
+
+        bot_provider = OpenAIChatProvider(settings.openai_api_key, settings.openai_model)
 
     app = Flask(__name__)
     app.config.update(
@@ -57,7 +68,10 @@ def create_app(
         # Only the configured number of proxies may set X-Forwarded-For; otherwise it is ignored.
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=settings.trusted_proxies)
     app.extensions["platform"] = PlatformContext(
-        settings=settings, authenticator=authenticator, limiter=LoginRateLimiter()
+        settings=settings,
+        authenticator=authenticator,
+        limiter=LoginRateLimiter(),
+        bot_provider=bot_provider,
     )
 
     app.before_request(csrf.protect)
@@ -70,7 +84,8 @@ def create_app(
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; style-src 'self'; form-action 'self'; "
+            "default-src 'none'; style-src 'self'; img-src 'self' https: data:; "
+            "script-src 'self'; connect-src 'self'; form-action 'self'; "
             "frame-ancestors 'none'; base-uri 'none'"
         )
         return response

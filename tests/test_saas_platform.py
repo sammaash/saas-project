@@ -51,9 +51,10 @@ def _add_catalogue(cursor, tenant_id):
     )
     product_id = cursor.fetchone()[0]
     cursor.execute(
-        "insert into public.product_variants (tenant_id, product_id, code, name, price) "
-        "values (%s, %s, 'std', 'Standard', 10)",
-        (tenant_id, product_id),
+        "insert into public.product_variants "
+        "(tenant_id, product_id, code, name, price, sku) "
+        "values (%s, %s, 'std', 'Standard', 10, %s)",
+        (tenant_id, product_id, f"{tenant_id}-std"),
     )
     cursor.execute("set local role saas_platform_admin")
 
@@ -505,8 +506,9 @@ class TenantScopeTests(SaasDatabaseTestCase):
             cursor.execute("select set_config('app.tenant_id', %s, true)", (TENANT_ONE_ID,))
             with self.assertRaises((_errors().ForeignKeyViolation, _errors().InsufficientPrivilege)):
                 cursor.execute(
-                    "insert into public.product_variants (tenant_id, product_id, code, name, price) "
-                    "values (app.current_tenant_id(), %s, 'x', 'X', 1)",
+                    "insert into public.product_variants "
+                    "(tenant_id, product_id, code, name, price, sku) "
+                    "values (app.current_tenant_id(), %s, 'x', 'X', 1, 'cross-tenant-x')",
                     (foreign_product,),
                 )
 
