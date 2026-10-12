@@ -108,6 +108,7 @@ class DatabaseErrorMappingTests(unittest.TestCase):
             (self.pg.UntranslatableCharacter("\\u0000 cannot be converted"), 400),
             (self.pg.InvalidTextRepresentation("bad input"), 400),
             (self.pg.InsufficientPrivilege("denied"), 403),
+            (self.pg.UndefinedColumn("column does not exist"), 404),
             (self.pg.UniqueViolation("dup"), 409),
             (self.pg.ForeignKeyViolation("fk"), 400),
             (self.pg.CheckViolation("check"), 400),

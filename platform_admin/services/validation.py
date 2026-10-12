@@ -146,6 +146,8 @@ def translate_db_error(error: Exception) -> ServiceError | None:
         return ServiceError("A value failed validation.", 400)
     if isinstance(error, pg.InsufficientPrivilege):
         return ServiceError("Not permitted.", 403)
+    if isinstance(error, pg.UndefinedColumn):
+        return ServiceError("Not found.", 404)
     if isinstance(error, pg.NoDataFound):
         message = getattr(getattr(error, "diag", None), "message_primary", "") or "not found"
         return ServiceError(message[0].upper() + message[1:] + ".", 404)
