@@ -1,0 +1,23 @@
+<div class="system-message">This private simulation uses {{ tenant.name }}'s active catalogue and saved bot configuration.</div>
+{% if not history %}
+<div class="bubble business-bubble">
+  <p>Hello! Choose an option below or type a message to test the assistant.</p>
+  <span class="message-meta">{{ demo_time }}</span>
+</div>
+{% endif %}
+{% for item in history %}
+<div class="bubble {{ 'customer-bubble' if item.role == 'user' else 'business-bubble' }}">
+  <p>{{ item.text }}</p>
+  <span class="message-meta">{{ item.time or demo_time }}{% if item.role == 'user' %} <span class="ticks" aria-label="Simulated delivered">&#10003;&#10003;</span>{% endif %}</span>
+</div>
+{% endfor %}
+{% if result and result.confirmation %}
+<div class="bubble business-bubble confirmation-bubble">
+  <strong>DEMO CONFIRMATION &middot; NOT A REAL ORDER</strong>
+  <p>Thanks, {{ result.confirmation.customer_name }}. This simulation calculated {{ result.confirmation.cart.currency }} {{ result.confirmation.cart.total }}. No order was saved and no payment was requested.</p>
+  <span class="message-meta">{{ demo_time }}</span>
+</div>
+{% endif %}
+<div class="typing-indicator" aria-label="Assistant is typing" hidden>
+  <span></span><span></span><span></span>
+</div>

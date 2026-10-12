@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Quotations</h2>
+<p><a class="button" href="{{ url_for('admin.quotation_create', tenant_id=tenant.id) }}">Create quotation</a></p>
+<table>
+  <tr><th>Number</th><th>Customer</th><th>Issued</th><th>Expires</th><th>Total</th><th>Status</th></tr>
+  {% for quotation in quotations %}
+  <tr>
+    <td><a href="{{ url_for('admin.quotation_detail', tenant_id=tenant.id, quotation_id=quotation.id) }}">{{ quotation.quotation_number }}</a></td>
+    <td>{{ quotation.customer_name }}</td>
+    <td>{{ quotation.issue_date }}</td>
+    <td>{{ quotation.expiry_date }}</td>
+    <td>{{ quotation.currency }} {{ '%.2f' | format(quotation.total) }}</td>
+    <td>{{ quotation.status | title }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">No quotations have been issued.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

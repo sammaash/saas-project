@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Members</h2>
+<table>
+  <tr><th>User id</th><th>Role</th><th>Status</th></tr>
+  {% for m in members %}<tr><td>{{ m.user_id }}</td><td>{{ m.role }}</td><td>{{ m.status }}</td></tr>
+  {% else %}<tr><td colspan="3" class="muted">No members yet.</td></tr>{% endfor %}
+</table>
+<h3>Add member</h3>
+<form method="post" class="card narrow">
+  {{ csrf_field() }}
+  <label>Auth user id (verified UUID) <input name="user_id" required></label>
+  <label>Role <select name="role"><option>owner</option><option>staff</option></select></label>
+  <label>Status <select name="status"><option>active</option><option>invited</option></select></label>
+  <button type="submit">Add member</button>
+</form>
+{% endblock %}

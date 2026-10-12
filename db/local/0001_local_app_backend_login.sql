@@ -10,6 +10,8 @@
 --
 -- Applied by:  python db/run_migrations.py --include-local
 
+do $$ begin if coalesce(current_setting('saas.allow_dev_data', true), '') <> 'on' then raise exception 'development-only script: refusing to set a known password without saas.allow_dev_data=on (db/run_migrations.py sets it for local databases only)'; end if; end $$;
+
 alter role app_backend with login password 'dev_app_backend_password';
 
 comment on role app_backend is

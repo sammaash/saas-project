@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Create quotation</h2>
+<form method="post">
+  {{ csrf_field() }}
+  <section class="card">
+    <label>Customer name <input name="customer_name" required maxlength="200" value="{{ request.form.get('customer_name', '') }}"></label>
+    <label>Customer contact <input name="customer_contact" maxlength="200" value="{{ request.form.get('customer_contact', '') }}"></label>
+    <label>Valid for days <input type="number" name="valid_days" min="1" max="365" value="{{ request.form.get('valid_days', form_context.valid_days) }}" required></label>
+    <label>Terms (optional) <textarea name="terms" rows="3" maxlength="4000">{{ request.form.get('terms', form_context.terms) }}</textarea></label>
+  </section>
+  <table>
+    <tr><th>SKU</th><th>Item</th><th>Price</th><th>Availability</th><th>Quantity</th></tr>
+    {% for item in form_context.items %}
+    <tr>
+      <td>{{ item.sku }}<input type="hidden" name="variant_id" value="{{ item.variant_id }}"></td>
+      <td>{{ item.product_name }} - {{ item.variant_name }}</td>
+      <td>{{ form_context.currency }} {{ '%.2f' | format(item.price) }}</td>
+      <td>
+        {{ item.availability | replace('_', ' ') | title }}
+        {% if item.stock_quantity is not none %} ({{ item.stock_quantity }} configured){% endif %}
+      </td>
+      <td><input type="number" name="quantity" min="0" max="100000" value="0" {{ 'readonly' if item.availability == 'OUT_OF_STOCK' else '' }}></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">No active catalogue items are available.</td></tr>
+    {% endfor %}
+  </table>
+  <p><button type="submit">Issue quotation</button></p>
+</form>
+<p class="muted">Issuing a quotation does not reserve stock, create an order, charge a customer or send a payment request.</p>
+{% endblock %}

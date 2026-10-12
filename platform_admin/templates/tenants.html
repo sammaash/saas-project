@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Tenants</h1>
+<p><a class="button" href="{{ url_for('admin.tenant_new') }}">Create tenant</a>
+  Filter:
+  {% for s in ['', 'draft', 'active', 'suspended', 'inactive'] %}
+    <a href="{{ url_for('admin.tenants', status=s) }}">{{ s or 'all' }}</a>
+  {% endfor %}</p>
+<table>
+  <tr><th>Name</th><th>Slug</th><th>Status</th><th>Products</th><th>Active variants</th><th>Owners</th><th>WhatsApp</th><th>Subscription</th></tr>
+  {% for t in tenants %}
+  <tr>
+    <td><a href="{{ url_for('admin.tenant_overview', tenant_id=t.id) }}">{{ t.name }}</a></td>
+    <td>{{ t.slug }}</td><td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+    <td>{{ t.product_count }}</td><td>{{ t.active_variant_count }}</td><td>{{ t.owner_count }}</td>
+    <td>{{ t.channel_status or '-' }}</td><td>{{ t.subscription_status or '-' }}</td>
+  </tr>
+  {% else %}<tr><td colspan="8" class="muted">No tenants yet.</td></tr>{% endfor %}
+</table>
+{% endblock %}

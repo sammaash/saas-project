@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Quotation {{ quotation.quotation_number }}</h2>
+<p><a class="button" href="{{ url_for('admin.quotation_download', tenant_id=tenant.id, quotation_id=quotation.id) }}">Download PDF</a></p>
+<section class="card">
+  <p><strong>Business:</strong> {{ quotation.business_name }}</p>
+  <p><strong>Customer:</strong> {{ quotation.customer_name }}{% if quotation.customer_contact %} · {{ quotation.customer_contact }}{% endif %}</p>
+  <p><strong>Issue date:</strong> {{ quotation.issue_date }} · <strong>Expiry:</strong> {{ quotation.expiry_date }} · <strong>Status:</strong> {{ quotation.status | title }}</p>
+</section>
+<table>
+  <tr><th>SKU</th><th>Description</th><th>Availability</th><th>Quantity</th><th>Unit price</th><th>Subtotal</th></tr>
+  {% for line in quotation.lines %}
+  <tr>
+    <td>{{ line.sku }}</td><td>{{ line.description }}</td>
+    <td>{{ line.availability | replace('_', ' ') | title }}</td>
+    <td>{{ line.quantity }}</td>
+    <td>{{ quotation.currency }} {{ '%.2f' | format(line.unit_price) }}</td>
+    <td>{{ quotation.currency }} {{ '%.2f' | format(line.subtotal) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<section class="card">
+  <p>Subtotal: {{ quotation.currency }} {{ '%.2f' | format(quotation.subtotal) }}</p>
+  <p>{{ quotation.tax_treatment }}</p>
+  {% if quotation.tax_amount is not none %}<p>Tax: {{ quotation.currency }} {{ '%.2f' | format(quotation.tax_amount) }}</p>{% endif %}
+  <p><strong>Total: {{ quotation.currency }} {{ '%.2f' | format(quotation.total) }}</strong></p>
+  {% if quotation.terms %}<h3>Terms</h3><p>{{ quotation.terms }}</p>{% endif %}
+</section>
+<p class="muted">This quotation is a snapshot. It does not reserve stock, create an order, charge the customer or send a payment request.</p>
+{% endblock %}

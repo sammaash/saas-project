@@ -23,6 +23,8 @@
 -- ---------------------------------------------------------------------------
 -- Plans (platform-owned: no tenant_id)
 -- ---------------------------------------------------------------------------
+do $$ begin if coalesce(current_setting('saas.allow_dev_data', true), '') <> 'on' then raise exception 'development-only seed: refusing to create fixture tenants without saas.allow_dev_data=on (db/run_migrations.py sets it for local databases only)'; end if; end $$;
+
 insert into public.plans (id, code, name, description, monthly_price, currency, is_active, limits)
 values (
   'd0000000-0000-4000-8000-000000000001',
@@ -55,11 +57,11 @@ values
   ('c0000000-0000-4000-8000-000000000001',
    '11111111-1111-4111-8111-111111111111',
    'whatsapp', 'dev-phone-id-cindy-001', 'dev-waba-001', '+254700000001', 'active', true,
-   'dev/tenants/cindy-bakes/whatsapp'),
+   'tenants/11111111-1111-4111-8111-111111111111/whatsapp'),
   ('c0000000-0000-4000-8000-000000000002',
    '22222222-2222-4222-8222-222222222222',
    'whatsapp', 'dev-phone-id-testbakery-002', 'dev-waba-002', '+254700000002', 'active', true,
-   'dev/tenants/test-bakery/whatsapp')
+   'tenants/22222222-2222-4222-8222-222222222222/whatsapp')
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------------

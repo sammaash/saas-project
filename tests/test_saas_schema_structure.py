@@ -47,6 +47,11 @@ PLATFORM_TABLES = (
     "audit_log",
     "products",
     "product_variants",
+    "catalogue_import_batches",
+    "quotations",
+    "quotation_lines",
+    "whatsapp_webhook_events",
+    "whatsapp_conversations",
 )
 
 # Tables that carry a tenant identity in a column named tenant_id. `tenants` is excluded
@@ -293,12 +298,12 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
         self.assertFalse(is_super, "app_backend must not be a superuser")
         self.assertFalse(bypasses, "app_backend must not have BYPASSRLS")
 
-    def test_platform_api_role_only_has_the_provisioning_function(self):
+    def test_platform_api_role_only_has_the_platform_functions(self):
         with self.superuser() as cursor:
             cursor.execute(
                 "select has_function_privilege("
                 "'saas_platform_admin', "
-                "'app.provision_tenant(text,text,uuid,text,text,uuid)', 'EXECUTE')"
+                "'app.platform_provision_tenant(text,text,text,text,uuid,uuid)', 'EXECUTE')"
             )
             self.assertTrue(cursor.fetchone()[0])
 
@@ -391,3 +396,25 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplicationSchemaContractTests(SaasDatabaseTestCase):
+    """The schema the dashboard verifies at startup must match the applied migrations.
+
+    Guards the staging regression where code requiring migration 0026 ran against a
+    database that did not have it, so every page using those objects returned 500.
+    """
+
+    def test_required_schema_is_present_in_the_migrated_database(self):
+        import psycopg
+
+        from platform_admin.config import REQUIRED_SCHEMA, missing_schema_objects
+
+        try:
+            from .saas_test_support import test_database_url
+        except ImportError:  # discovery inside the tests directory
+            from saas_test_support import test_database_url  # type: ignore[no-redef]
+
+        self.assertTrue(REQUIRED_SCHEMA, "the startup contract must not be empty")
+        with psycopg.connect(test_database_url()) as conn:
+            self.assertEqual(missing_schema_objects(conn), [])
