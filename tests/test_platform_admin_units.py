@@ -10,6 +10,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import jwt
 
@@ -374,20 +375,74 @@ class AppSecurityTests(unittest.TestCase):
         response = client.post("/login", data={"csrf_token": token, "email": "a@b.c", "password": "x"})
         self.assertEqual(response.status_code, 401)
 
-    def test_unexpected_errors_return_a_generic_page_and_log_no_values(self):
+    def test_unexpected_errors_return_a_generic_page_and_log_safe_stack_frames(self):
         app = create_app(_settings(), authenticator=_AcceptAll())
 
         @app.get("/boom")
         def boom():
-            raise RuntimeError("tenant-secret-value 12345")
+            raise RuntimeError("arbitrary customer text and database details")
 
         with self.assertLogs("platform_admin", level="ERROR") as logs:
             response = app.test_client().get("/boom")
         self.assertEqual(response.status_code, 500)
         body = response.get_data(as_text=True)
+        joined_output = "\n".join(logs.output)
         self.assertIn("Something went wrong", body)
-        self.assertNotIn("tenant-secret-value", body + "\n".join(logs.output))
-        self.assertNotIn("Traceback", body + "\n".join(logs.output))
+        self.assertIn("Traceback", joined_output)
+        self.assertIn("endpoint=boom", joined_output)
+        self.assertIn("in boom", joined_output)
+        self.assertNotIn("arbitrary customer text", body + joined_output)
+        self.assertNotIn("database details", body + joined_output)
+
+    def test_quotation_route_logs_safe_diagnostics_for_unexpected_database_failure(self):
+        tenant = {"id": TENANT_A, "name": "Tenant", "slug": "tenant", "status": "active"}
+        with self.client.session_transaction() as session:
+            session.update(
+                user_id=str(uuid.uuid4()),
+                email="admin@example.test",
+                exp=time.time() + 60,
+            )
+        with (
+            patch("saas.platform.is_platform_admin", return_value=True),
+            patch("platform_admin.routes.tenant_service.get_tenant", return_value=tenant),
+            patch(
+                "platform_admin.routes.quotation_service.list_quotations",
+                side_effect=RuntimeError("relation public.quotations does not exist"),
+            ),
+            self.assertLogs("platform_admin", level="ERROR") as logs,
+        ):
+            response = self.client.get(f"/tenants/{TENANT_A}/quotations")
+        output = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Something went wrong", response.get_data(as_text=True))
+        self.assertIn("endpoint=admin.tenant_quotations", output)
+        self.assertIn("tenant_quotations", output)
+        self.assertNotIn("public.quotations", output)
+
+    def test_playground_route_logs_safe_diagnostics_for_unexpected_database_failure(self):
+        tenant = {"id": TENANT_A, "name": "Tenant", "slug": "tenant", "status": "active"}
+        with self.client.session_transaction() as session:
+            session.update(
+                user_id=str(uuid.uuid4()),
+                email="admin@example.test",
+                exp=time.time() + 60,
+            )
+        with (
+            patch("saas.platform.is_platform_admin", return_value=True),
+            patch("platform_admin.routes.tenant_service.list_tenants", return_value=[tenant]),
+            patch(
+                "platform_admin.routes.playground_service.load_tenant_context",
+                side_effect=RuntimeError("column product_variants.availability does not exist"),
+            ),
+            self.assertLogs("platform_admin", level="ERROR") as logs,
+        ):
+            response = self.client.get("/playground")
+        output = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Something went wrong", response.get_data(as_text=True))
+        self.assertIn("endpoint=admin.bot_playground", output)
+        self.assertIn("bot_playground", output)
+        self.assertNotIn("product_variants.availability", output)
 
     def test_database_errors_become_friendly_responses_not_500s(self):
         import psycopg.errors as pg

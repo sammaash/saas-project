@@ -580,6 +580,11 @@ class QuotationDashboardTests(DashboardTestCase):
             )
             self.variant_id = cursor.fetchone()[0]
 
+    def test_quotation_list_page_uses_the_tenant_scoped_schema(self):
+        response = self.client.get(f"/tenants/{self.tenant}/quotations")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Quotations", response.get_data(as_text=True))
+
     def test_quotation_uses_server_prices_snapshots_values_and_downloads_pdf(self):
         response = self.post(
             f"/tenants/{self.tenant}/quotations/new",

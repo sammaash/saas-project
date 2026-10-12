@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from flask import Flask, render_template
+from flask import Flask, render_template, request
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -20,6 +21,21 @@ logger = logging.getLogger("platform_admin")
 
 if TYPE_CHECKING:
     from saas.bot import BotResponseProvider
+
+
+def _log_unexpected_error(error: Exception) -> None:
+    stack = "Traceback (most recent call last):\n" + "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(error.__traceback__)
+    )
+    logger.error(
+        "Unhandled %s endpoint=%s method=%s sqlstate=%s\n%s",
+        type(error).__name__,
+        request.endpoint or "<unknown>",
+        request.method if request else "<unknown>",
+        getattr(error, "sqlstate", None),
+        stack,
+    )
 
 
 class _UnconfiguredAuthenticator(Authenticator):
@@ -102,11 +118,7 @@ def create_app(
         friendly = translate_db_error(error)
         if friendly is not None:
             return render_template("error.html", message=friendly.message), friendly.status
-        # Log the exception type and SQLSTATE only: tracebacks and driver messages can echo
-        # SQL parameter values (tenant data).
-        logger.error(
-            "unhandled %s (sqlstate=%s)", type(error).__name__, getattr(error, "sqlstate", None)
-        )
+        _log_unexpected_error(error)
         return render_template("error.html", message="Something went wrong."), 500
 
     from .routes import register_routes  # noqa: PLC0415  (avoids an import cycle)
