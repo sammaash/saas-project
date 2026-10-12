@@ -55,6 +55,19 @@ def _granted(cursor, role, table):
 
 
 class DefaultPrivilegeTests(SaasDatabaseTestCase):
+    @staticmethod
+    def _ensure_service_role(cursor):
+        # A fresh PostgreSQL cluster (like CI's service container) has no
+        # service_role: has_table_privilege() raises for a missing role, so the
+        # privilege assertions below need the Supabase role to exist first.
+        cursor.execute(
+            "do $$ begin "
+            "if not exists (select 1 from pg_roles where rolname = 'service_role') then "
+            "create role service_role nologin; "
+            "end if; "
+            "end $$"
+        )
+
     def _assert_intended_privileges(self, cursor):
         for table in PLATFORM_TABLES:
             with self.subTest(table=table, role="anon"):
@@ -76,19 +89,14 @@ class DefaultPrivilegeTests(SaasDatabaseTestCase):
 
     def test_migrated_database_has_only_the_intended_dashboard_privileges(self):
         with self.superuser() as cursor:
+            self._ensure_service_role(cursor)
             self._assert_intended_privileges(cursor)
 
     def _simulate_hosted_grants_then_harden(self, repeat):
         import psycopg  # noqa: PLC0415
 
         with self.superuser() as cursor:
-            cursor.execute(
-                "do $$ begin "
-                "if not exists (select 1 from pg_roles where rolname = 'service_role') then "
-                "create role service_role nologin; "
-                "end if; "
-                "end $$"
-            )
+            self._ensure_service_role(cursor)
             cursor.execute("grant all on all tables in schema public to anon, authenticated, service_role")
             cursor.execute("grant all on all sequences in schema public to anon, authenticated, service_role")
             cursor.execute("alter table public.saas_schema_migrations disable row level security")
