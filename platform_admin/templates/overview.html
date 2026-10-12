@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Overview</h1>
+<section class="grid">
+  <div class="card"><h2>{{ data.tenants_total }}</h2><p>Total tenants</p></div>
+  <div class="card"><h2>{{ data.tenants_by_status.get('active', 0) }}</h2><p>Active tenants</p></div>
+  <div class="card"><h2>{{ data.tenants_by_status.get('draft', 0) }}</h2><p>Draft tenants</p></div>
+  <div class="card"><h2>{{ data.products_active }} / {{ data.products_total }}</h2><p>Active / total products</p></div>
+  <div class="card"><h2>{{ data.variants_active }} / {{ data.variants_total }}</h2><p>Active / total variants</p></div>
+</section>
+<h2>Subscriptions</h2>
+{% if data.subscriptions_by_status %}
+<ul>{% for status, count in data.subscriptions_by_status.items() %}<li>{{ status }}: {{ count }}</li>{% endfor %}</ul>
+{% else %}<p class="muted">No subscriptions yet.</p>{% endif %}
+<h2>Recent audit activity</h2>
+<table>
+  <tr><th>When</th><th>Tenant</th><th>Action</th><th>Actor</th></tr>
+  {% for row in data.recent_audit %}
+  <tr><td>{{ row.created_at.strftime('%Y-%m-%d %H:%M') }}</td><td>{{ row.tenant_name or 'platform' }}</td>
+      <td>{{ row.action }}</td><td>{{ row.actor_type }}</td></tr>
+  {% else %}<tr><td colspan="4" class="muted">No activity yet.</td></tr>{% endfor %}
+</table>
+{% endblock %}

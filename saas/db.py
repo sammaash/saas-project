@@ -10,7 +10,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from .config import app_db_role, require_database_url
+from .config import (
+    app_db_role,
+    platform_db_role,
+    require_database_url,
+    require_platform_database_url,
+)
 
 # Roles this helper will switch to. Restricted to a constant set because SET ROLE cannot
 # be parameterised -- the value is interpolated into SQL, so it must never come from a
@@ -18,8 +23,8 @@ from .config import app_db_role, require_database_url
 ALLOWED_ROLES = frozenset({"app_backend", "authenticated", "anon"})
 
 
-def connect(url: str | None = None) -> Any:
-    """Open a connection with autocommit disabled.
+def _connect_as(url: str, expected_role: str) -> Any:
+    """Open a connection with autocommit disabled, refusing any role but ``expected_role``.
 
     Autocommit off matters: the tenant-context helper depends on being inside a
     transaction so that ``set_config(..., true)`` is transaction-local and cannot leak to
@@ -33,7 +38,7 @@ def connect(url: str | None = None) -> Any:
             "    pip install -r requirements.txt"
         ) from error
 
-    conn = psycopg.connect(url or require_database_url())
+    conn = psycopg.connect(url)
     try:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -66,10 +71,11 @@ def connect(url: str | None = None) -> Any:
                 """
             )
             row = cursor.fetchone()
+        conn.rollback()
         if (
             row is None
-            or row[0] != app_db_role()
-            or row[1] != app_db_role()
+            or row[0] != expected_role
+            or row[1] != expected_role
             or row[2]
             or row[3]
             or row[4]
@@ -78,13 +84,23 @@ def connect(url: str | None = None) -> Any:
             actual_role = row[0] if row else "unknown"
             raise RuntimeError(
                 f"Unsafe SaaS database connection: expected session and current role "
-                f"{app_db_role()!r}, without superuser, BYPASSRLS, public-table ownership, "
+                f"{expected_role!r}, without superuser, BYPASSRLS, public-table ownership, "
                 f"or elevated-role membership; got {actual_role!r}."
             )
     except Exception:
         conn.close()
         raise
     return conn
+
+
+def connect(url: str | None = None) -> Any:
+    """Open a tenant-scoped application connection (role ``app_backend`` only)."""
+    return _connect_as(url or require_database_url(), app_db_role())
+
+
+def connect_platform(url: str | None = None) -> Any:
+    """Open a platform admin connection (role ``saas_platform_admin`` only)."""
+    return _connect_as(url or require_platform_database_url(), platform_db_role())
 
 
 @contextmanager

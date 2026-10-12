@@ -157,14 +157,16 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
     # -- 5: cross-tenant UPDATE affects nothing --------------------------------
     def test_5_tenant_001_cannot_update_tenant_002_records(self):
+        # Since migration 0023 channels are not writable by tenant-facing roles at all.
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
-            cursor.execute(
-                "update public.tenant_channels set display_phone_number = %s "
-                "where tenant_id = %s",
-                ("+254799999999", TENANT_TWO_ID),
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "update public.tenant_channels set display_phone_number = %s "
+                    "where tenant_id = %s",
+                    ("+254799999999", TENANT_TWO_ID),
+                )
 
+        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute(
                 "update public.tenants set name = 'Hijacked' where id = %s", (TENANT_TWO_ID,)
             )
@@ -177,12 +179,12 @@ class TenantIsolationTests(SaasDatabaseTestCase):
 
     # -- 6: cross-tenant DELETE affects nothing --------------------------------
     def test_6_tenant_001_cannot_delete_tenant_002_records(self):
-        # Granted but policy-filtered: the statement succeeds and deletes zero rows.
+        # Channels are not writable by tenant-facing roles (migration 0023).
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
-            cursor.execute(
-                "delete from public.tenant_channels where tenant_id = %s", (TENANT_TWO_ID,)
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "delete from public.tenant_channels where tenant_id = %s", (TENANT_TWO_ID,)
+                )
 
         # `tenants` has neither a DELETE grant nor a DELETE policy, so this raises.
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
@@ -262,13 +264,13 @@ class TenantIsolationTests(SaasDatabaseTestCase):
                 self.count_rows(cursor, "tenant_channels", "tenant_id", TENANT_ONE_ID), 1
             )
 
-            # A member, but not an owner, so the UPDATE policy does not match.
-            cursor.execute(
-                "update public.tenant_channels set display_phone_number = %s "
-                "where tenant_id = %s",
-                ("+254700000009", TENANT_ONE_ID),
-            )
-            self.assertEqual(cursor.rowcount, 0)
+            # A member, but not an owner; channels are not writable by tenant roles at all.
+            with self.assertRaises(_denied_error()):
+                cursor.execute(
+                    "update public.tenant_channels set display_phone_number = %s "
+                    "where tenant_id = %s",
+                    ("+254700000009", TENANT_ONE_ID),
+                )
 
     def test_invited_member_cannot_read_tenant_data(self):
         with self.superuser() as cursor:
@@ -358,30 +360,17 @@ class RoutingTests(SaasDatabaseTestCase):
             )
             self.assertIsNone(cursor.fetchone()[0])
 
-    def test_routing_is_identity_not_authorisation(self):
-        """Routing answers "whose number is this?", not "may we serve them?".
-
-        A suspended tenant's active channel still resolves, because public.tenants is
-        FORCE-RLS'd and the resolver deliberately cannot read it. Tenant status is checked
-        afterwards, inside tenant context, where the tenant row is legitimately readable.
-        """
-        from saas import routing
-
+    def test_routing_does_not_resolve_a_non_active_tenant(self):
+        """Since migration 0020 the resolver also requires an active tenant."""
         with self.superuser() as cursor:
             cursor.execute(
                 "update public.tenants set status = 'suspended' where id = %s", (TENANT_TWO_ID,)
             )
-            self.assertEqual(
-                routing.resolve_tenant_id_by_phone_number_id(
-                    TENANT_TWO_PHONE_NUMBER_ID, _app_backend_url()
-                ),
-                TENANT_TWO_ID,
+            cursor.execute("set local role app_backend")
+            cursor.execute(
+                "select app.resolve_tenant_by_phone_number_id(%s)", (TENANT_TWO_PHONE_NUMBER_ID,)
             )
-
-        # ...and in context the backend can read the status and decide what to do.
-        with self.backend(TENANT_TWO_ID) as cursor:
-            cursor.execute("select status from public.tenants")
-            self.assertEqual(cursor.fetchone()[0], "active")
+            self.assertIsNone(cursor.fetchone()[0])
 
     def test_routing_function_is_not_available_to_dashboard_sessions(self):
         """EXECUTE is granted to app_backend only: a browser never resolves a tenant."""
@@ -488,68 +477,9 @@ class ConstraintTests(SaasDatabaseTestCase):
             )
             self.assertEqual(cursor.fetchall(), [("starter",)])
 
-    def test_platform_provisioning_creates_tenant_owner_settings_and_audit_atomically(self):
-        owner_id = "dddddddd-0000-4000-8000-000000000001"
-        with self.superuser() as cursor:
-            cursor.execute("set local role saas_platform_admin")
-            cursor.execute(
-                "select app.provision_tenant(%s, %s, %s, %s, %s, %s)",
-                ("Provisioned Test", "provisioned-test", owner_id, "Africa/Nairobi", "KES", PLAN_ID),
-            )
-            tenant_id = cursor.fetchone()[0]
+    # Platform provisioning is covered in tests/test_saas_platform.py
+    # (app.platform_provision_tenant replaced app.provision_tenant in migration 0021).
 
-            cursor.execute("reset role")
-            cursor.execute("select name from public.tenants where id = %s", (tenant_id,))
-            self.assertEqual(cursor.fetchone(), ("Provisioned Test",))
-            cursor.execute(
-                "select role, status from public.tenant_users "
-                "where tenant_id = %s and user_id = %s",
-                (tenant_id, owner_id),
-            )
-            self.assertEqual(cursor.fetchone(), ("owner", "active"))
-            cursor.execute("select currency from public.tenant_settings where tenant_id = %s", (tenant_id,))
-            self.assertEqual(cursor.fetchone(), ("KES",))
-            cursor.execute(
-                "select action from public.audit_log "
-                "where tenant_id = %s and action = 'tenant.provisioned'",
-                (tenant_id,),
-            )
-            self.assertEqual(cursor.fetchone(), ("tenant.provisioned",))
-            cursor.execute(
-                "select count(*) from public.subscriptions "
-                "where tenant_id = %s and plan_id = %s",
-                (tenant_id, PLAN_ID),
-            )
-            self.assertEqual(cursor.fetchone()[0], 1)
-
-    def test_platform_provisioning_rolls_back_everything_on_failure(self):
-        owner_id = "dddddddd-0000-4000-8000-000000000002"
-        with self.superuser() as cursor:
-            cursor.execute("savepoint before_provisioning_failure")
-            cursor.execute("set local role saas_platform_admin")
-            with self.assertRaises(Exception):
-                cursor.execute(
-                    "select app.provision_tenant(%s, %s, %s, %s, %s, %s)",
-                    (
-                        "Atomic Failure",
-                        "atomic-failure",
-                        owner_id,
-                        "Africa/Nairobi",
-                        "KES",
-                        "ffffffff-ffff-4fff-8fff-ffffffffffff",
-                    ),
-                )
-            cursor.execute("rollback to savepoint before_provisioning_failure")
-            cursor.execute("select count(*) from public.tenants where slug = 'atomic-failure'")
-            self.assertEqual(cursor.fetchone()[0], 0)
-
-    def test_tenant_role_cannot_call_platform_provisioning(self):
-        with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
-            with self.assertRaises(_denied_error()):
-                cursor.execute(
-                    "select app.provision_tenant(%s, %s, %s)",
-                    ("Client Tenant", "client-tenant", TENANT_ONE_OWNER_USER_ID),
-                )
 
 class AuditLogTests(SaasDatabaseTestCase):
     """Append-only audit trail, including platform-level (tenant-less) events."""

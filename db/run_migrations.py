@@ -19,7 +19,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
@@ -37,6 +37,42 @@ create table if not exists public.saas_schema_migrations (
 """
 
 
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def database_hosts(url: str, environ: dict[str, str] | None = None) -> list[str] | None:
+    """Every host libpq could connect to for ``url``; None when it cannot be determined."""
+    environ = os.environ if environ is None else environ
+    if "://" not in url:
+        return None
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        params = parse_qs(parts.query)
+    except ValueError:
+        return None
+    hosts = [hostname] if hostname else []
+    for key in ("host", "hostaddr"):
+        hosts += [item for value in params.get(key, []) for item in value.split(",")]
+    if not hosts:
+        hosts += [item for item in environ.get("PGHOST", "").split(",") if item]
+        hosts += [item for item in environ.get("PGHOSTADDR", "").split(",") if item]
+    return [host.strip() for host in hosts]
+
+
+def is_local_target(url: str, environ: dict[str, str] | None = None) -> bool:
+    """True only when every possible connection target is loopback or a unix socket."""
+    hosts = database_hosts(url, environ)
+    if hosts is None:
+        return False
+    return all(host.lower() in LOOPBACK_HOSTS or host.startswith("/") for host in hosts)
+
+
+def is_supabase_target(url: str, environ: dict[str, str] | None = None) -> bool:
+    hosts = database_hosts(url, environ) or []
+    return "supabase" in url.lower() or any("supabase" in host.lower() for host in hosts)
+
+
 def _psycopg():
     """Import psycopg lazily so a missing optional dependency gives a clear message."""
     try:
@@ -47,6 +83,58 @@ def _psycopg():
             "    pip install -r requirements.txt"
         )
     return psycopg
+
+
+PROVISIONER_ROLE = "saas_platform_provisioner"
+
+
+def ensure_provisioner_access(conn) -> bool:
+    """Let a non-superuser migration role own functions as the provisioner (hosted PostgreSQL).
+
+    ``ALTER FUNCTION ... OWNER TO`` and ``CREATE OR REPLACE`` on provisioner-owned functions
+    need SET and INHERIT on that role. On PostgreSQL 16+ (Supabase) a CREATEROLE user that
+    creates a role holds only ADMIN on it, so the runner creates the role with the same
+    attributes migration 0013 uses and grants itself that membership for the run only.
+    A superuser needs nothing. Returns True when a membership was granted (release it after).
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "select rolsuper, current_setting('server_version_num')::int "
+            "from pg_catalog.pg_roles where rolname = current_user"
+        )
+        is_superuser, version = cursor.fetchone()
+        if is_superuser:
+            return False
+        cursor.execute("select 1 from pg_catalog.pg_roles where rolname = %s", (PROVISIONER_ROLE,))
+        if cursor.fetchone() is None:
+            cursor.execute(f"create role {PROVISIONER_ROLE} nologin noinherit nobypassrls")
+        if version >= 160000:
+            cursor.execute(
+                "select pg_catalog.pg_has_role(current_user, %s, 'USAGE') "
+                "and pg_catalog.pg_has_role(current_user, %s, 'SET')",
+                (PROVISIONER_ROLE, PROVISIONER_ROLE),
+            )
+            if cursor.fetchone()[0]:
+                conn.commit()
+                return False
+            cursor.execute(f"grant {PROVISIONER_ROLE} to current_user with inherit true, set true")
+        else:
+            cursor.execute(
+                "select pg_catalog.pg_has_role(current_user, %s, 'MEMBER')", (PROVISIONER_ROLE,)
+            )
+            if cursor.fetchone()[0]:
+                conn.commit()
+                return False
+            cursor.execute(f"grant {PROVISIONER_ROLE} to current_user")
+    conn.commit()
+    return True
+
+
+def release_provisioner_access(conn) -> None:
+    """Drop the temporary membership granted by :func:`ensure_provisioner_access`."""
+    with conn.cursor() as cursor:
+        cursor.execute(f"revoke {PROVISIONER_ROLE} from current_user")
+    conn.commit()
 
 
 def _checksum(sql: str) -> str:
@@ -127,12 +215,11 @@ def apply_all(conn, directory: Path, label: str) -> None:
         conn.commit()
 
 
+
 def print_status(conn) -> None:
     """Show which migrations are applied and which are pending."""
-    _run_script(conn, LEDGER_SQL)
-    conn.commit()
-
     applied = _applied(conn)
+
     if not applied:
         print("no migrations recorded yet")
     else:
@@ -140,11 +227,29 @@ def print_status(conn) -> None:
         for version in sorted(applied):
             print(f"  {version}  ({applied[version]})")
 
-    pending = [path.name for path in _sql_files(MIGRATIONS_DIR) if path.name not in applied]
+    files = _sql_files(MIGRATIONS_DIR)
+    pending = [
+        path.name for path in files
+        if path.name not in applied
+    ]
+
     if pending:
         print("not applied yet:")
         for name in pending:
             print(f"  {name}")
+
+    mismatches = [
+        (path.name, applied[path.name], _checksum(path.read_text(encoding="utf-8")))
+        for path in files
+        if path.name in applied
+        and applied[path.name] != _checksum(path.read_text(encoding="utf-8"))
+    ]
+
+    if mismatches:
+        print("CHECKSUM MISMATCHES:")
+        for name, recorded, current in mismatches:
+            print(f"  {name}: recorded={recorded}, current={current}")
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,10 +285,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--status", action="store_true", help="show applied and pending migrations"
     )
+    parser.add_argument(
+        "--allow-nonlocal-dev",
+        action="store_true",
+        help="development override: allow --include-local/--seed on a non-loopback host "
+        "(never honoured for Supabase hosts)",
+    )
     args = parser.parse_args(argv)
 
     if not args.database_url:
         parser.error("set SAAS_DATABASE_URL or pass --database-url")
+
+    dev_data = args.include_local or args.seed
+    if dev_data:
+        if is_supabase_target(args.database_url):
+            parser.error(
+                "--include-local/--seed set known development passwords and create fixture "
+                "data; they are forbidden for Supabase databases"
+            )
+        if not is_local_target(args.database_url) and not args.allow_nonlocal_dev:
+            parser.error(
+                "--include-local/--seed are refused for non-local database hosts; pass "
+                "--allow-nonlocal-dev only for a disposable development database"
+            )
 
     if args.reset and not args.i_am_sure:
         parser.error("--reset requires the explicit confirmation flag --i-am-sure")
@@ -219,13 +343,23 @@ def main(argv: list[str] | None = None) -> int:
             print_status(conn)
             return 0
 
-        apply_migrations(conn)
+        granted = ensure_provisioner_access(conn)
+        try:
+            apply_migrations(conn)
 
-        if args.include_local:
-            apply_all(conn, LOCAL_DIR, "local")
+            if dev_data:
+                # The db/local and db/seeds scripts refuse to run without this session setting.
+                conn.execute("select set_config('saas.allow_dev_data', 'on', false)")
 
-        if args.seed:
-            apply_all(conn, SEEDS_DIR, "seed")
+            if args.include_local:
+                apply_all(conn, LOCAL_DIR, "local")
+
+            if args.seed:
+                apply_all(conn, SEEDS_DIR, "seed")
+        finally:
+            if granted:
+                conn.rollback()
+                release_provisioner_access(conn)
 
     print("migrations complete")
     return 0

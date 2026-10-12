@@ -293,12 +293,12 @@ class GrantAndRoleTests(SaasDatabaseTestCase):
         self.assertFalse(is_super, "app_backend must not be a superuser")
         self.assertFalse(bypasses, "app_backend must not have BYPASSRLS")
 
-    def test_platform_api_role_only_has_the_provisioning_function(self):
+    def test_platform_api_role_only_has_the_platform_functions(self):
         with self.superuser() as cursor:
             cursor.execute(
                 "select has_function_privilege("
                 "'saas_platform_admin', "
-                "'app.provision_tenant(text,text,uuid,text,text,uuid)', 'EXECUTE')"
+                "'app.platform_provision_tenant(text,text,text,text,uuid,uuid)', 'EXECUTE')"
             )
             self.assertTrue(cursor.fetchone()[0])
 

@@ -10,7 +10,9 @@ on:
     paths:
       - "db/**"
       - "saas/**"
+      - "platform_admin/**"
       - "tests/test_saas_*.py"
+      - "tests/test_platform_admin_*.py"
       - "tests/saas_test_support.py"
       - "requirements.txt"
       - ".github/workflows/saas-isolation.yml"
@@ -18,7 +20,9 @@ on:
     paths:
       - "db/**"
       - "saas/**"
+      - "platform_admin/**"
       - "tests/test_saas_*.py"
+      - "tests/test_platform_admin_*.py"
       - "tests/saas_test_support.py"
       - "requirements.txt"
       - ".github/workflows/saas-isolation.yml"
@@ -78,6 +82,17 @@ jobs:
           grep -Eq '^Ran [1-9][0-9]* tests?' /tmp/saas-tests.log
           if grep -Eq 'skipped=[1-9][0-9]*' /tmp/saas-tests.log; then
             echo "SaaS isolation tests must not be skipped in CI" >&2
+            exit 1
+          fi
+
+      - name: Run the platform admin dashboard tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -p "test_platform_admin_*.py" -v 2>&1 | tee /tmp/platform-tests.log
+          grep -Eq '^Ran [1-9][0-9]* tests?' /tmp/platform-tests.log
+          if grep -Eq 'skipped=[1-9][0-9]*' /tmp/platform-tests.log; then
+            echo "Platform admin tests must not be skipped in CI" >&2
             exit 1
           fi
 

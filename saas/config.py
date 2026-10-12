@@ -17,6 +17,10 @@ import os
 # would make every policy in db/migrations/0011 decorative.
 APP_DB_ROLE = "app_backend"
 
+# The login used only by the platform admin service. It holds no table privileges and can
+# only execute the app.platform_* functions, each of which checks app.is_platform_admin().
+PLATFORM_DB_ROLE = "saas_platform_admin"
+
 # The setting that carries tenant context. Read by app.current_tenant_id().
 TENANT_CONTEXT_SETTING = "app.tenant_id"
 
@@ -44,6 +48,26 @@ def require_database_url() -> str:
             "connection string; the existing SQLite application does not use this setting."
         )
     return url
+
+
+def platform_database_url() -> str | None:
+    """Connection string for the platform admin login (saas_platform_admin)."""
+    return os.getenv("SAAS_PLATFORM_DATABASE_URL")
+
+
+def require_platform_database_url() -> str:
+    url = platform_database_url()
+    if not url:
+        raise RuntimeError(
+            "SAAS_PLATFORM_DATABASE_URL is not set. The platform admin service needs a "
+            "connection string for the saas_platform_admin login (configured out of band)."
+        )
+    return url
+
+
+def platform_db_role() -> str:
+    """The fixed role required for platform admin connections."""
+    return PLATFORM_DB_ROLE
 
 
 def app_db_role() -> str:

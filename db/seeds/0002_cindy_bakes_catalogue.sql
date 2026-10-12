@@ -3,6 +3,8 @@
 -- ============================================================================
 -- This script looks up the existing tenant by slug. It never inserts a tenant.
 
+do $$ begin if coalesce(current_setting('saas.allow_dev_data', true), '') <> 'on' then raise exception 'development-only seed: refusing to run without saas.allow_dev_data=on (db/run_migrations.py sets it for local databases only)'; end if; end $$;
+
 with cindy as (
   select id from public.tenants where slug = 'cindy-bakes'
 ), products_to_seed(name, category, sort_order) as (

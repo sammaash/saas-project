@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Catalogue</h2>
+
+<details class="card">
+  <summary>Add product</summary>
+  <form method="post" action="{{ url_for('admin.product_create', tenant_id=tenant.id) }}">
+    {{ csrf_field() }}
+    <label>Name <input name="name" required maxlength="200"></label>
+    <label>Category <input name="category" maxlength="100"></label>
+    <label>Description <textarea name="description" rows="2" maxlength="2000"></textarea></label>
+    <label>Sort order <input name="sort_order" value="0"></label>
+    <label>Attributes (JSON object) <textarea name="attributes" rows="2">{}</textarea></label>
+    <button type="submit">Create product</button>
+  </form>
+</details>
+
+{% for product in products %}
+<section class="card {{ '' if product.is_active else 'inactive' }}">
+  <h3>{{ product.name }} {% if not product.is_active %}<span class="badge inactive">inactive</span>{% endif %}</h3>
+  <details>
+    <summary>Edit product</summary>
+    <form method="post" action="{{ url_for('admin.product_update', tenant_id=tenant.id, product_id=product.id) }}">
+      {{ csrf_field() }}
+      <label>Name <input name="name" value="{{ product.name }}" required maxlength="200"></label>
+      <label>Category <input name="category" value="{{ product.category or '' }}" maxlength="100"></label>
+      <label>Description <textarea name="description" rows="2" maxlength="2000">{{ product.description or '' }}</textarea></label>
+      <label>Sort order <input name="sort_order" value="{{ product.sort_order }}"></label>
+      <label>Attributes (JSON object) <textarea name="attributes" rows="2">{{ product.attributes | tojson }}</textarea></label>
+      <button type="submit">Save product</button>
+    </form>
+  </details>
+  <form method="post" class="inline" action="{{ url_for('admin.product_active', tenant_id=tenant.id, product_id=product.id) }}">
+    {{ csrf_field() }}<input type="hidden" name="active" value="{{ '0' if product.is_active else '1' }}">
+    <button type="submit">{{ 'Deactivate' if product.is_active else 'Activate' }} product</button>
+  </form>
+
+  <table>
+    <tr><th>Code</th><th>Name</th><th>Price</th><th>Status</th><th></th></tr>
+    {% for variant in product.variants %}
+    <tr>
+      <td>{{ variant.code }}</td><td>{{ variant.name }}</td><td>{{ variant.price }}</td>
+      <td>{{ 'active' if variant.is_active else 'inactive' }}</td>
+      <td>
+        <details>
+          <summary>Edit</summary>
+          <form method="post" action="{{ url_for('admin.variant_update', tenant_id=tenant.id, variant_id=variant.id) }}">
+            {{ csrf_field() }}
+            <label>Code <input name="code" value="{{ variant.code }}" required></label>
+            <label>Name <input name="name" value="{{ variant.name }}" required></label>
+            <label>Price <input name="price" value="{{ variant.price }}" required></label>
+            <label>Sort order <input name="sort_order" value="{{ variant.sort_order }}"></label>
+            <label>Attributes (JSON object) <textarea name="attributes" rows="2">{{ variant.attributes | tojson }}</textarea></label>
+            <button type="submit">Save variant</button>
+          </form>
+        </details>
+        <form method="post" class="inline" action="{{ url_for('admin.variant_active', tenant_id=tenant.id, variant_id=variant.id) }}">
+          {{ csrf_field() }}<input type="hidden" name="active" value="{{ '0' if variant.is_active else '1' }}">
+          <button type="submit">{{ 'Deactivate' if variant.is_active else 'Activate' }}</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}<tr><td colspan="5" class="muted">No variants yet.</td></tr>{% endfor %}
+  </table>
+
+  <details>
+    <summary>Add variant</summary>
+    <form method="post" action="{{ url_for('admin.variant_create', tenant_id=tenant.id, product_id=product.id) }}">
+      {{ csrf_field() }}
+      <label>Code <input name="code" required></label>
+      <label>Name <input name="name" required></label>
+      <label>Price <input name="price" required inputmode="decimal"></label>
+      <label>Sort order <input name="sort_order" value="0"></label>
+      <label>Attributes (JSON object) <textarea name="attributes" rows="2">{}</textarea></label>
+      <button type="submit">Create variant</button>
+    </form>
+  </details>
+</section>
+{% else %}<p class="muted">No products yet.</p>{% endfor %}
+{% endblock %}

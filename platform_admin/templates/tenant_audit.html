@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Audit log</h2>
+<table>
+  <tr><th>When</th><th>Action</th><th>Actor</th><th>Entity</th><th>Details</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td><td>{{ r.action }}</td>
+      <td>{{ r.actor_type }}{% if r.actor_user_id %} {{ r.actor_user_id }}{% endif %}</td>
+      <td>{{ r.entity_type or '' }} {{ r.entity_id or '' }}</td><td><code>{{ r.metadata | tojson }}</code></td></tr>
+  {% else %}<tr><td colspan="5" class="muted">No activity yet.</td></tr>{% endfor %}
+</table>
+{% endblock %}

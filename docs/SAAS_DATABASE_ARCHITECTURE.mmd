@@ -1,0 +1,76 @@
+flowchart LR
+  subgraph PG["CURRENT SaaS DATABASE · PostgreSQL · migrations 0001–0018"]
+    subgraph PUBLIC["public domain tables · RLS enabled · FORCE except tenant_channels and tenant_users"]
+      TENANTS["tenants · root<br/>PK id · UNIQUE slug · status<br/>Tenant 001: 11111111-1111-4111-8111-111111111111<br/>slug cindy-bakes"]
+      CHANNELS["tenant_channels<br/>PK id · FK tenant_id → tenants.id<br/>UNIQUE phone_number_id<br/>partial UNIQUE default / tenant · secret reference only"]
+      USERS["tenant_users<br/>PK id · FK tenant_id → tenants.id<br/>UNIQUE (tenant_id,user_id)<br/>user_id = JWT sub · no auth.users FK<br/>owner/staff · invited/active/disabled"]
+      SETTINGS["tenant_settings<br/>PK/FK tenant_id → tenants.id<br/>one row / tenant · timezone, currency, JSONB"]
+      PLANS["plans · platform-owned<br/>PK id · UNIQUE code · is_active · limits"]
+      SUBS["subscriptions<br/>PK id · FK tenant_id + plan_id<br/>partial UNIQUE one live subscription / tenant"]
+      AUDIT["audit_log · append-only<br/>PK bigint id · nullable FK tenant_id<br/>ON DELETE SET NULL · platform rows may be NULL"]
+      PRODUCTS["products<br/>PK id · FK tenant_id → tenants.id<br/>UNIQUE (tenant_id,name_normalized)<br/>active · category · attributes"]
+      VARIANTS["product_variants<br/>PK id · composite FK (tenant_id,product_id)<br/>UNIQUE (tenant_id,product_id,code)<br/>numeric(12,2) price · JSONB attributes"]
+      TENANTS -->|tenant_id| CHANNELS
+      TENANTS -->|tenant_id| USERS
+      TENANTS -->|tenant_id| SETTINGS
+      TENANTS -->|tenant_id| SUBS
+      PLANS -->|plan_id| SUBS
+      TENANTS -. nullable tenant_id .-> AUDIT
+      TENANTS -->|tenant_id| PRODUCTS
+      PRODUCTS -->|tenant-preserving composite FK| VARIANTS
+    end
+    subgraph APP["app helper schema · helper functions, not tables"]
+      CTX["current_tenant_id()<br/>transaction-local; NULL fails closed"]
+      JWT["current_user_id()<br/>request.jwt.claims → sub<br/>no auth.users FK"]
+      MEMBER["is_tenant_member / is_tenant_owner<br/>status = active only"]
+      ROUTER["resolve_tenant_by_phone_number_id<br/>SECURITY DEFINER lookup"]
+      PROVISION["provision_tenant<br/>atomic tenant + owner + settings + audit<br/>generates UUID; no requested-ID argument"]
+      OWNER["final-active-owner trigger<br/>prevents removal of last active owner"]
+    end
+    ROLES["Database roles<br/>app_backend · runtime, RLS constrained<br/>authenticated · JWT/membership policies<br/>saas_platform_admin · provision function only<br/>anon · no table access"]
+    LEDGER["saas_schema_migrations<br/>PK version · checksum · applied_at<br/>runner metadata; no tenant RLS policy"]
+  end
+
+  subgraph SQLITE["SEPARATE CINDY BAKES APPLICATION · SQLite"]
+    ORDERS["orders<br/>PK integer id · tenant_id TEXT<br/>product_id / variant_id TEXT<br/>unit_price_snapshot REAL"]
+    CONV["whatsapp_conversations<br/>PK wa_id · current_order_id references orders.id<br/>draft_json + input_items_json"]
+    EVENTS["whatsapp_events<br/>PK message_id · webhook idempotency/status"]
+    ORDERS -. "declared SQLite FK; foreign_keys pragma not enabled" .-> CONV
+    NOTE["TRANSITIONAL BOUNDARY<br/>Cindy application may read catalogue/quotes from PostgreSQL.<br/>Orders and conversation state remain SQLite.<br/>IDs/snapshots are text; no PostgreSQL foreign keys."]
+  end
+
+  subgraph NOTBUILT["NOT IMPLEMENTED IN CURRENT SaaS REPOSITORY"]
+    HTTP["HTTP/API service · Auth/session integration · dashboard"]
+    PGOPS["PostgreSQL customers · conversations · messages<br/>orders · order_items · payments · usage/metering"]
+  end
+
+  ROLES -->|connect as app_backend| PUBLIC
+  CTX --> PUBLIC
+  JWT --> MEMBER
+  MEMBER --> PUBLIC
+  ROUTER --> CHANNELS
+  PROVISION --> TENANTS
+  PROVISION --> USERS
+  PROVISION --> SETTINGS
+  PROVISION --> AUDIT
+  OWNER --> USERS
+  PRODUCTS -. "text product_id; no cross-DB FK" .-> ORDERS
+  VARIANTS -. "text variant_id + agreed price snapshot" .-> ORDERS
+  NOTE --- ORDERS
+  HTTP -. planned .-> PUBLIC
+  HTTP -. planned .-> PGOPS
+
+  classDef root fill:#e8f1f8,stroke:#245a78,color:#163447,stroke-width:2px;
+  classDef tenant fill:#eef7f5,stroke:#287568,color:#123e38,stroke-width:2px;
+  classDef platform fill:#fff5e6,stroke:#a86f20,color:#53380f,stroke-width:2px;
+  classDef helper fill:#f1effa,stroke:#6653a3,color:#302659,stroke-width:2px;
+  classDef meta fill:#f2f4f5,stroke:#77838a,color:#344047,stroke-dasharray:5 4;
+  classDef sqlite fill:#fff0e8,stroke:#b35d37,color:#5a2b18,stroke-width:2px;
+  classDef future fill:#f7f7f7,stroke:#9aa2a6,color:#4d555a,stroke-dasharray:7 5;
+  class TENANTS root;
+  class CHANNELS,USERS,SETTINGS,SUBS,PRODUCTS,VARIANTS tenant;
+  class PLANS platform;
+  class AUDIT,LEDGER meta;
+  class CTX,JWT,MEMBER,ROUTER,PROVISION,OWNER,ROLES helper;
+  class ORDERS,CONV,EVENTS,NOTE sqlite;
+  class HTTP,PGOPS future;
