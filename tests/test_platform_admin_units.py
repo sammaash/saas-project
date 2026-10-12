@@ -125,6 +125,21 @@ class DatabaseErrorMappingTests(unittest.TestCase):
         self.assertIsNone(v.translate_db_error(RuntimeError("boom")))
         self.assertIsNone(v.translate_db_error(self.pg.OperationalError("down")))
 
+    def test_missing_schema_objects_become_a_safe_retryable_response(self):
+        cases = (
+            self.pg.UndefinedTable('relation "public.quotations" does not exist'),
+            self.pg.UndefinedColumn('column "availability" does not exist'),
+        )
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                friendly = v.translate_db_error(error)
+                self.assertIsNotNone(friendly)
+                self.assertEqual(friendly.status, 503)
+                self.assertIn("missing required schema", friendly.message)
+                self.assertIn("run_migrations.py", friendly.message)
+                self.assertNotIn("public.quotations", friendly.message)
+                self.assertNotIn("availability", friendly.message)
+
 
 def _token(secret, **overrides):
     claims = {

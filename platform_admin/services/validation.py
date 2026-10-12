@@ -146,6 +146,13 @@ def translate_db_error(error: Exception) -> ServiceError | None:
         return ServiceError("A value failed validation.", 400)
     if isinstance(error, pg.InsufficientPrivilege):
         return ServiceError("Not permitted.", 403)
+    if isinstance(error, (pg.UndefinedTable, pg.UndefinedColumn)):
+        return ServiceError(
+            "The application database is missing required schema. "
+            "Apply the pending migrations with db/run_migrations.py "
+            "before starting.",
+            503,
+        )
     if isinstance(error, pg.NoDataFound):
         message = getattr(getattr(error, "diag", None), "message_primary", "") or "not found"
         return ServiceError(message[0].upper() + message[1:] + ".", 404)
