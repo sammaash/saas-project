@@ -217,7 +217,19 @@ class MigrationPortabilityTests(unittest.TestCase):
                     self.assertNotRegex(attributes, r"superuser|createrole|createdb|(?<!no)bypassrls|replication")
 
     def test_hardening_migration_is_last_and_not_applied_with_other_grants_in_between(self):
-        self.assertEqual(MIGRATIONS[-1].name, HARDENING.name)
+        # Security invariant: no migration applied *after* the hardening pass may
+        # re-grant privileges to a Supabase-exposed role (anon / authenticated /
+        # service_role). Private backend roles (e.g. app_backend) sit behind RLS
+        # and are exempt, so schema/grant migrations for them may legitimately
+        # ship after hardening. The actual resulting privileges are enforced by
+        # DefaultPrivilegeTests against a real database.
+        exposed = ("anon", "authenticated", "service_role")
+        for path in MIGRATIONS[MIGRATIONS.index(HARDENING) + 1:]:
+            code = self._code(path)
+            hit = re.search(r"\bgrant\b[^;]*\bto\b[^;]*\b(anon|authenticated|service_role)\b", code, re.I)
+            self.assertIsNone(
+                hit, f"{path.name} grants to a Supabase-exposed role after the hardening pass"
+            )
 
 
 class _Cursor:

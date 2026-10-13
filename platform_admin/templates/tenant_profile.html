@@ -6,8 +6,8 @@
 <form method="post" class="card narrow">
   {{ csrf_field() }}
   <label>Business name <input name="name" value="{{ profile.tenant.name }}" required maxlength="200"></label>
-  <label>Timezone <input name="timezone" value="{{ profile.settings.timezone }}" required></label>
-  <label>Currency <input name="currency" value="{{ profile.settings.currency }}" required maxlength="3"></label>
+  <label>Activity <input name="activity" value="{{ profile.settings.configuration.get('activity', '') }}" maxlength="200"
+                        placeholder="e.g. Auto parts retail, salon, electronics shop"></label>
   <button type="submit">Save profile</button>
 </form>
 {% endblock %}

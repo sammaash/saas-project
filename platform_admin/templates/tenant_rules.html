@@ -2,13 +2,223 @@
 {% block content %}
 {% from "_macros.html" import csrf_field, tenant_tabs %}
 {{ tenant_tabs(tenant, tab) }}
-<h2>Business rules / AI behaviour</h2>
-<p class="muted">Each document is a JSON object stored for this tenant only.</p>
-<form method="post" class="card">
+{% set values = form_values %}
+<h2>WhatsApp AI agent onboarding</h2>
+<p class="muted">One form. The platform turns it into the single JSON configuration the bot consumes.
+The catalogue is uploaded separately from the Catalogue tab using catalogue-import-template.xlsx (Sheet: Products).</p>
+
+<form method="post" enctype="multipart/form-data" class="card">
   {{ csrf_field() }}
-  {% for column, label in labels %}
-  <label>{{ label }} <textarea name="{{ column }}" rows="8" spellcheck="false">{{ documents[column] }}</textarea></label>
+  <input type="hidden" name="form_kind" value="whatsapp_onboarding">
+
+  <h3>A. WhatsApp identity</h3>
+  <label>WhatsApp display name
+    <input name="wa_display_name" value="{{ values.identity.get('whatsapp_display_name', '') }}"
+           required maxlength="100" placeholder="Autolamps Kenya"></label>
+  <label>Business type
+    <select name="business_type" required>
+      <option value="">Select…</option>
+      {% for option in constants.WHATSAPP_BUSINESS_TYPES %}
+      <option {{ 'selected' if values.identity.get('business_type') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <p class="muted">The business type drives the AI persona, not the product category.</p>
+  <label>WhatsApp number
+    <input name="whatsapp_number" value="{{ values.identity.get('whatsapp_number', '') }}"
+           placeholder="+254700000000"></label>
+
+  <h3>B. Bot persona</h3>
+  <label>Tone
+    <select name="tone" required>
+      <option value="">Select…</option>
+      {% for option in constants.BOT_TONES %}
+      <option {{ 'selected' if values.persona.get('tone') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Bot name in chat (max 20 characters)
+    <input name="bot_name" maxlength="20" value="{{ values.persona.get('bot_name', '') }}"
+           placeholder="Lamps Assistant"></label>
+
+  <h3>C. Business hours + greeting</h3>
+  <label>Greeting (first message, sent 24/7)
+    <textarea name="greeting" rows="2" required
+              placeholder="Karibu Autolamps! Mimi ni Lamps Assistant. Tuma picha ama part number niku-check.">{{ values.hours.get('greeting', '') }}</textarea></label>
+
+  <h4>Human hours (timezone Africa/Nairobi, locked)</h4>
+  {% for day in constants.BUSINESS_DAYS %}
+  {% set day_value = values.days[day] %}
+  <div class="grid">
+    <label class="check"><input type="checkbox" name="day_open_{{ day }}" value="1"
+              {{ 'checked' if day_value.is_open else '' }}> {{ day | title }}</label>
+    <label>Opens <input type="time" name="day_open_time_{{ day }}" value="{{ day_value.open }}"></label>
+    <label>Closes <input type="time" name="day_close_time_{{ day }}" value="{{ day_value.close }}"></label>
+  </div>
   {% endfor %}
-  <button type="submit">Save</button>
+  <p class="muted">The bot answers 24/7. When a customer asks for a human, the platform checks these
+  hours; inside them the bot pauses for 2 hours and alerts the team, otherwise the offline message is
+  sent and the bot keeps saving the intent.</p>
+  <label>Offline message
+    <textarea name="human_offline_message" rows="2"
+              placeholder="Team yetu iko offline sai. Watarudi kesho 8am. Nime-save ujumbe wako.">{{ values.hours.get('human_offline_message', '') }}</textarea></label>
+  <h3>D. Business rules — describe your business</h3>
+  <label>Andika biashara yako hufanya kazi vipi, 3-4 lines
+    <textarea name="business_description" rows="4" required maxlength="4000"
+              placeholder="Sisi huuza taa za gari Toyota na Nissan. Bei ni fixed lakini tunaeza pea discount 5%. Tukikosa stock tunaeza suggest alternative. Malipo ni M-Pesa na cash. Delivery ni countrywide. Kurudisha ndani ya 3 days kama iko na damage. Customer akisema anataka kununua, confirm part kwanza, then ask qty, then M-Pesa, then delivery location.">{{ values.rules.get('description_paragraph', '') }}</textarea></label>
+  <p class="muted">The platform extracts the rules below from this paragraph.</p>
+  <label>Pricing rule
+    <select name="pricing_rule">
+      {% for option in ['Fixed', 'Negotiable', 'Quote-based'] %}
+      <option {{ 'selected' if values.rules.get('pricing_rule') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Discount allowed
+    <select name="discount_allowed">
+      {% for option in ['No', 'Up to 5%', 'Up to 10%'] %}
+      <option {{ 'selected' if values.rules.get('discount_allowed') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Out of stock
+    <select name="out_of_stock">
+      {% for option in ['Suggest alternative', 'Take order', 'Escalate to human'] %}
+      <option {{ 'selected' if values.rules.get('out_of_stock') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <fieldset>
+    <legend>Payment methods</legend>
+    {% for option in constants.PAYMENT_METHODS %}
+    <label class="check"><input type="checkbox" name="payment_methods" value="{{ option }}"
+      {{ 'checked' if option in (values.rules.get('payment_methods') or []) else '' }}> {{ option }}</label>
+    {% endfor %}
+  </fieldset>
+  <label>Delivery
+    <select name="delivery">
+      {% for option in ['Pickup only', 'Delivery within Nairobi', 'Countrywide'] %}
+      <option {{ 'selected' if values.rules.get('delivery') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Return policy
+    <input name="return_policy" maxlength="500" value="{{ values.rules.get('return_policy') or '' }}"
+           placeholder="Return within 3 days if damaged"></label>
+  <label>Order flow
+    <span class="badge">Derived: {{ values.order_flow_badge }}</span></label>
+  <fieldset>
+    <legend>Sellable product categories (loaded from the Products sheet)</legend>
+    {% if categories %}
+    {% for category in categories %}
+    <label class="check"><input type="checkbox" name="sellable_products" value="{{ category }}"
+      {{ 'checked' if category in (values.rules.get('sellable_products') or []) else '' }}> {{ category }}</label>
+    {% endfor %}
+    {% else %}<p class="muted">No categories yet — upload the catalogue first.</p>{% endif %}
+  </fieldset>
+  <label>Escalate after
+    <input type="number" name="escalation_tries" min="1"
+           value="{{ (values.rules.get('escalation') or {}).get('after_tries', 2) }}"></label>
+  <label>Escalation transfers to
+    <select name="escalation_transfer">
+      {% for option in constants.ESCALATION_TARGETS %}
+      <option {{ 'selected' if (values.rules.get('escalation') or {}).get('transfer_to') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Escalation WhatsApp number
+    <input name="escalation_whatsapp" value="{{ (values.rules.get('escalation') or {}).get('whatsapp') or '' }}"
+           placeholder="+254700123456"></label>
+
+  <h3>E. WhatsApp logic</h3>
+  <label>On photo
+    <select name="on_photo">
+      {% for option in constants.ON_PHOTO_CHOICES %}
+      <option value="{{ option }}" {{ 'selected' if values.rules.get('on_photo') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <label>On part not found
+    <select name="on_part_not_found">
+      {% for option in constants.ON_PART_NOT_FOUND_CHOICES %}
+      <option value="{{ option }}" {{ 'selected' if values.rules.get('on_part_not_found') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <label>On price asked
+    <select name="on_price_asked">
+      {% for option in constants.ON_PRICE_ASKED_CHOICES %}
+      <option value="{{ option }}" {{ 'selected' if values.rules.get('on_price_asked') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Pricing visibility
+    <select name="pricing_visibility">
+      {% for option in constants.PRICING_VISIBILITY_CHOICES %}
+      <option value="{{ option }}" {{ 'selected' if values.rules.get('pricing_visibility') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Spam rule — same question repeated
+    <input type="number" name="spam_repeat" min="1"
+           value="{{ (values.rules.get('spam_rule') or {}).get('repeat_count', 3) }}"></label>
+  <label>then
+    <select name="spam_action">
+      {% for option in constants.SPAM_ACTIONS %}
+      <option value="{{ option }}" {{ 'selected' if (values.rules.get('spam_rule') or {}).get('action') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <h3>F. WhatsApp API configuration</h3>
+  <label>Provider <input value="meta_cloud_api" disabled></label>
+  <input type="hidden" name="provider" value="meta_cloud_api">
+  <label>24-hour window expired
+    <select name="window_24h_action">
+      {% for option in constants.WINDOW_24H_ACTIONS %}
+      <option value="{{ option }}" {{ 'selected' if values.api.get('window_24h_action') == option else '' }}>{{ option | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Follow-up template name (must be approved in Meta Manager)
+    <input name="followup_template_name" value="{{ values.api.get('followup_template_name', '') }}"
+           placeholder="order_followup_1"></label>
+  <label>Human handover number
+    <input name="human_handover_number" value="{{ values.api.get('human_handover_number') or '' }}"
+           placeholder="+254700123456"></label>
+  <label>Auto-close ticket after
+    <select name="auto_close_ticket_after">
+      {% for option in constants.AUTO_CLOSE_CHOICES %}
+      <option value="{{ option }}" {{ 'selected' if values.api.get('auto_close_ticket_after') == option else '' }}>{{ option }}</option>
+      {% endfor %}
+    </select></label>
+
+  <h3>G. Knowledge base (RAG)</h3>
+  <label>Website link
+    <input name="website_link" value="{{ values.knowledge.get('website_link') or '' }}"
+           placeholder="https://autolamps.co.ke"></label>
+  <label>Scrape options
+    <label class="check"><input type="checkbox" name="include_subpages" value="1"
+      {{ 'checked' if (values.knowledge.get('scrape_options') or {}).get('include_subpages') else '' }}>
+      Include subpages</label>
+    <label>Max pages <input type="number" name="max_pages" min="1" max="100"
+      value="{{ (values.knowledge.get('scrape_options') or {}).get('max_pages', 20) }}"></label>
+  </label>
+  <label>FAQs — one pair per two lines
+    <textarea name="faqs_bulk" rows="5" spellcheck="false"
+              placeholder="Q: Mnafungua saa ngapi?&#10;A: Mon-Sat 8am-6pm">{{ values.faqs_bulk }}</textarea></label>
+  <label>Documents (PDF/DOCX)
+    <input type="file" name="document_uploads" accept=".pdf,.docx" multiple></label>
+  <p class="muted">
+    {% if values.knowledge.get('documents') %}Uploaded: {{ values.knowledge.get('documents') | join(', ') }}.<br>{% endif %}
+    RAG priority: FAQ &gt; Products sheet (price, stock, availability) &gt; Extra info &gt;
+    Website &gt; Documents. IN_STOCK sells now; MADE_TO_ORDER asks for lead time.</p>
+  <label>Extra information (policies, branches, warranty…)
+    <textarea name="extra_info" rows="3" maxlength="4000"
+              placeholder="Hatuna branch. Warranty 6 months.">{{ values.knowledge.get('extra_info') or '' }}</textarea></label>
+
+  <button type="submit">Save configuration</button>
 </form>
+
+<h2>Bot JSON output</h2>
+<p class="muted">Read-only: this is the single configuration the bot consumes.</p>
+<pre>{{ preview | tojson(indent=2) }}</pre>
+
+<details class="card">
+  <summary>Advanced: raw JSON documents</summary>
+  <p class="muted">Each document is a JSON object stored for this tenant only.</p>
+  <form method="post">
+    {{ csrf_field() }}
+    {% for column, label in labels %}
+    <label>{{ label }} <textarea name="{{ column }}" rows="8" spellcheck="false">{{ documents[column] }}</textarea></label>
+    {% endfor %}
+    <button type="submit">Save raw JSON</button>
+  </form>
+</details>
 {% endblock %}

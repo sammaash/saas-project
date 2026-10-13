@@ -540,6 +540,17 @@ def tenant_rules(tenant_id):
     tenant = _tenant(tenant_id)
     settings = context().settings
     if request.method == "POST":
+        if request.form.get("form_kind") == "whatsapp_onboarding":
+            payload = _form()
+            for key in ("payment_methods", "sellable_products"):
+                payload[key] = request.form.getlist(key)
+            uploaded = [f.filename for f in request.files.getlist("document_uploads") if f.filename]
+            payload["documents"] = sorted(
+                set(request.form.getlist("documents")) | set(uploaded)
+            )
+            return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
+                        lambda: tenant_service.update_rules_from_form(
+                            settings, g.admin_id, tenant["id"], payload))
         return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
                     lambda: tenant_service.update_rules(settings, g.admin_id, tenant["id"], _form()))
     profile = tenant_service.get_profile(settings, tenant["id"])
@@ -547,9 +558,14 @@ def tenant_rules(tenant_id):
         column: json.dumps(profile["settings"][column], indent=2, sort_keys=True)
         for column, _label in tenant_service.RULE_DOCUMENTS
     }
+    form_values = tenant_service.rules_form_values(settings, tenant["id"])
+    products = catalogue_service.list_catalogue(settings, tenant["id"])
+    categories = sorted({p["category"] for p in products if p.get("category")})
     return render_template(
         "tenant_rules.html", tenant=tenant, documents=documents,
         labels=tenant_service.RULE_DOCUMENTS, tab="rules",
+        form_values=form_values, categories=categories,
+        constants=tenant_service, preview=tenant_service.bot_config_preview(profile["settings"]),
     )
 
 

@@ -635,7 +635,10 @@ class GenericCodeTests(unittest.TestCase):
         for root in roots:
             files = [root] if root.is_file() else [p for p in root.rglob("*") if p.suffix in {".py", ".html", ".css"}]
             for path in files:
-                if re.search(r"cindy|bakes|bakery", path.read_text(encoding="utf-8"), re.I):
+                # Bans naming a specific tenant's business ("Cindy Bakes"). Generic
+                # business-type vocabulary (e.g. the WhatsApp onboarding dropdown
+                # options) is platform data and allowed.
+                if re.search(r"cindy|bakes", path.read_text(encoding="utf-8"), re.I):
                     offenders.append(str(path.relative_to(REPO)))
         self.assertEqual(offenders, [])
 
