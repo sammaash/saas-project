@@ -72,7 +72,7 @@ surcharge and the `M-Pesa`-only payment list. Both are data, changeable from the
 * Backward compatibility: the pre-existing WhatsApp tables and the order/payment workflows
   are untouched; all their tests still pass.
 
-Full suite result: **410 passed, 690 subtests passed, 0 failed** (disposable local database,
+Full suite result: **411 passed, 691 subtests passed, 0 failed** (disposable local database,
 `SAAS_TEST_DATABASE_URL` pointed at it, `SAAS_REQUIRE_TEST_DATABASE=1`).
 
 ### The dashboard verified against real staging data (read-only GETs)
@@ -126,21 +126,86 @@ external providers. No real Meta/WhatsApp provider call and no real M-Pesa STK p
 | Backend without tenant context | sees 0 rows (fails closed) |
 | RLS scoping | proven per tenant in `tests/test_saas_isolation.py` |
 
-## 6. WhatsApp integration status — **BLOCKED**
+## 6. WhatsApp integration status — **PARTIAL (identifiers live, credentials missing)**
+
+### Real Meta identifiers are now recorded for this tenant
+
+Supplied by the client and written to the staging channel through the dashboard's own
+service layer (`app.platform_update_channel`), which performs the database-mandated
+disable → update → activate sequence:
+
+| Field | Value | Where it lives |
+|---|---|---|
+| Business name | Cindy Bakes | `public.tenants.name` (as *Cindy Bakes Delights*) |
+| WABA ID | `2526681404500702` | `public.tenant_channels.waba_id` |
+| Business Portfolio ID | `2803809630006435` | reference only — our schema has no field for it |
+| WhatsApp phone number | `+254 747 595334` | `public.tenant_channels.display_phone_number` |
+| Phone Number ID | `1222930064245010` | `public.tenant_channels.phone_number_id` |
+
+Change applied (reversible — the previous values are recorded here):
+
+```text
+before   : dev-phone-id-cindy-001 / dev-waba-001 / +254700000001 (active)
+step 1/3 : disabling channel (identifiers cannot change while active)
+step 2/3 : updating identifiers
+step 3/3 : setting channel status to active
+after    : 1222930064245010 / 2526681404500702 / +254747595334 (active)
+```
+
+**Verified after the change** — `app.resolve_whatsapp_channel('1222930064245010')` returns this
+tenant, so an inbound webhook for the live number would route to Cindy Bakes rather than to
+nothing. The preflight now reports:
+
+```text
+   [ok] tenant status active                   active
+   [ok] channel recorded                       1222930064245010
+   [ok] channel status active                  active
+   [ok] credentials_ref exact                  tenants/11111111-1111-4111-8111-111111111111/whatsapp
+   [ok] phone_number_id is a real Meta id      1222930064245010
+   [ok] waba_id recorded                       2526681404500702
+   [ok] display number recorded                +254747595334
+   [ok] inbound routing resolves to this tenant resolves
+   [NO] WHATSAPP_APP_SECRET set                not set
+   [NO] WHATSAPP_VERIFY_TOKEN set              not set
+   [NO] tenant access token in environment     WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111 NOT set
+   [NO] outbound sending enabled               disabled
+verdict : BLOCKED by: ['WHATSAPP_APP_SECRET set', 'WHATSAPP_VERIFY_TOKEN set',
+                       'tenant access token in environment', 'outbound sending enabled']
+```
+
+### What is still missing (credentials, not identifiers)
 
 | Item | Status |
 |---|---|
-| Inbound webhook route, signature verification, idempotent message claim | implemented, tested against a mock provider |
-| Outbound delivery | gated off: `WHATSAPP_SEND_ENABLED` unset |
-| Channel row for this tenant | **still the development fixture**: `phone_number_id dev-phone-id-cindy-001`, `waba_id dev-waba-001`, display `+254700000001` |
-| Real `phone_number_id` / WABA id / display number | **not supplied** |
-| `WHATSAPP_ACCESS_TOKEN_<TENANT_ID>` | **not present** in the environment |
-| `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET` | **not set** |
-| Registered test number for webhook verification | **not supplied** |
+| `WHATSAPP_APP_SECRET` | **not set** — inbound signatures cannot be verified |
+| `WHATSAPP_VERIFY_TOKEN` | **not set** — the Meta webhook challenge cannot be answered |
+| `WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111` | **not set** — outbound cannot authenticate |
+| `WHATSAPP_SEND_ENABLED` | **not enabled** — outbound stays gated |
+| Registered test number for end-to-end webhook verification | **not supplied** |
 
-The channel row exists (so the readiness `channel` check is `ok`) but it points at the
-development placeholder from the seed. It must not be presented as a working WhatsApp
-channel, and the production number must not be pointed at the staging webhook.
+### What is verified, and what is still NOT
+
+| Claim | Status |
+|---|---|
+| Our database maps the live Phone Number ID to the Cindy Bakes tenant | **VERIFIED** (routing resolves) |
+| The identifier is well-formed and no longer a development placeholder | **VERIFIED** |
+| Meta's webhook is pointed at this application for this number | **NOT verified** — a Meta-side setting |
+| The number is registered for the Cloud API | **NOT verified** — needs Graph API/MCP access |
+| Inbound signature verification works against Meta's real signature | **NOT verified** — no app secret |
+| Outbound delivery works | **NOT verified** — gated off, no token |
+| Any real message has been sent or received | **NO — none** |
+
+**Therefore: live WhatsApp readiness is NOT claimed.** Recording the identifiers makes the
+tenant *routable*; it does not make the channel *working*. With sending disabled, an inbound
+message would be stored and left unanswered.
+
+> **Operational consequence to be aware of:** the live number is now bound in this database.
+> If Meta's webhook is (or becomes) pointed at this deployment, real customer messages for
+> `+254 747 595334` would be persisted into this tenant and **not answered**, because outbound
+> is disabled. If that is not wanted yet, disable the channel
+> (`python db/tenant_onboarding.py status …` is not the right lever — use
+> `channel --status disabled --confirm-slug cindy-bakes`) or keep Meta's webhook on its current
+> target until the credentials are in place.
 
 ### The exact go-live gate (read from the code, not assumed)
 
@@ -373,23 +438,29 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Bot Playground, orders and payments (automated) | **PASS** |
 | Migrations, RLS and database roles | **PASS** |
 | Operator onboarding tooling (`catalogue`/`settings`/`verify`/`status`/`channel`/`whatsapp`) | **PASS** — exercised end to end on a disposable database in both gate states |
-| Test suite | **PASS** — 410 passed, 690 subtests, 0 failed |
-| Real WhatsApp channel (identifiers, credentials, registered test number) | **BLOCKED** on client-supplied values; wiring path is built and verified |
+| Test suite | **PASS** — 411 passed, 691 subtests, 0 failed |
+| Real WhatsApp identifiers (Phone Number ID, WABA id, display number) | **PASS** — recorded and inbound routing verified |
+| Real WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token, send gate) | **BLOCKED** — not supplied; outbound stays off |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
 
 ### The one remaining dependency
 
-Everything on the platform side of the WhatsApp channel is built, tested and fail-closed.
-The only outstanding inputs are commercial/credential, not technical:
+Items (1) and (2) are **done** — the real identifiers are recorded and inbound routing is
+verified (see §6). What remains is credential material only:
 
-1. Meta `phone_number_id` and WABA id;
-2. the display number in E.164;
-3. a separate registered test number with its own verify token and app secret;
-4. the tenant access token (Railway service variables) and a decision on enabling outbound.
+1. ~~Meta `phone_number_id` and WABA id~~ — **done**: `1222930064245010` / `2526681404500702`
+2. ~~the display number in E.164~~ — **done**: `+254747595334`
+3. `WHATSAPP_APP_SECRET` and `WHATSAPP_VERIFY_TOKEN` — so inbound webhooks can be verified
+4. `WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111` and a decision on
+   `WHATSAPP_SEND_ENABLED` — so outbound can work
+5. a separate registered test number, to prove the inbound path end to end without
+   disturbing the live number
 
-Supplying (1)–(3) makes the `channel` command the last technical step; (4) decides whether
-`whatsapp` reports `READY`.
+Items 3–4 are Railway service variables (never repository files). Once they are set,
+`whatsapp` reports `READY` — but `READY` only means *our* gates are satisfied. It does **not**
+mean Meta's webhook points at us, nor that the number is registered for the Cloud API; those
+are Meta-side facts that only an authenticated Graph API or MCP call can confirm.
 
 **See also:** `docs/META_MCP_INTEGRATION.md` — Meta's WhatsApp Business Tools MCP is now
 configured in the development environment (Streamable HTTP + OAuth, no client secret). It is

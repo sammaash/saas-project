@@ -189,9 +189,13 @@ Rules that follow from the existing design, which any future integration must re
    the §4 prerequisite 2 question (whether the WABA sits on an app we administer).
 4. Inspect the phone number and its registration status, the templates, and the webhook
    subscription.
-5. Compare against what staging already holds for tenant `cindy-bakes`
-   (`phone_number_id dev-phone-id-cindy-001`, `waba_id dev-waba-001`, display
-   `+254700000001` — all development placeholders from the seed).
+5. Confirm against what this platform already holds for tenant `cindy-bakes`, which now
+   records the real identifiers supplied by the client:
+   `phone_number_id 1222930064245010`, `waba_id 2526681404500702`, display
+   `+254747595334`, Business Portfolio ID `2803809630006435` (reference only — our schema
+   has no column for it). The useful checks are the ones our database cannot make itself:
+   whether the number is actually **registered** for the Cloud API, its quality/limit tier,
+   the existing **webhook subscription target**, and the template list with approval states.
 6. Re-run the existing preflight, which reports the eight go-live prerequisites without
    calling the provider:
 
