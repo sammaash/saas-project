@@ -216,6 +216,7 @@ try:
         TENANT_ONE_OWNER_USER_ID,
         TENANT_TWO_ID,
         SaasDatabaseTestCase,
+        _connect,
         as_backend,
         as_superuser,
         as_user,
@@ -226,10 +227,22 @@ except ImportError:  # discovery inside the tests directory
         TENANT_ONE_OWNER_USER_ID,
         TENANT_TWO_ID,
         SaasDatabaseTestCase,
+        _connect,
         as_backend,
         as_superuser,
         as_user,
     )
+
+
+def _run_committed(sql: str, params: tuple) -> None:
+    """Execute and COMMIT as the migration role.
+
+    ``as_superuser`` deliberately rolls back, so fixture rows that must be visible to
+    a *second* connection (the app_backend role) have to be committed explicitly.
+    """
+    conn = _connect()
+    with conn, conn.cursor() as cursor:
+        cursor.execute(sql, params)
 
 NEW_TABLES = ("customers", "conversations", "messages")
 
@@ -270,12 +283,13 @@ class CustomerSchemaPresenceTests(SaasDatabaseTestCase):
 class CustomerRlsIsolationTests(SaasDatabaseTestCase):
     """RLS hides other tenants' customers and fails closed without context."""
 
-    def _seed_customer(self, cursor, tenant_id, wa_id):
-        cursor.execute(
-            "insert into public.customers (tenant_id, wa_id) values (%s, %s) returning id",
+    @staticmethod
+    def _seed_customer(tenant_id, wa_id):
+        _run_committed(
+            "insert into public.customers (tenant_id, wa_id) values (%s, %s) "
+            "on conflict do nothing",
             (tenant_id, wa_id),
         )
-        return cursor.fetchone()[0]
 
     def test_backend_without_context_sees_nothing(self):
         with as_backend(None) as cursor:
@@ -285,9 +299,8 @@ class CustomerRlsIsolationTests(SaasDatabaseTestCase):
                     self.assertEqual(cursor.fetchone()[0], 0)
 
     def test_customer_is_confined_to_its_tenant(self):
-        with as_superuser() as cursor:
-            self._seed_customer(cursor, TENANT_ONE_ID, "+254711111111")
-            self._seed_customer(cursor, TENANT_TWO_ID, "+254722222222")
+        self._seed_customer(TENANT_ONE_ID, "+254711111111")
+        self._seed_customer(TENANT_TWO_ID, "+254722222222")
         try:
             with as_backend(TENANT_ONE_ID) as cursor:
                 cursor.execute("select count(*) from public.customers")
@@ -297,15 +310,18 @@ class CustomerRlsIsolationTests(SaasDatabaseTestCase):
                     (TENANT_TWO_ID,),
                 )
                 self.assertEqual(cursor.fetchone()[0], 0)
+            # The dashboard role holds no grant at all on customer data, so Postgres
+            # refuses the query outright (stronger than RLS returning zero rows).
+            import psycopg  # noqa: PLC0415
+
             with as_user(TENANT_ONE_OWNER_USER_ID) as cursor:
-                cursor.execute("select count(*) from public.customers")
-                self.assertEqual(cursor.fetchone()[0], 0)  # authenticated has no grant
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    cursor.execute("select count(*) from public.customers")
         finally:
-            with as_superuser() as cursor:
-                cursor.execute(
-                    "delete from public.customers where wa_id in (%s, %s)",
-                    ("+254711111111", "+254722222222"),
-                )
+            _run_committed(
+                "delete from public.customers where wa_id in (%s, %s)",
+                ("+254711111111", "+254722222222"),
+            )
 
 
 class CustomerServiceDbTests(SaasDatabaseTestCase):
@@ -330,10 +346,9 @@ class CustomerServiceDbTests(SaasDatabaseTestCase):
             self.assertEqual(customer["id"], again["id"])
             self.assertEqual(again["name"], "Idem")  # coalesce keeps first name
         finally:
-            with as_superuser() as cursor:
-                cursor.execute(
-                    "delete from public.customers where wa_id = %s", ("+254733333333",)
-                )
+            _run_committed(
+                "delete from public.customers where wa_id = %s", ("+254733333333",)
+            )
 
 
 if __name__ == "__main__":

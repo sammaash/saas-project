@@ -88,10 +88,27 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("tenant_order_sequences", "tenant_id"),
 )
 
-# Webhook processing is backend-only; authenticated dashboard sessions must not be able
-# to inspect or enumerate these tables.
+# Tables that the `authenticated` dashboard role holds no grant on at all, so a dashboard
+# session cannot read or enumerate them (Postgres refuses the query outright, which is
+# stronger than RLS filtering it to zero rows).
+#
+# Webhook processing, order/payment ledgers and customer message history are backend-only:
+# migrations after 0030 grant to `app_backend` alone (see the privilege note at the top of
+# 0032/0033), and the hardening test asserts no later migration re-grants to a
+# Supabase-exposed role. The isolation suite must therefore skip these tables when it acts
+# as a dashboard session instead of expecting zero rows.
 AUTHENTICATED_INACCESSIBLE_TABLES = frozenset(
-    {"whatsapp_webhook_events", "whatsapp_conversations"}
+    {
+        "whatsapp_webhook_events",
+        "whatsapp_conversations",
+        "orders",
+        "order_items",
+        "order_payments",
+        "customers",
+        "conversations",
+        "messages",
+        "tenant_order_sequences",
+    }
 )
 
 # Tables where FORCE ROW LEVEL SECURITY is deliberately NOT applied, because the
