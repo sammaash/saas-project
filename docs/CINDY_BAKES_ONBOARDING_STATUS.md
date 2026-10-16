@@ -173,39 +173,91 @@ verdict : BLOCKED by: ['WHATSAPP_APP_SECRET set', 'WHATSAPP_VERIFY_TOKEN set',
                        'tenant access token in environment', 'outbound sending enabled']
 ```
 
-### What is still missing (credentials, not identifiers)
+### Meta-side facts, now VERIFIED by read-only Graph API calls
+
+The client supplied the app secret, verify token and tenant access token. They were written
+into the **local, gitignored `.env`** using the variable names this application actually
+reads, and then used for read-only `GET` calls (no message was sent, no asset changed).
+
+> **Two variable names in the supplied list were wrong for this codebase** and would have
+> failed silently if set in Railway as given:
+>
+> | Supplied | This app reads | Effect if uncorrected |
+> |---|---|---|
+> | `ACCESS_TOKEN` | `WHATSAPP_ACCESS_TOKEN_<TENANT_ID_UPPER_WITH_UNDERSCORES>` | outbound never authenticates |
+> | `WHATSAPP_API_VERSION` | `WHATSAPP_GRAPH_API_VERSION` | version silently falls back to `v21.0` |
+>
+> `WHATSAPP_VERIFY_TOKEN` and `WHATSAPP_APP_SECRET` were already correct.
+
+| Fact | Value | Source |
+|---|---|---|
+| Phone number | `+254 747 595334`, id `1222930064245010` | `GET /v26.0/1222930064245010` |
+| Platform | **`CLOUD_API`** | same |
+| Number status | **`CONNECTED`** | same |
+| Quality rating | `GREEN` | same |
+| `code_verification_status` | **`EXPIRED`** | same |
+| WABA | `cindy_bakes`, id `2526681404500702`, `account_review_status: APPROVED` | `GET /v26.0/2526681404500702` |
+| Numbers on the WABA | exactly one, matching the above | `GET /…/phone_numbers` |
+| Templates | **only `hello_world`** (`APPROVED`, `UTILITY`, `en_US`) — no Cindy Bakes templates exist | `GET /…/message_templates` |
+| App subscribed to the WABA | id `28834141379522438`, name `Cindy_bakes` | `GET /…/subscribed_apps` |
+
+The token works and carries the `whatsapp_business_management` scope.
+
+**Two findings that need attention:**
+
+1. **The app secret must belong to app `28834141379522438`.** That is the app currently
+   subscribed to this WABA. Inbound webhooks are rejected unless the `WHATSAPP_APP_SECRET`
+   used to verify `X-Hub-Signature-256` belongs to *that* app. The supplied secret has not
+   been proven to match it — this cannot be confirmed with a user token, only by comparing
+   against App settings → Basic for `28834141379522438`. **If they differ, every real webhook
+   will be rejected and the bot will appear to receive nothing.**
+2. **`code_verification_status: EXPIRED`** while `status: CONNECTED`. Recorded as Meta
+   reports it; it does not appear to be blocking, but it is worth confirming in the dashboard
+   rather than assuming.
+
+**Still not readable with this token:** the webhook **callback URL** that Meta will POST to.
+`subscribed_apps` confirms an app is subscribed but does not expose its callback URL, so
+whether Meta points at this deployment remains unverified.
+
+
+### What is still missing
 
 | Item | Status |
 |---|---|
-| `WHATSAPP_APP_SECRET` | **not set** — inbound signatures cannot be verified |
-| `WHATSAPP_VERIFY_TOKEN` | **not set** — the Meta webhook challenge cannot be answered |
-| `WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111` | **not set** — outbound cannot authenticate |
-| `WHATSAPP_SEND_ENABLED` | **not enabled** — outbound stays gated |
+| `WHATSAPP_APP_SECRET` | **set** locally — but must be proven to belong to app `28834141379522438` (see above) |
+| `WHATSAPP_VERIFY_TOKEN` | **set** locally — must also be set in the Railway service environment |
+| `WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111` | **set** locally — must also be set in Railway |
+| `WHATSAPP_GRAPH_API_VERSION` | **set** to `v26.0` locally |
+| `WHATSAPP_SEND_ENABLED` | **deliberately NOT enabled** — awaiting your decision |
 | Registered test number for end-to-end webhook verification | **not supplied** |
+| All of the above in the **Railway** service environment | **not done** — local `.env` only |
 
 ### What is verified, and what is still NOT
 
 | Claim | Status |
 |---|---|
-| Our database maps the live Phone Number ID to the Cindy Bakes tenant | **VERIFIED** (routing resolves) |
+| Our database maps the live Phone Number ID to the Cindy Bakes tenant | **VERIFIED** — routing resolves |
 | The identifier is well-formed and no longer a development placeholder | **VERIFIED** |
-| Meta's webhook is pointed at this application for this number | **NOT verified** — a Meta-side setting |
-| The number is registered for the Cloud API | **NOT verified** — needs Graph API/MCP access |
-| Inbound signature verification works against Meta's real signature | **NOT verified** — no app secret |
-| Outbound delivery works | **NOT verified** — gated off, no token |
+| The access token authenticates and carries `whatsapp_business_management` | **VERIFIED** — live Graph API calls succeeded |
+| The number is on **Cloud API** and `CONNECTED` | **VERIFIED** |
+| The WABA is `APPROVED` and owns exactly this number | **VERIFIED** |
+| Template inventory | **VERIFIED** — only `hello_world` exists |
+| An app is subscribed to the WABA | **VERIFIED** — app `28834141379522438` |
+| The supplied app secret belongs to that subscribed app | **NOT verified** — needs the App dashboard; if wrong, every webhook is rejected |
+| Meta's webhook **callback URL** points at this deployment | **NOT verified** — not readable with a user token |
+| Inbound signature verification works against a real Meta signature | **NOT verified** — no real webhook has arrived |
+| Outbound delivery works | **NOT verified** — send gate off; sending a test would message a real customer |
 | Any real message has been sent or received | **NO — none** |
 
-**Therefore: live WhatsApp readiness is NOT claimed.** Recording the identifiers makes the
-tenant *routable*; it does not make the channel *working*. With sending disabled, an inbound
-message would be stored and left unanswered.
+**Therefore: live WhatsApp readiness is still NOT claimed.** The tenant is *routable*, the
+credentials *work*, and the assets are *confirmed healthy* — but no end-to-end message has
+crossed the boundary, and the send gate remains off by choice.
 
-> **Operational consequence to be aware of:** the live number is now bound in this database.
-> If Meta's webhook is (or becomes) pointed at this deployment, real customer messages for
-> `+254 747 595334` would be persisted into this tenant and **not answered**, because outbound
-> is disabled. If that is not wanted yet, disable the channel
-> (`python db/tenant_onboarding.py status …` is not the right lever — use
-> `channel --status disabled --confirm-slug cindy-bakes`) or keep Meta's webhook on its current
-> target until the credentials are in place.
+> **Operational consequence to be aware of:** the live number is bound in this database and
+> `WHATSAPP_APP_SECRET` + `WHATSAPP_VERIFY_TOKEN` are now present locally. If Meta's webhook is
+> pointed at this deployment, real customer messages for `+254 747 595334` would be verified
+> and persisted into this tenant and **left unanswered**, because outbound is disabled. To park
+> the channel: `channel --status disabled --confirm-slug cindy-bakes`.
 
 ### The exact go-live gate (read from the code, not assumed)
 
@@ -440,7 +492,11 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Operator onboarding tooling (`catalogue`/`settings`/`verify`/`status`/`channel`/`whatsapp`) | **PASS** — exercised end to end on a disposable database in both gate states |
 | Test suite | **PASS** — 411 passed, 691 subtests, 0 failed |
 | Real WhatsApp identifiers (Phone Number ID, WABA id, display number) | **PASS** — recorded and inbound routing verified |
-| Real WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token, send gate) | **BLOCKED** — not supplied; outbound stays off |
+| Meta assets verified healthy (Cloud API, `CONNECTED`, WABA `APPROVED`, token authenticates) | **PASS** — read-only Graph API |
+| WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token) | **PASS locally** — set in gitignored `.env`; still to be set in Railway |
+| App secret proven to match the subscribed app `28834141379522438` | **UNVERIFIED** — must be confirmed in the App dashboard |
+| Outbound sending enabled | **NOT ENABLED** — awaiting your decision; no message has been sent |
+| End-to-end real-provider test (inbound webhook / outbound delivery) | **NOT PERFORMED** — needs a registered test number |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
 
