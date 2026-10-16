@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -217,6 +218,7 @@ try:
         TENANT_TWO_ID,
         SaasDatabaseTestCase,
         _connect,
+        app_backend_test_url,
         as_backend,
         as_superuser,
         as_user,
@@ -228,6 +230,7 @@ except ImportError:  # discovery inside the tests directory
         TENANT_TWO_ID,
         SaasDatabaseTestCase,
         _connect,
+        app_backend_test_url,
         as_backend,
         as_superuser,
         as_user,
@@ -329,26 +332,28 @@ class CustomerServiceDbTests(SaasDatabaseTestCase):
 
     def test_get_or_create_is_idempotent(self):
         settings = Settings(secret_key="s" * 40, app_database_url=None)
-        # The service opens its own connection via saas.db.connect using
-        # SAAS_DATABASE_URL; point it at the test URL for this call.
-        from saas import config as saas_config  # noqa: PLC0415
-
-        url = saas_config.test_database_url()
-        try:
-            customer = customers.get_or_create_customer(
-                settings, TENANT_ONE_ID, "c0000000-0000-4000-8000-000000000001",
-                "+254733333333", name="Idem",
-            )
-            again = customers.get_or_create_customer(
-                settings, TENANT_ONE_ID, "c0000000-0000-4000-8000-000000000001",
-                "+254733333333",
-            )
-            self.assertEqual(customer["id"], again["id"])
-            self.assertEqual(again["name"], "Idem")  # coalesce keeps first name
-        finally:
-            _run_committed(
-                "delete from public.customers where wa_id = %s", ("+254733333333",)
-            )
+        # The service opens its own connection through saas.db.connect, which reads
+        # SAAS_DATABASE_URL at call time. Pin that variable to the test database for the
+        # duration of the call: without this the suite would silently write to whatever
+        # SAAS_DATABASE_URL happens to point at (for example staging).
+        url = app_backend_test_url()
+        self.assertTrue(url, "the test database must be configured for this test")
+        with patch.dict(os.environ, {"SAAS_DATABASE_URL": url}):
+            try:
+                customer = customers.get_or_create_customer(
+                    settings, TENANT_ONE_ID, "c0000000-0000-4000-8000-000000000001",
+                    "+254733333333", name="Idem",
+                )
+                again = customers.get_or_create_customer(
+                    settings, TENANT_ONE_ID, "c0000000-0000-4000-8000-000000000001",
+                    "+254733333333",
+                )
+                self.assertEqual(customer["id"], again["id"])
+                self.assertEqual(again["name"], "Idem")  # coalesce keeps first name
+            finally:
+                _run_committed(
+                    "delete from public.customers where wa_id = %s", ("+254733333333",)
+                )
 
 
 if __name__ == "__main__":

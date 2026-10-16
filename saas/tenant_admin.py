@@ -198,7 +198,7 @@ class TenantAdmin:
                     variant_weight = int(match.group(1))
             if variant_weight is not None and int(variant_weight) == weight_kg_int:
                 product = next(
-                    (p for p in products if str(p["id"]) == variant["product_id"]),
+                    (p for p in products if str(p["id"]) == str(variant["product_id"])),
                     None,
                 )
                 if product is None:
@@ -225,7 +225,7 @@ class TenantAdmin:
         # when no exact weight match exists, so callers can surface a close option.
         if variants:
             product = next(
-                (p for p in products if str(p["id"]) == variants[0]["product_id"]),
+                (p for p in products if str(p["id"]) == str(variants[0]["product_id"])),
                 None,
             )
             if product is not None:
