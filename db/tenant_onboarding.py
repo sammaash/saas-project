@@ -222,13 +222,18 @@ def command_verify(args: argparse.Namespace, settings: Settings) -> int:
             )
 
     readiness = tenants.readiness(settings, admin_id, tenant_id)
+    checks = readiness.get("checks", [])
     print("readiness :")
-    for check in readiness.get("checks", []):
+    for check in checks:
         flag = "ok" if check.get("ok") else "NO"
         required = "required" if check.get("required") else "optional"
-        print(f"   [{flag}] {check.get('key'):<26} {required:<8} {check.get('detail', '')}")
-    print(f"ready     : {readiness.get('ready')}")
-    return 0 if readiness.get("ready") else 1
+        print(f"   [{flag}] {check.get('key'):<10} {required:<8} {check.get('label', '')}")
+    blocking = [c for c in checks if c.get("required") and not c.get("ok")]
+    print(
+        "ready     : "
+        + ("yes" if not blocking else f"no (blocking: {[c['key'] for c in blocking]})")
+    )
+    return 0 if not blocking else 1
 
 
 def command_status(args: argparse.Namespace, settings: Settings) -> int:
