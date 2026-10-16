@@ -72,7 +72,7 @@ surcharge and the `M-Pesa`-only payment list. Both are data, changeable from the
 * Backward compatibility: the pre-existing WhatsApp tables and the order/payment workflows
   are untouched; all their tests still pass.
 
-Full suite result: **407 passed, 657 subtests passed, 0 failed** (disposable local database,
+Full suite result: **410 passed, 690 subtests passed, 0 failed** (disposable local database,
 `SAAS_TEST_DATABASE_URL` pointed at it, `SAAS_REQUIRE_TEST_DATABASE=1`).
 
 ## 4. Bot Playground, orders and payments — **PASS (automated), see limitations**
@@ -117,13 +117,71 @@ The channel row exists (so the readiness `channel` check is `ok`) but it points 
 development placeholder from the seed. It must not be presented as a working WhatsApp
 channel, and the production number must not be pointed at the staging webhook.
 
+### The exact go-live gate (read from the code, not assumed)
+
+`platform_admin/services/whatsapp.py` gates outbound delivery on four conditions, all of
+which must hold, and the channel must be active for inbound routing to resolve:
+
+1. `WHATSAPP_SEND_ENABLED=1` (`Settings.whatsapp_send_enabled`);
+2. the channel's `credentials_ref` **exactly equals** `tenants/<tenant-uuid>/whatsapp`;
+3. `WHATSAPP_ACCESS_TOKEN_<TENANT-ID-UPPERCASE-WITH-UNDERSCORES>` is present in the
+   environment — i.e. `WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111`;
+4. inbound additionally needs `WHATSAPP_APP_SECRET` (signature verification) and
+   `WHATSAPP_VERIFY_TOKEN` (the Meta challenge).
+
+The token is never stored in the database and never reaches a template or a log.
+
+### Changing identifiers on a live channel is a three-step sequence
+
+The database **refuses** to change `phone_number_id`/`waba_id` while a channel is active
+(`"Disable the channel before changing its identifiers."`). The operator CLI performs and
+prints the sequence, and it checks the activation gate *before* the first mutation so a
+refusal cannot leave the channel disabled:
+
+```text
+before   : dev-phone-id-cindy-001 / dev-waba-001 / +254700000001 (active)
+step 1/3 : disabling channel (identifiers cannot change while active)
+step 2/3 : updating identifiers
+step 3/3 : setting channel status to active
+after    : 123456789012345 / 987654321098765 / +254712345678 (active)
+```
+
 **Blocking questions for the client:**
 
 1. The real WhatsApp Cloud API `phone_number_id` and WABA id for Cindy Bakes.
 2. Confirmation of the display number in E.164.
 3. A separate registered test number (its own verify token and app secret) to verify the
    webhook end to end, so the live number is never disturbed.
-4. Whether outbound sending should be enabled at launch, and the token to hold out of band.
+4. Whether outbound sending should be enabled at launch, and the token to hold out of band
+   (in the Railway service variables, never in the repository).
+
+### Ready-to-run commands once the values are supplied
+
+```bash
+# 1. Record/update the identifiers (requires the slug to be typed again as confirmation)
+python db/tenant_onboarding.py --admin-user-id <admin-uuid> \
+    channel --tenant-slug cindy-bakes \
+    --phone-number-id <META_PHONE_NUMBER_ID> \
+    --waba-id <WABA_ID> \
+    --display-number +254xxxxxxxxx \
+    --confirm-slug cindy-bakes
+
+# 2. Export the secrets in the service environment (Railway variables, not the repo)
+#    WHATSAPP_APP_SECRET, WHATSAPP_VERIFY_TOKEN, WHATSAPP_SEND_ENABLED=1,
+#    WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111
+
+# 3. Prove the gate; exits non-zero and lists exactly what is still missing
+python db/tenant_onboarding.py --admin-user-id <admin-uuid> \
+    whatsapp --tenant-slug cindy-bakes
+```
+
+The `whatsapp` command makes **no provider call and sends nothing**. Its inbound check calls
+the same `app.resolve_whatsapp_channel` function the webhook uses, so a pass means an inbound
+message for that number would really route to this tenant.
+
+Verified in both directions on a disposable database: with the development placeholder and no
+secrets it reported `BLOCKED by: [...5 items]` (exit 1); after recording a Meta-shaped
+identifier and exporting the secrets it reported `READY` (exit 0).
 ## 7. Deployment, rollback and next actions
 
 | Item | Status |
@@ -214,6 +272,13 @@ python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
     settings  --tenant-slug cindy-bakes --json db/tenants/cindy-bakes/settings.json
 python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
     verify    --tenant-slug cindy-bakes --lookup 'Vanilla:2'
+
+# WhatsApp channel and go-live gate (no provider call, sends nothing)
+python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
+    channel   --tenant-slug cindy-bakes --phone-number-id <META_ID> --waba-id <WABA_ID> \
+              --display-number +254xxxxxxxxx --confirm-slug cindy-bakes
+python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
+    whatsapp  --tenant-slug cindy-bakes
 ```
 
 The administrator UUID must be the verified Supabase Auth `sub` (an active row in
@@ -230,7 +295,21 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Customer-history implementation (0033, isolation, webhook, dashboard) | **PASS** |
 | Bot Playground, orders and payments (automated) | **PASS** |
 | Migrations, RLS and database roles | **PASS** |
-| Test suite | **PASS** — 407 passed, 657 subtests, 0 failed |
-| Real WhatsApp channel (identifiers, credentials, registered test number) | **BLOCKED** |
+| Operator onboarding tooling (`catalogue`/`settings`/`verify`/`status`/`channel`/`whatsapp`) | **PASS** — exercised end to end on a disposable database in both gate states |
+| Test suite | **PASS** — 410 passed, 690 subtests, 0 failed |
+| Real WhatsApp channel (identifiers, credentials, registered test number) | **BLOCKED** on client-supplied values; wiring path is built and verified |
 | Railway deployment confirmation | **BLOCKED** — service branch unconfirmed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
+
+### The one remaining dependency
+
+Everything on the platform side of the WhatsApp channel is built, tested and fail-closed.
+The only outstanding inputs are commercial/credential, not technical:
+
+1. Meta `phone_number_id` and WABA id;
+2. the display number in E.164;
+3. a separate registered test number with its own verify token and app secret;
+4. the tenant access token (Railway service variables) and a decision on enabling outbound.
+
+Supplying (1)–(3) makes the `channel` command the last technical step; (4) decides whether
+`whatsapp` reports `READY`.

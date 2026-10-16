@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import patch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 try:
     from .saas_test_support import (
@@ -80,6 +83,57 @@ def _delete_committed(sql: str, params: tuple) -> None:
     conn = _connect()
     with conn, conn.cursor() as cursor:
         cursor.execute(sql, params)
+
+
+class OnboardingCatalogueArtefactTests(unittest.TestCase):
+    """The shipped Cindy Bakes onboarding data must match the documented price list.
+
+    ``db/tenants/<slug>/`` is how a tenant is onboarded without the dashboard, so this
+    file is load-bearing product data. If it drifts from the documented prices, a customer
+    would be quoted the wrong amount.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.csv_path = REPO_ROOT / "db" / "tenants" / "cindy-bakes" / "catalogue.csv"
+
+    def test_csv_parses_into_an_accepted_workbook(self):
+        from platform_admin.services import catalogue_import
+        from db.tenant_onboarding import _workbook_bytes
+
+        content, row_count = _workbook_bytes(self.csv_path)
+        self.assertEqual(row_count, 33)
+        rows, errors = catalogue_import.parse_workbook("catalogue.xlsx", content)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 33)
+        self.assertTrue(all(row["currency"] == "KES" for row in rows))
+        self.assertTrue(all(row["availability"] == "MADE_TO_ORDER" for row in rows))
+
+    def test_prices_match_the_documented_list(self):
+        from decimal import Decimal
+
+        from db.tenant_onboarding import _workbook_bytes
+        from platform_admin.services import catalogue_import
+
+        content, _count = _workbook_bytes(self.csv_path)
+        rows, _errors = catalogue_import.parse_workbook("catalogue.xlsx", content)
+        actual: dict[str, dict[int, float]] = {}
+        for row in rows:
+            weight = int(str(row["variant"]).split()[0])
+            actual.setdefault(row["product_name"], {})[weight] = float(Decimal(row["price"]))
+        self.assertEqual(actual, EXPECTED_CINDY_PRICES)
+
+    def test_every_variant_name_carries_its_weight(self):
+        """The bot resolves a weight from the variant name, so it must end in "kg"."""
+        from platform_admin.services import catalogue_import
+
+        from db.tenant_onboarding import _workbook_bytes
+
+        content, _count = _workbook_bytes(self.csv_path)
+        rows, _errors = catalogue_import.parse_workbook("catalogue.xlsx", content)
+        for row in rows:
+            with self.subTest(sku=row["sku"]):
+                self.assertRegex(str(row["variant"]), r"^\d+\s*kg$")
 
 
 class TenantAdminPriceResolutionTests(SaasDatabaseTestCase):

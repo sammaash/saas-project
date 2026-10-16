@@ -40,7 +40,7 @@ if str(REPO_ROOT) not in sys.path:  # allow `python db/tenant_onboarding.py` fro
     sys.path.insert(0, str(REPO_ROOT))
 
 from platform_admin.config import Settings  # noqa: E402
-from platform_admin.services import catalogue_import, tenants  # noqa: E402
+from platform_admin.services import catalogue_import, channels, tenants, whatsapp  # noqa: E402
 from platform_admin.services.validation import ServiceError  # noqa: E402
 from saas.tenant_admin import tenant_admin  # noqa: E402
 
@@ -73,6 +73,12 @@ def _settings(env_file: Path) -> Settings:
         app_database_url=os.environ["SAAS_DATABASE_URL"],
         platform_database_url=os.environ["SAAS_PLATFORM_DATABASE_URL"],
         allow_active_channels=os.environ.get("PLATFORM_ALLOW_ACTIVE_CHANNELS", "0") == "1",
+        whatsapp_verify_token=os.environ.get("WHATSAPP_VERIFY_TOKEN") or None,
+        whatsapp_app_secret=os.environ.get("WHATSAPP_APP_SECRET") or None,
+        whatsapp_graph_api_version=(
+            os.environ.get("WHATSAPP_GRAPH_API_VERSION", "v21.0").strip() or "v21.0"
+        ),
+        whatsapp_send_enabled=os.environ.get("WHATSAPP_SEND_ENABLED", "0") == "1",
     )
 
 
@@ -246,6 +252,121 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def command_channel(args: argparse.Namespace, settings: Settings) -> int:
+    """Record or update this tenant's WhatsApp channel identifiers.
+
+    The platform never calls Meta here. Only non-secret identifiers are stored; the
+    access token stays in the environment (see the ``whatsapp`` command for the gate).
+    """
+    admin_id = _admin_id(args)
+    tenant = _tenant(settings, admin_id, args.tenant_slug)
+    tenant_id = str(tenant["id"])
+    form = {
+        "phone_number_id": args.phone_number_id,
+        "waba_id": args.waba_id,
+        "display_phone_number": args.display_number,
+        "confirm_slug": args.confirm_slug or "",
+    }
+
+    existing = channels.list_channels(settings, tenant_id)
+    if existing:
+        channel = existing[0]
+        if len(existing) > 1:
+            print(f"REFUSED  : {len(existing)} channels exist; resolve them in the dashboard.")
+            return 1
+        if not args.confirm_slug or args.confirm_slug != tenant["slug"]:
+            print("REFUSED  : re-run with --confirm-slug <slug> to change a live identifier.")
+            return 1
+        print(f"before   : {channel['phone_number_id']} / {channel['waba_id']} / "
+              f"{channel['display_phone_number']} ({channel['status']})")
+        channel_id = str(channel["id"])
+        was_active = channel["status"] == "active"
+        target = args.status or ("active" if was_active else None)
+        # The database refuses identifier changes while a channel is active, so changing a
+        # live channel is a three-step sequence. Check the activation gate BEFORE the first
+        # mutation, otherwise a failure half-way would leave the channel disabled.
+        if target == "active" and not settings.allow_active_channels:
+            print("REFUSED  : this environment cannot re-activate a channel "
+                  "(PLATFORM_ALLOW_ACTIVE_CHANNELS is not 1); nothing was changed.")
+            return 1
+        if was_active:
+            print("step 1/3 : disabling channel (identifiers cannot change while active)")
+            channels.set_channel_status(settings, admin_id, tenant_id, channel_id, "disabled")
+        print("step 2/3 : updating identifiers")
+        channels.update_channel(settings, admin_id, tenant_id, channel_id, form)
+        if target:
+            print(f"step 3/3 : setting channel status to {target}")
+            channels.set_channel_status(settings, admin_id, tenant_id, channel_id, target)
+    else:
+        channel_id = channels.connect_channel(settings, admin_id, tenant, form)
+        print(f"created  : channel {channel_id} (status pending)")
+        if args.status:
+            channels.set_channel_status(settings, admin_id, tenant_id, channel_id, args.status)
+            print(f"status   : {args.status}")
+
+    after = channels.list_channels(settings, tenant_id)[0]
+    print(f"after    : {after['phone_number_id']} / {after['waba_id']} / "
+          f"{after['display_phone_number']} ({after['status']})")
+    return 0
+
+
+def command_whatsapp(args: argparse.Namespace, settings: Settings) -> int:
+    """Report the go-live prerequisites for this tenant's WhatsApp channel.
+
+    Performs no provider call and sends nothing. The inbound check is a real call to
+    ``app.resolve_whatsapp_channel``, which is the same function the webhook uses, so a
+    pass means an inbound message for this number would actually route to this tenant.
+    """
+    admin_id = _admin_id(args)
+    tenant = _tenant(settings, admin_id, args.tenant_slug)
+    tenant_id = str(tenant["id"])
+    token_var = f"WHATSAPP_ACCESS_TOKEN_{tenant_id.replace('-', '_').upper()}"
+
+    rows: list[tuple[bool, str, str]] = []
+    rows.append((tenant["status"] == "active", "tenant status active", str(tenant["status"])))
+
+    existing = channels.list_channels(settings, tenant_id)
+    channel = existing[0] if existing else None
+    rows.append((channel is not None, "channel recorded",
+                 channel["phone_number_id"] if channel else "none"))
+    if channel:
+        rows.append((channel["status"] == "active", "channel status active", str(channel["status"])))
+        expected_ref = f"tenants/{tenant_id}/whatsapp"
+        rows.append((channel["credentials_ref"] == expected_ref, "credentials_ref exact",
+                     str(channel["credentials_ref"])))
+        identifiers = str(channel["phone_number_id"])
+        rows.append((identifiers.isdigit() and len(identifiers) >= 10,
+                     "phone_number_id is a real Meta id", identifiers))
+        rows.append((bool(channel["waba_id"]), "waba_id recorded", str(channel["waba_id"])))
+        rows.append((bool(channel["display_phone_number"]), "display number recorded",
+                     str(channel["display_phone_number"])))
+
+        resolved = whatsapp.resolve_channel(settings, str(channel["phone_number_id"]))
+        routed = resolved is not None and str(resolved.get("tenant_id")) == tenant_id
+        rows.append((routed, "inbound routing resolves to this tenant",
+                     "resolves" if routed else "does not resolve"))
+
+    rows.append((bool(settings.whatsapp_app_secret), "WHATSAPP_APP_SECRET set", "secret present"
+                 if settings.whatsapp_app_secret else "not set"))
+    rows.append((bool(settings.whatsapp_verify_token), "WHATSAPP_VERIFY_TOKEN set",
+                 "token present" if settings.whatsapp_verify_token else "not set"))
+    token_present = bool(os.environ.get(token_var))
+    rows.append((token_present, "tenant access token in environment",
+                 f"{token_var} {'set' if token_present else 'NOT set'}"))
+    rows.append((settings.whatsapp_send_enabled, "outbound sending enabled",
+                 "WHATSAPP_SEND_ENABLED=1" if settings.whatsapp_send_enabled else "disabled"))
+
+    print(f"tenant      : {tenant['name']} ({tenant['slug']}) {tenant_id}")
+    print(f"graph api   : {settings.whatsapp_graph_api_version}")
+    for ok, label, detail in rows:
+        print(f"   [{'ok' if ok else 'NO'}] {label:<38} {detail}")
+
+    blocking = [label for ok, label, _ in rows if not ok]
+    print("verdict     : " + ("READY" if not blocking else f"BLOCKED by: {blocking}"))
+    print("note        : no provider call was made and no message was sent.")
+    return 0 if not blocking else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--env-file", default=".env", help="load missing variables from here")
@@ -273,6 +394,23 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--set", required=True, choices=("active", "suspended", "inactive"))
     status.add_argument("--waive-owner", action="store_true")
     status.set_defaults(func=command_status)
+
+    channel = subparsers.add_parser(
+        "channel", help="record or update the tenant's WhatsApp channel identifiers"
+    )
+    channel.add_argument("--tenant-slug", required=True)
+    channel.add_argument("--phone-number-id", required=True)
+    channel.add_argument("--waba-id", default=None)
+    channel.add_argument("--display-number", default=None)
+    channel.add_argument("--confirm-slug", default=None, help="required to change a live value")
+    channel.add_argument("--status", choices=("pending", "active", "disabled"), default=None)
+    channel.set_defaults(func=command_channel)
+
+    whatsapp_cmd = subparsers.add_parser(
+        "whatsapp", help="report the WhatsApp go-live prerequisites (no provider call)"
+    )
+    whatsapp_cmd.add_argument("--tenant-slug", required=True)
+    whatsapp_cmd.set_defaults(func=command_whatsapp)
 
     args = parser.parse_args(argv)
     settings = _settings(_resolve(args.env_file))
