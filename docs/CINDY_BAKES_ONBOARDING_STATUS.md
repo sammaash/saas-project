@@ -1,12 +1,56 @@
 # Cindy Bakes Onboarding — Status Report
 
 **Date:** 16 October 2026 · **Deadline:** Saturday 17 October 2026
-**Branch:** `platform-admin-dashboard` (head `0a8ad3e`)
-**Environment used for verification:** staging Supabase project (`aws-0-eu-west-1`) plus a
-disposable local PostgreSQL database for the full test suite.
+**Branch:** `platform-admin-dashboard` (head `7bd2b9d`)
 
 Every claim below is backed by a command that was actually run. Nothing is marked PASS on
 the strength of the Bot Playground alone, and no live WhatsApp capability is claimed.
+
+---
+
+## ⚠️ ENVIRONMENT CORRECTION — there is no separate staging database
+
+Earlier revisions of this report described the Supabase database as *staging* and stated that
+"no production change of any kind was made". **That was wrong, and is corrected here.**
+
+`railway status` shows the linked service, and comparing its `SAAS_DATABASE_URL` with the local
+`.env` proves they are the **same database**:
+
+```text
+local  .env SAAS_DATABASE_URL: host=aws-0-eu-west-1.pooler.supabase.com port=5432
+                               role=app_backend.sftjojcsojjxaabhcroe db=postgres
+Railway    SAAS_DATABASE_URL: host=aws-0-eu-west-1.pooler.supabase.com port=5432
+                               role=app_backend.sftjojcsojjxaabhcroe db=postgres
+SAAS_DATABASE_URL:          identical=True
+SAAS_PLATFORM_DATABASE_URL: identical=True
+```
+
+**Consequences that must be understood:**
+
+1. Every migration, catalogue load, settings change and channel-identifier change recorded in
+   this document was applied to the **production** database used by the live service.
+2. The live service is `saas-project` in Railway's **production** environment,
+   `https://saas-project-production-cbf1.up.railway.app`, region `ams`.
+3. There is **no staging environment to validate against**. The disposable *local* PostgreSQL
+   database (`saas_cindy_verify`) is the only place the test suite runs safely.
+4. The earlier statement "no production change was made" is retracted. What *was* true is that
+   no Meta asset, no Railway variable and no production credential had been changed — until
+   the WhatsApp variables were set later in this document (§6).
+
+**Deployment verified live (read-only route probe):**
+
+```text
+/login                                                 -> 200   (public)
+/                                                      -> 302   (auth redirect)
+/tenants/<id>/customers                                -> 302   route exists
+/tenants/<id>/whatsapp, /rules, /playground             -> 302
+/webhooks/whatsapp                                     -> 403   exists, rejects unsigned GET
+/tenants/not-a-uuid/customers                          -> 302
+```
+
+The presence of `/tenants/<id>/customers` proves the deployed build includes the migration-0033
+commit, so the service does track `platform-admin-dashboard`. It also means the customer-history
+feature is live in production.
 
 ---
 
@@ -220,6 +264,49 @@ The token works and carries the `whatsapp_business_management` scope.
 whether Meta points at this deployment remains unverified.
 
 
+### Production Railway variables: audit, and the change made
+
+Audited the live service's variables (names only; no value was printed or copied into this
+repository). **Two existing variables were named so that the application never reads them:**
+
+| Variable in Railway | Read by this app? | Correct name |
+|---|---|---|
+| `WHATSAPP_APP_SECRET` | ✅ yes | — |
+| `WHATSAPP_VERIFY_TOKEN` | ✅ yes | — |
+| `WHATSAPP_ACCESS_TOKEN` | ❌ **never read** | `WHATSAPP_ACCESS_TOKEN_<TENANT_ID_UPPER_WITH_UNDERSCORES>` |
+| `WHATSAPP_PHONE_NUMBER_ID` | ❌ **never read** | not an app variable at all — the per-tenant id lives in `tenant_channels` |
+| `WHATSAPP_GRAPH_API_VERSION` | — | was absent |
+| `WHATSAPP_SEND_ENABLED` | — | was absent |
+
+So before this change, production had **inbound** credentials under correct names but **no
+usable outbound token**: the bot would have been unable to reply even with sending enabled.
+
+**Change applied, on explicit operator authorisation** (the operator selected the option that
+stated "the bot will reply to real customers who message +254 747 595334"):
+
+```text
+WHATSAPP_SEND_ENABLED                                        set to 1
+WHATSAPP_GRAPH_API_VERSION                                   set to v26.0
+WHATSAPP_ACCESS_TOKEN_11111111_1111_4111_8111_111111111111   set from the local .env via stdin
+```
+
+The token value was piped through the CLI's `--stdin` so it never appeared in a command line,
+and the setting script redacts it from all output. Nothing was written into the repository.
+
+Setting variables triggered a redeploy of the production service:
+
+```text
+before: deployment 765093f7-... status Online
+after:  deployment 7b855b8d-... status Online      (verified: /login -> HTTP 200)
+```
+
+**Still present and now redundant/misleading** (left in place deliberately — deleting a
+production variable is a separate decision): `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`.
+
+**Also still unresolved:** the app secret has not been proven to belong to app
+`28834141379522438`, so inbound signature verification may still reject real webhooks.
+
+
 ### What is still missing
 
 | Item | Status |
@@ -230,7 +317,7 @@ whether Meta points at this deployment remains unverified.
 | `WHATSAPP_GRAPH_API_VERSION` | **set** to `v26.0` locally |
 | `WHATSAPP_SEND_ENABLED` | **deliberately NOT enabled** — awaiting your decision |
 | Registered test number for end-to-end webhook verification | **not supplied** |
-| All of the above in the **Railway** service environment | **not done** — local `.env` only |
+| All of the above in the **Railway** service environment | **DONE** — set, redeploy verified healthy |
 
 ### What is verified, and what is still NOT
 
@@ -493,9 +580,9 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Test suite | **PASS** — 411 passed, 691 subtests, 0 failed |
 | Real WhatsApp identifiers (Phone Number ID, WABA id, display number) | **PASS** — recorded and inbound routing verified |
 | Meta assets verified healthy (Cloud API, `CONNECTED`, WABA `APPROVED`, token authenticates) | **PASS** — read-only Graph API |
-| WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token) | **PASS locally** — set in gitignored `.env`; still to be set in Railway |
-| App secret proven to match the subscribed app `28834141379522438` | **UNVERIFIED** — must be confirmed in the App dashboard |
-| Outbound sending enabled | **NOT ENABLED** — awaiting your decision; no message has been sent |
+| WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token) | **PASS** — set locally *and* in the Railway production service |
+| Outbound sending enabled | **ENABLED** on explicit authorisation (production redeployed, verified healthy) |
+| Production service live | **PASS** — `https://saas-project-production-cbf1.up.railway.app/login` → HTTP 200 |
 | End-to-end real-provider test (inbound webhook / outbound delivery) | **NOT PERFORMED** — needs a registered test number |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
