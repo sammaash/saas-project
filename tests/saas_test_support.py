@@ -79,6 +79,10 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("quotation_lines", "tenant_id"),
     ("whatsapp_webhook_events", "tenant_id"),
     ("whatsapp_conversations", "tenant_id"),
+    ("orders", "tenant_id"),
+    ("order_items", "tenant_id"),
+    ("order_payments", "tenant_id"),
+    ("tenant_order_sequences", "tenant_id"),
 )
 
 # Webhook processing is backend-only; authenticated dashboard sessions must not be able

@@ -152,7 +152,7 @@ def verify_database_roles(settings: Settings) -> None:
 
 # Schema the application database must already provide. Each entry is a table and the
 # columns this code selects from it; a table with no columns listed is required to exist.
-# Keep in step with the migrations that introduce them (0017, 0026, 0028).
+# Keep in step with the migrations that introduce them (0017, 0026, 0028, 0032).
 REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.tenant_settings", ("catalogue_version",)),
     ("public.product_variants", ("sku", "availability", "stock_quantity", "reorder_level")),
@@ -161,6 +161,10 @@ REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.catalogue_import_batches", ()),
     ("public.whatsapp_webhook_events", ()),
     ("public.whatsapp_conversations", ()),
+    ("public.tenant_order_sequences", ()),
+    ("public.orders", ()),
+    ("public.order_items", ()),
+    ("public.order_payments", ()),
 )
 
 
