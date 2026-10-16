@@ -624,6 +624,27 @@ class WhatsAppIntegrationSurfaceTests(unittest.TestCase):
         self.assertIn("/webhooks/whatsapp", rules)
         self.assertNotIn("/webhooks/meta", rules)
 
+    def test_a_workspace_mcp_configuration_never_carries_a_credential(self):
+        """Any development MCP configuration must stay gitignored and secret-free.
+
+        ``.vscode/`` is gitignored, so this file is absent in CI; when a developer has one,
+        it must not carry a token, a client secret or a static Authorization header. Meta's
+        endpoint uses OAuth with a public client (it issues no client secret), so nothing
+        needs to be stored in the file at all.
+        """
+        config = REPO / ".vscode" / "mcp.json"
+        if not config.exists():
+            self.skipTest("no workspace MCP configuration in this checkout")
+        self.assertIn(".vscode/", (REPO / ".gitignore").read_text(encoding="utf-8"))
+        servers = json.loads(config.read_text(encoding="utf-8")).get("servers") or {}
+        for name, server in servers.items():
+            with self.subTest(server=name):
+                lowered = json.dumps(server).lower()
+                self.assertNotIn("headers", server)
+                self.assertNotIn("env", server)
+                for forbidden in ("token", "secret", "password", "api_key", "apikey", "bearer"):
+                    self.assertNotIn(forbidden, lowered)
+
 
 class GenericCodeTests(unittest.TestCase):
     """Onboarding is data: no source file may name a specific business."""

@@ -390,3 +390,9 @@ The only outstanding inputs are commercial/credential, not technical:
 
 Supplying (1)–(3) makes the `channel` command the last technical step; (4) decides whether
 `whatsapp` reports `READY`.
+
+**See also:** `docs/META_MCP_INTEGRATION.md` — Meta's WhatsApp Business Tools MCP is now
+configured in the development environment (Streamable HTTP + OAuth, no client secret). It is
+an operator tool for *inspecting* and *setting up* Meta assets; it makes no call into this
+platform and does not change any of the above. Items (1)–(3) can be read off from it once
+OAuth is completed.
