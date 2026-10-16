@@ -75,6 +75,31 @@ surcharge and the `M-Pesa`-only payment list. Both are data, changeable from the
 Full suite result: **410 passed, 690 subtests passed, 0 failed** (disposable local database,
 `SAAS_TEST_DATABASE_URL` pointed at it, `SAAS_REQUIRE_TEST_DATABASE=1`).
 
+### The dashboard verified against real staging data (read-only GETs)
+
+Every admin page was rendered against the staging tenant using the app's own session flow
+with a stub authenticator (the technique `tests/test_platform_admin_app.py` uses) — no
+Supabase password, nothing forged, and only GET requests:
+
+```text
+login                                   -> 302   (session established)
+/                            overview   -> 200
+/tenants                     list       -> 200
+/tenants/<id>                detail     -> 200
+/tenants/<id>/profile                   -> 200
+/tenants/<id>/rules          AI config  -> 200
+/tenants/<id>/members                   -> 200
+/tenants/<id>/subscription              -> 200
+/tenants/<id>/whatsapp       channel    -> 200
+/tenants/<id>/customers      new in 0033-> 200   (2261 bytes)
+/tenants/<id>/customers/<unknown>       -> 404   (correct, not a 500)
+/tenants/<id>/conversations/<unknown>   -> 404   (correct, not a 500)
+/playground                  bot        -> 200
+```
+
+That covers the Platform Admin Dashboard, tenant provisioning surfaces, catalogue, rules/AI
+configuration, WhatsApp channel page and Bot Playground against live staging data.
+
 ## 4. Bot Playground, orders and payments — **PASS (automated), see limitations**
 
 | Area | Evidence |
