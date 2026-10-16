@@ -19,6 +19,7 @@ from typing import Any, NoReturn, Protocol, Sequence
 
 from .catalogue import CatalogueService
 from .tenant_admin import tenant_admin
+from . import tools as _tools
 
 MAX_HISTORY_TURNS = 4
 MAX_HISTORY_TURN_LENGTH = 1_000
@@ -83,6 +84,7 @@ class BotResponseRequest:
     customer_message: str
     channel: str
     safe_test_mode: bool
+    messages: tuple[dict[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -330,9 +332,12 @@ class OpenAIChatProvider:
 
     def generate(self, request: BotResponseRequest) -> str:
         started = time.perf_counter()
-        messages = [{"role": "system", "content": request.system_prompt}]
-        messages.extend({"role": turn.role, "content": turn.text} for turn in request.history)
-        messages.append({"role": "user", "content": request.customer_message})
+        if request.messages is not None:
+            messages = [dict(m) for m in request.messages]
+        else:
+            messages = [{"role": "system", "content": request.system_prompt}]
+            messages.extend({"role": turn.role, "content": turn.text} for turn in request.history)
+            messages.append({"role": "user", "content": request.customer_message})
         payload = {
             "model": self._model,
             "messages": messages,
@@ -505,16 +510,76 @@ class BotResponseEngine:
             safe_test_mode=safe_test_mode,
         )
         request_processing_ms = (time.perf_counter() - processing_started) * 1_000
+
+        # Build the conversation message list that will grow with tool-result turns.
+        registry = _tools.default_tool_registry()
+        tenant_id_str = str(context.tenant.get("id"))
+        customer_key = context.tenant.get("whatsapp_wa_id") or context.tenant.get("id")
+        tool_context = _tools.ToolContext(
+            tenant_id=tenant_id_str,
+            customer_key=str(customer_key) if customer_key else None,
+        )
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": request.system_prompt},
+        ]
+        messages.extend(
+            {"role": turn.role, "content": turn.text} for turn in request.history
+        )
+        messages.append({"role": "user", "content": request.customer_message})
+
+        tool_call_rounds = 0
+        final_text = ""
+
         provider_started = time.perf_counter()
-        text = self._provider.generate(request)
-        provider_ms = (time.perf_counter() - provider_started) * 1_000
+        while tool_call_rounds <= _tools.MAX_TOOL_CALLS:
+            text = self._provider.generate(
+                BotResponseRequest(
+                    system_prompt=request.system_prompt,
+                    history=request.history,
+                    customer_message=request.customer_message,
+                    channel=request.channel,
+                    safe_test_mode=request.safe_test_mode,
+                    messages=tuple(messages),
+                )
+            )
+            provider_ms = (time.perf_counter() - provider_started) * 1_000
+            calls = _tools.parse_tool_calls(text)
+
+            if not calls:
+                final_text = text.strip()[:MAX_RESPONSE_LENGTH]
+                break
+
+            tool_call_rounds += 1
+            results = _tools.execute_tool_calls(registry, tool_context, calls)
+
+            # Feed tool results back as structured assistant-visible context so the
+            # model can compose a final answer from real data.
+            result_lines = []
+            for entry in results:
+                result_lines.append(
+                    "TOOL_RESULT: "
+                    + json.dumps(entry, ensure_ascii=True, default=str)
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Tool results:\n" + "\n".join(result_lines)
+                    ),
+                }
+            )
+        else:
+            # Exhausted the tool-call budget; return whatever the last model text was.
+            final_text = text.strip()[:MAX_RESPONSE_LENGTH] if text else ""
+
         response_started = time.perf_counter()
-        response = BotResponse(text=text, context=context)
+        response = BotResponse(text=final_text, context=context)
         response_processing_ms = (time.perf_counter() - response_started) * 1_000
         logger.info(
             "Bot response timing total_ms=%.1f context_ms=%.1f request_processing_ms=%.1f "
             "provider_ms=%.1f response_processing_ms=%.1f prompt_chars=%d history_turns=%d "
-            "products=%d variants=%d",
+            "products=%d variants=%d tool_call_rounds=%d",
             (time.perf_counter() - started) * 1_000,
             context_ms,
             request_processing_ms,
@@ -524,5 +589,6 @@ class BotResponseEngine:
             len(request.history),
             len(context.catalogue),
             sum(len(product.get("variants") or []) for product in context.catalogue),
+            tool_call_rounds,
         )
         return response

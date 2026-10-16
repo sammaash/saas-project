@@ -146,6 +146,109 @@ class TenantAdmin:
             (variant_id,),
         )
 
+    def lookup_price(
+        self, product_name: str, weight_kg: int
+    ) -> dict[str, Any] | None:
+        """Resolve a catalogue price for a product name and weight variant.
+
+        Prices are read from the persisted catalogue only -- never from model
+        input. Weight is matched against the variant's ``attributes`` JSONB
+        (key ``weight_kg``) or the variant name when it ends with ``kg``.
+        """
+        name_pattern = f"%{product_name.strip()}%"
+        products = self._all(
+            "select id, name, description, category, sort_order, attributes, is_active "
+            "from public.products "
+            "where tenant_id = app.current_tenant_id() "
+            "and is_active = true "
+            "and name ILIKE %s "
+            "order by sort_order, name",
+            (name_pattern,),
+        )
+        if not products:
+            return None
+
+        # Collect all variant ids for the matched products.
+        product_ids = [str(p["id"]) for p in products]
+        placeholders = ", ".join(["%s"] * len(product_ids))
+        variants = self._all(
+            f"select id, product_id, code, name, price, attributes, sort_order, is_active, "
+            f"sku, availability, stock_quantity, reorder_level "
+            f"from public.product_variants "
+            f"where tenant_id = app.current_tenant_id() "
+            f"and product_id in ({placeholders}) "
+            f"and is_active = true "
+            f"order by sort_order, name",
+            tuple(product_ids),
+        )
+
+        weight_kg_int = int(weight_kg)
+        best: dict[str, Any] | None = None
+
+        for variant in variants:
+            attributes = variant.get("attributes") or {}
+            variant_weight = attributes.get("weight_kg")
+            if variant_weight is None:
+                # Try parsing weight from the variant name (e.g. "5 kg", "5kg").
+                variant_name = str(variant.get("name", ""))
+                import re as _re
+
+                match = _re.search(r"(\d+)\s*kg\b", variant_name, _re.I)
+                if match:
+                    variant_weight = int(match.group(1))
+            if variant_weight is not None and int(variant_weight) == weight_kg_int:
+                product = next(
+                    (p for p in products if str(p["id"]) == variant["product_id"]),
+                    None,
+                )
+                if product is None:
+                    continue
+                return {
+                    "product": {
+                        "id": str(product["id"]),
+                        "name": product["name"],
+                        "description": product.get("description"),
+                        "category": product.get("category"),
+                    },
+                    "variant": {
+                        "id": str(variant["id"]),
+                        "code": variant["code"],
+                        "name": variant["name"],
+                        "price": variant["price"],
+                        "sku": variant.get("sku"),
+                        "availability": variant.get("availability"),
+                        "stock_quantity": variant.get("stock_quantity"),
+                    },
+                }
+
+        # Fallback: return the first active variant of the best-matching product
+        # when no exact weight match exists, so callers can surface a close option.
+        if variants:
+            product = next(
+                (p for p in products if str(p["id"]) == variants[0]["product_id"]),
+                None,
+            )
+            if product is not None:
+                best = {
+                    "product": {
+                        "id": str(product["id"]),
+                        "name": product["name"],
+                        "description": product.get("description"),
+                        "category": product.get("category"),
+                    },
+                    "variant": {
+                        "id": str(variants[0]["id"]),
+                        "code": variants[0]["code"],
+                        "name": variants[0]["name"],
+                        "price": variants[0]["price"],
+                        "sku": variants[0].get("sku"),
+                        "availability": variants[0].get("availability"),
+                        "stock_quantity": variants[0].get("stock_quantity"),
+                    },
+                }
+
+        return best
+
     def create_product(
         self,
         name: str,
@@ -341,6 +444,17 @@ class TenantAdmin:
             "where id = %s and tenant_id = app.current_tenant_id()",
             (order_id,),
         )
+
+    def get_order_draft_id_by_whatsapp(self, whatsapp_wa_id: str) -> str | None:
+        """Return the id of the most recent draft order for this WhatsApp user."""
+        row = self._one(
+            "select id from public.orders "
+            "where whatsapp_wa_id = %s and tenant_id = app.current_tenant_id() "
+            "and status = 'draft' "
+            "order by created_at desc limit 1",
+            (whatsapp_wa_id,),
+        )
+        return str(row["id"]) if row else None
 
     def get_order_by_number(self, order_number: str) -> dict[str, Any] | None:
         return self._one(
