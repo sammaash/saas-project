@@ -38,3 +38,8 @@ secrets.json
 .DS_Store
 Thumbs.db
 *.swp
+# Operator scratch files: ad-hoc probes and captured logs are never part of the product.
+.probe_*.py
+.inspect_*.py
+*.log
+migration_status.txt
