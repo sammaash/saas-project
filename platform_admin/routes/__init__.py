@@ -28,6 +28,7 @@ from ..authz import admin_required, context
 from ..services import catalogue as catalogue_service
 from ..services import catalogue_import as catalogue_import_service
 from ..services import channels as channel_service
+from ..services import customers as customer_service
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -82,9 +83,47 @@ def whatsapp_webhook():
         event["customer_key"],
     ):
         return jsonify(ok=True, duplicate=True)
+
+    tenant_id = str(channel["tenant_id"])
+    channel_id = str(channel["channel_id"])
+    customer_key = event["customer_key"]
+
+    # --- tenant-isolated customer / conversation / message persistence -------
+    # These writes are non-fatal: a persistence problem must not prevent a
+    # 200 to Meta (which would trigger redelivery), but they are logged so
+    # the gap is visible. The existing whatsapp_conversations jsonb writes are
+    # preserved during the transition.
+    customer = None
+    conversation = None
+    try:
+        customer = customer_service.get_or_create_customer(
+            settings, tenant_id, channel_id, customer_key
+        )
+        conversation = customer_service.get_or_create_conversation(
+            settings, tenant_id, customer["id"], channel_id
+        )
+        customer_service.save_message(
+            settings,
+            tenant_id,
+            channel_id,
+            str(conversation["id"]),
+            direction="inbound",
+            sender_type="customer",
+            provider_message_id=event["message_id"],
+            message_type="text",
+            body_text=event["text"],
+            payload=event,
+        )
+    except Exception as error:  # noqa: BLE001 - never block webhook ack on persistence
+        logger.error(
+            "Customer/conversation/inbound persistence failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
     try:
         history = whatsapp_service.conversation_history(
-            settings, str(channel["tenant_id"]), event["customer_key"]
+            settings, tenant_id, customer_key
         )
         turns = [
             ConversationTurn(str(item.get("role", "")), str(item.get("text", "")))
@@ -97,7 +136,7 @@ def whatsapp_webhook():
         response = BotResponseEngine(
             TenantBotContextLoader(settings.app_database_url), provider
         ).respond(
-            str(channel["tenant_id"]),
+            tenant_id,
             event["text"],
             turns,
             channel="whatsapp",
@@ -106,11 +145,36 @@ def whatsapp_webhook():
         outbound_id = whatsapp_service.send_text(
             settings,
             phone_number_id=event["phone_number_id"],
-            tenant_id=str(channel["tenant_id"]),
+            tenant_id=tenant_id,
             credentials_ref=channel.get("credentials_ref"),
-            recipient=event["customer_key"],
+            recipient=customer_key,
             text=response.text,
         )
+        # Persist the outbound message only after a successful send.
+        if conversation:
+            try:
+                customer_service.save_message(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]),
+                    direction="outbound",
+                    sender_type="assistant",
+                    provider_message_id=outbound_id,
+                    message_type="text",
+                    body_text=response.text,
+                    payload={"text": response.text},
+                    delivery_status="sent",
+                )
+                customer_service.update_conversation_activity(
+                    settings, tenant_id, str(conversation["id"])
+                )
+            except Exception as error:  # noqa: BLE001 - non-fatal
+                logger.error(
+                    "Outbound message persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
         history.extend(
             [
                 {"role": "user", "text": event["text"][:1000]},
@@ -118,10 +182,10 @@ def whatsapp_webhook():
             ]
         )
         whatsapp_service.save_conversation(
-            settings, str(channel["tenant_id"]), event["customer_key"], history
+            settings, tenant_id, customer_key, history
         )
         whatsapp_service.update_event(
-            settings, str(channel["tenant_id"]), event["message_id"], "processed"
+            settings, tenant_id, event["message_id"], "processed"
         )
         return jsonify(ok=True, message_id=outbound_id)
     except ServiceError as error:
@@ -137,6 +201,84 @@ def whatsapp_webhook():
             "WhatsApp webhook processing failed type=%s", type(error).__name__
         )
         return jsonify(ok=False, error="WhatsApp message processing failed."), 502
+
+
+# ----------------------------------------------------------------- customers
+@admin_bp.get("/tenants/<tenant_id>/customers")
+@admin_required
+def customer_list(tenant_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "20") or "20"), 100))
+    search = (request.args.get("search") or "").strip() or None
+    rows, total = customer_service.list_customers(
+        settings, tenant_id, search=search, page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "customer_list.html",
+        tenant=g.tenant,
+        customers=rows,
+        total=total,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        search=search or "",
+        tab="customers",
+    )
+
+
+@admin_bp.get("/tenants/<tenant_id>/customers/<customer_id>")
+@admin_required
+def customer_detail(tenant_id, customer_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    customer = customer_service.get_customer(settings, tenant_id, customer_id)
+    if customer is None:
+        abort(404)
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "50") or "50"), 200))
+    conversations, total = customer_service.list_conversations(
+        settings, tenant_id, customer_id=customer_id, page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "customer_detail.html",
+        tenant=g.tenant,
+        customer=customer,
+        conversations=conversations,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        tab="customers",
+    )
+
+
+@admin_bp.get("/tenants/<tenant_id>/conversations/<conversation_id>")
+@admin_required
+def conversation_detail(tenant_id, conversation_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    conversation = customer_service.get_conversation(settings, tenant_id, conversation_id)
+    if conversation is None:
+        abort(404)
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "50") or "50"), 200))
+    messages, total = customer_service.list_messages(
+        settings, tenant_id, str(conversation["id"]), page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "conversation_detail.html",
+        tenant=g.tenant,
+        conversation=conversation,
+        messages=messages,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        tab="customers",
+    )
 
 
 # --------------------------------------------------------------------- auth

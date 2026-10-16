@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tenant_tabs %}
+{% block content %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Customers</h2>
+<form method="get" action="{{ url_for('admin.customer_list', tenant_id=tenant.id) }}" class="search">
+  <input type="search" name="search" value="{{ search }}" placeholder="Search by WhatsApp identity, name or email…">
+  <input type="hidden" name="page_size" value="{{ page_size }}">
+  <button type="submit" class="button">Search</button>
+  {% if search %}
+    <a class="button link" href="{{ url_for('admin.customer_list', tenant_id=tenant.id) }}">Clear</a>
+  {% endif %}
+</form>
+<table>
+  <tr>
+    <th>WhatsApp identity</th>
+    <th>Name</th>
+    <th>Email</th>
+    <th>Phone</th>
+    <th>Last interaction</th>
+    <th>Conversations</th>
+  </tr>
+  {% for c in customers %}
+  <tr>
+    <td><code>{{ c.wa_id }}</code></td>
+    <td><a href="{{ url_for('admin.customer_detail', tenant_id=tenant.id, customer_id=c.id) }}">{{ c.name or '-' }}</a></td>
+    <td>{{ c.email or '-' }}</td>
+    <td>{{ c.phone_normalized or '-' }}</td>
+    <td>{{ c.last_interaction_at or '-' }}</td>
+    <td><a href="{{ url_for('admin.customer_detail', tenant_id=tenant.id, customer_id=c.id) }}">view</a></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">No customers yet. Inbound WhatsApp messages create customers automatically.</td></tr>
+  {% endfor %}
+</table>
+{% if pages > 1 %}
+<nav class="pagination">
+  {% for p in range(1, pages + 1) %}
+    <a href="{{ url_for('admin.customer_list', tenant_id=tenant.id, page=p, page_size=page_size, search=search) }}" class="{{ 'active' if p == page else '' }}">{{ p }}</a>
+  {% endfor %}
+</nav>
+{% endif %}
+<p class="muted">{{ total }} customer{{ 's' if total != 1 else '' }} total.</p>
+{% endblock %}

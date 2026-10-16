@@ -82,6 +82,9 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("orders", "tenant_id"),
     ("order_items", "tenant_id"),
     ("order_payments", "tenant_id"),
+    ("customers", "tenant_id"),
+    ("conversations", "tenant_id"),
+    ("messages", "tenant_id"),
     ("tenant_order_sequences", "tenant_id"),
 )
 
