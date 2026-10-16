@@ -187,9 +187,54 @@ identifier and exporting the secrets it reported `READY` (exit 0).
 | Item | Status |
 |---|---|
 | Code pushed | `f88151c`, `df4f8b5`, `a0de28f`, `0a8ad3e` on `origin/platform-admin-dashboard` |
-| Railway service branch | **unconfirmed** — no `railway.json`/`railway.toml` in the repo, only a `Procfile`; the service may track `main`, in which case nothing is deployed |
+| Railway service branch | **confirmed: `platform-admin-dashboard`** |
+| Local `HEAD` vs `origin` | identical at `7383879`; nothing unpushed |
+| Procfile target | `gunicorn … platform_admin.railway_app:app`; the module imports and builds a 40-route Flask app |
+| **Railway startup gate executed against staging** | **PASS** — see below |
 | Production database state | **not inspected** (no production credentials, and none were assumed) |
 | Live webhook / registered number / production credentials | **not touched** |
+
+### The deploy will boot: startup gate verified against staging
+
+`platform_admin/railway_app.py` runs `Settings.from_env()` → `verify_database_roles()` →
+`verify_database_schema()` → `create_app()` **before** the process serves anything. That whole
+sequence was executed against the staging database (read-only: role checks, `pg_catalog`
+reads and the app factory; no writes, no provider calls):
+
+```text
+ok: app_database_url      -> aws-0-eu-west-1.pooler.supabase.com:5432/postgres
+ok: cookie_secure         = True
+--- verify_database_roles() ---
+ok: both logins are the expected unprivileged roles
+--- verify_database_schema() ---
+ok: every REQUIRED_SCHEMA table and column is present
+missing: []
+   [ok] public.customers / public.conversations / public.messages / public.orders /
+        public.order_items / public.order_payments / public.tenant_order_sequences /
+        public.whatsapp_webhook_events / public.whatsapp_conversations /
+        public.catalogue_import_batches / public.quotations / public.quotation_lines /
+        public.tenant_settings(catalogue_version) /
+        public.product_variants(sku, availability, stock_quantity, reorder_level)
+--- create_app() ---
+ok: flask app built with 39 routes
+    /tenants/<tenant_id>/customers
+    /tenants/<tenant_id>/customers/<customer_id>
+    /tenants/<tenant_id>/conversations/<conversation_id>
+    /webhooks/whatsapp
+RESULT: the Railway entry point boots cleanly against staging.
+```
+
+**Operational finding:** staging reports `allow_active_channels = False`, so
+`PLATFORM_ALLOW_ACTIVE_CHANNELS` is not `1` in that environment. The staged channel is already
+`active`, so inbound routing works; but any *re*-activation (needed when identifiers change)
+must be performed by the operator CLI with `PLATFORM_ALLOW_ACTIVE_CHANNELS=1` in its own
+environment, or the staging service variable must be set. This is a deliberate gate, not a bug.
+
+**What is still not verifiable from here:** Railway's own build log, deploy status and the
+public health response. I have no Railway credentials, so I have not claimed the service is
+"deployed and healthy" — only that the branch is correct, everything needed is committed, and
+the process's own fail-closed startup checks pass against staging. Point me at the service URL
+and I will confirm the live response.
 
 **Rollback plan (staging only):**
 
@@ -279,6 +324,13 @@ python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
               --display-number +254xxxxxxxxx --confirm-slug cindy-bakes
 python db/tenant_onboarding.py --admin-user-id <verified-admin-uuid> \
     whatsapp  --tenant-slug cindy-bakes
+
+# Prove the deployed process will start (the same checks railway_app.py runs before
+# serving). Settings.from_env() reads os.environ only, so .env must be loaded first.
+python -c "from dotenv import load_dotenv; load_dotenv(); \
+from platform_admin.config import Settings, verify_database_roles, verify_database_schema as v; \
+s = Settings.from_env(); verify_database_roles(s); v(s); \
+from platform_admin.app import create_app; print('boots:', create_app(s))"
 ```
 
 The administrator UUID must be the verified Supabase Auth `sub` (an active row in
@@ -298,7 +350,7 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Operator onboarding tooling (`catalogue`/`settings`/`verify`/`status`/`channel`/`whatsapp`) | **PASS** — exercised end to end on a disposable database in both gate states |
 | Test suite | **PASS** — 410 passed, 690 subtests, 0 failed |
 | Real WhatsApp channel (identifiers, credentials, registered test number) | **BLOCKED** on client-supplied values; wiring path is built and verified |
-| Railway deployment confirmation | **BLOCKED** — service branch unconfirmed |
+| Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
 
 ### The one remaining dependency
