@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from saas import platform
+from saas.bot import redact_sensitive_values
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
 from . import audit, validation as v
+from .config_merge import deep_merge
 
 RULE_DOCUMENTS = (
     ("business_rules", "Business rules"),
@@ -48,7 +51,7 @@ CATALOGUE_COLUMNS = (
 )
 
 
-def _optional_choice(value: Any, field: str, choices: tuple[str, ...]) -> str | None:
+def optional_choice(value: Any, field: str, choices: tuple[str, ...]) -> str | None:
     cleaned = (str(value).strip() if value is not None else "")
     if not cleaned:
         return None
@@ -57,7 +60,7 @@ def _optional_choice(value: Any, field: str, choices: tuple[str, ...]) -> str | 
     return cleaned
 
 
-def _phone(value: Any, field: str, *, required: bool = False) -> str | None:
+def phone_value(value: Any, field: str, *, required: bool = False) -> str | None:
     cleaned = (str(value).strip() if value is not None else "")
     if not cleaned:
         if required:
@@ -68,7 +71,7 @@ def _phone(value: Any, field: str, *, required: bool = False) -> str | None:
     return cleaned
 
 
-def _time_value(value: Any, field: str, default: str) -> str:
+def time_value(value: Any, field: str, default: str) -> str:
     cleaned = str(value).strip() if value is not None else ""
     if not cleaned:
         return default
@@ -199,11 +202,42 @@ def update_profile(settings: Settings, admin_id: str, tenant_id: str, form: dict
         )
 
 
-def update_rules(settings: Settings, admin_id: str, tenant_id: str, form: dict[str, Any]) -> None:
-    documents = {
-        column: v.json_object(form.get(column), label) for column, label in RULE_DOCUMENTS
+def mask_documents(stored: dict[str, Any]) -> dict[str, str]:
+    """The four stored documents as pretty JSON, for the raw JSON editors.
+
+    A value whose key looks like a credential is replaced by :data:`audit.REDACTED`, and
+    :func:`update_rules` puts the stored value back when that document is saved unchanged.
+    Masking therefore cannot destroy a credential, and a credential never reaches a browser.
+    """
+    return {
+        column: json.dumps(audit.redact(stored.get(column) or {}), indent=2, sort_keys=True)
+        for column, _label in RULE_DOCUMENTS
     }
+
+
+def _restore_masked(submitted: Any, stored: Any) -> Any:
+    """Put stored values back where the raw editor showed the redaction mask."""
+    if not isinstance(submitted, dict):
+        return submitted
+    restored = dict(submitted)
+    for key, value in submitted.items():
+        previous = stored.get(key) if isinstance(stored, dict) else None
+        if value == audit.REDACTED and previous is not None:
+            restored[key] = previous
+        elif isinstance(value, dict):
+            restored[key] = _restore_masked(value, previous)
+    return restored
+
+
+def update_rules(settings: Settings, admin_id: str, tenant_id: str, form: dict[str, Any]) -> None:
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
+        current = ta.get_settings() or {}
+        documents = {
+            column: _restore_masked(
+                v.json_object(form.get(column), label), current.get(column) or {}
+            )
+            for column, label in RULE_DOCUMENTS
+        }
         ta.update_settings(**documents)
         # Section names only: values may be large or sensitive and do not belong in audit.
         audit.record(
@@ -215,12 +249,12 @@ def update_rules(settings: Settings, admin_id: str, tenant_id: str, form: dict[s
 def _structured_documents(form: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Build the four settings documents from the A-G onboarding form fields."""
     display_name = v.text(form.get("wa_display_name"), "WhatsApp display name", max_length=100)
-    business_type = _optional_choice(form.get("business_type"), "Business type", WHATSAPP_BUSINESS_TYPES)
+    business_type = optional_choice(form.get("business_type"), "Business type", WHATSAPP_BUSINESS_TYPES)
     if business_type is None:
         raise v.ServiceError("Business type is required.")
-    number = _phone(form.get("whatsapp_number"), "WhatsApp number")
+    number = phone_value(form.get("whatsapp_number"), "WhatsApp number")
 
-    tone = _optional_choice(form.get("tone"), "Tone", BOT_TONES)
+    tone = optional_choice(form.get("tone"), "Tone", BOT_TONES)
     if tone is None:
         raise v.ServiceError("Tone is required.")
     bot_name = v.text(form.get("bot_name"), "Bot name", max_length=20, required=False) or display_name
@@ -231,8 +265,8 @@ def _structured_documents(form: dict[str, Any]) -> dict[str, dict[str, Any]]:
         is_open = form.get(f"day_open_{day}") == "1"
         entry: dict[str, Any] = {"is_open": is_open}
         if is_open:
-            entry["open"] = _time_value(form.get(f"day_open_time_{day}"), f"{day.title()} open time", "08:00")
-            entry["close"] = _time_value(form.get(f"day_close_time_{day}"), f"{day.title()} close time", "18:00")
+            entry["open"] = time_value(form.get(f"day_open_time_{day}"), f"{day.title()} open time", "08:00")
+            entry["close"] = time_value(form.get(f"day_close_time_{day}"), f"{day.title()} close time", "18:00")
         human_hours[day] = entry
     offline_message = v.text(
         form.get("human_offline_message"), "Offline message", max_length=2000, required=False
@@ -259,18 +293,18 @@ def _structured_documents_tail(
     form: dict[str, Any], *, bot_persona: dict, business_hours: dict, identity: dict
 ) -> dict[str, dict[str, Any]]:
     description = v.text(form.get("business_description"), "Business description", max_length=4000)
-    pricing_rule = _optional_choice(form.get("pricing_rule"), "Pricing rule", ("Fixed", "Negotiable", "Quote-based"))
-    discount_allowed = _optional_choice(
+    pricing_rule = optional_choice(form.get("pricing_rule"), "Pricing rule", ("Fixed", "Negotiable", "Quote-based"))
+    discount_allowed = optional_choice(
         form.get("discount_allowed"), "Discount", ("No", "Up to 5%", "Up to 10%")
     )
-    out_of_stock = _optional_choice(
+    out_of_stock = optional_choice(
         form.get("out_of_stock"), "Out of stock", ("Suggest alternative", "Take order", "Escalate to human")
     )
     payment_methods = [
         method for method in (str(item).strip() for item in form.get("payment_methods") or [])
         if method in PAYMENT_METHODS
     ]
-    delivery = _optional_choice(
+    delivery = optional_choice(
         form.get("delivery"), "Delivery", ("Pickup only", "Delivery within Nairobi", "Countrywide")
     )
     return_policy = v.text(form.get("return_policy"), "Return policy", max_length=500, required=False)
@@ -278,10 +312,10 @@ def _structured_documents_tail(
         str(item).strip() for item in form.get("sellable_products") or [] if str(item).strip()
     ]
     escalation_tries = v.integer(form.get("escalation_tries"), "Escalation tries", minimum=1, default=2)
-    escalation_transfer = _optional_choice(
+    escalation_transfer = optional_choice(
         form.get("escalation_transfer"), "Escalation target", ESCALATION_TARGETS
     ) or "Owner"
-    escalation_whatsapp = _phone(form.get("escalation_whatsapp"), "Escalation WhatsApp number")
+    escalation_whatsapp = phone_value(form.get("escalation_whatsapp"), "Escalation WhatsApp number")
     order_flow = derive_order_flow(payment_methods, delivery)
     return _structured_documents_config(
         form,
@@ -310,16 +344,16 @@ def _structured_documents_tail(
 def _structured_documents_config(
     form: dict[str, Any], *, bot_persona: dict, business_hours: dict, business_rules: dict, identity: dict
 ) -> dict[str, dict[str, Any]]:
-    on_photo = _optional_choice(form.get("on_photo"), "On photo", ON_PHOTO_CHOICES)
-    on_part_not_found = _optional_choice(
+    on_photo = optional_choice(form.get("on_photo"), "On photo", ON_PHOTO_CHOICES)
+    on_part_not_found = optional_choice(
         form.get("on_part_not_found"), "On part not found", ON_PART_NOT_FOUND_CHOICES
     )
-    on_price_asked = _optional_choice(form.get("on_price_asked"), "On price asked", ON_PRICE_ASKED_CHOICES)
-    pricing_visibility = _optional_choice(
+    on_price_asked = optional_choice(form.get("on_price_asked"), "On price asked", ON_PRICE_ASKED_CHOICES)
+    pricing_visibility = optional_choice(
         form.get("pricing_visibility"), "Pricing visibility", PRICING_VISIBILITY_CHOICES
     )
     spam_repeat = v.integer(form.get("spam_repeat"), "Spam repeat count", minimum=1, default=3)
-    spam_action = _optional_choice(form.get("spam_action"), "Spam action", SPAM_ACTIONS) or "send_to_human"
+    spam_action = optional_choice(form.get("spam_action"), "Spam action", SPAM_ACTIONS) or "send_to_human"
     business_rules.update({
         "on_photo": on_photo,
         "on_part_not_found": on_part_not_found,
@@ -331,14 +365,14 @@ def _structured_documents_config(
     provider = str(form.get("provider") or "").strip() or "meta_cloud_api"
     if provider != "meta_cloud_api":
         raise v.ServiceError("Only the Meta Cloud API provider is supported.")
-    window_24h_action = _optional_choice(
+    window_24h_action = optional_choice(
         form.get("window_24h_action"), "24h window action", WINDOW_24H_ACTIONS
     ) or "send_template_to_reopen"
     followup_template = v.text(
         form.get("followup_template_name"), "Follow-up template name", max_length=100, required=False
     ) or "order_followup_1"
-    handover_number = _phone(form.get("human_handover_number"), "Human handover number")
-    auto_close = _optional_choice(form.get("auto_close_ticket_after"), "Auto close", AUTO_CLOSE_CHOICES) or "48h"
+    handover_number = phone_value(form.get("human_handover_number"), "Human handover number")
+    auto_close = optional_choice(form.get("auto_close_ticket_after"), "Auto close", AUTO_CLOSE_CHOICES) or "48h"
 
     website_link = v.text(form.get("website_link"), "Website link", max_length=300, required=False)
     if website_link and not website_link.lower().startswith(("http://", "https://")):
@@ -380,16 +414,17 @@ def _structured_documents_config(
 def update_rules_from_form(
     settings: Settings, admin_id: str, tenant_id: str, form: dict[str, Any]
 ) -> None:
-    """Save the structured WhatsApp AI agent onboarding form.
+    """Save the structured WhatsApp AI agent onboarding form (sections A-G at once).
 
-    Each document is merged over the tenant's existing one so values saved earlier
-    through the raw JSON editors survive.
+    Each document is deep-merged over the tenant's existing one, so values saved earlier --
+    through the raw JSON editors or through a single-section save -- survive. This is the
+    "new client" path: every field is submitted, so it keeps the onboarding validation.
     """
     documents = _structured_documents(form)
     with v.translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         current = ta.get_settings() or {}
         merged = {
-            column: {**(current.get(column) or {}), **documents[column]}
+            column: deep_merge(current.get(column) or {}, documents[column])
             for column in documents
         }
         ta.update_settings(**merged)
@@ -441,25 +476,32 @@ def rules_form_values(settings: Settings, tenant_id: str) -> dict[str, Any]:
 
 
 def bot_config_preview(stored: dict[str, Any]) -> dict[str, Any]:
-    """Compose the single JSON configuration the bot consumes, for read-only preview."""
+    """Compose the single JSON configuration the bot consumes, for read-only preview.
+
+    Secrets are redacted with the helper the bot uses before configuration reaches a prompt:
+    this block is rendered to a browser, so a credential an operator pasted into a document
+    must not appear here.
+    """
     configuration = stored.get("configuration") or {}
     rules = stored.get("business_rules") or {}
-    return {
-        "identity": configuration.get("identity") or {},
-        "persona": stored.get("bot_persona") or {},
-        "hours_and_greeting": stored.get("business_hours") or {},
-        "business_rules": rules,
-        "config": configuration.get("config") or {"provider": "meta_cloud_api"},
-        "knowledge_base": {
-            **(configuration.get("knowledge_base") or {}),
-            "rag_priority": list(RAG_PRIORITY),
-        },
-        "catalogue_schema": {
-            "file": "catalogue-import-template.xlsx",
-            "sheet": "Products",
-            "columns": list(CATALOGUE_COLUMNS),
-        },
-    }
+    return redact_sensitive_values(
+        {
+            "identity": configuration.get("identity") or {},
+            "persona": stored.get("bot_persona") or {},
+            "hours_and_greeting": stored.get("business_hours") or {},
+            "business_rules": rules,
+            "config": configuration.get("config") or {"provider": "meta_cloud_api"},
+            "knowledge_base": {
+                **(configuration.get("knowledge_base") or {}),
+                "rag_priority": list(RAG_PRIORITY),
+            },
+            "catalogue_schema": {
+                "file": "catalogue-import-template.xlsx",
+                "sheet": "Products",
+                "columns": list(CATALOGUE_COLUMNS),
+            },
+        }
+    )
 
 
 def tenant_audit(settings: Settings, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:

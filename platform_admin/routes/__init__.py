@@ -27,6 +27,7 @@ from ..auth import AuthError
 from ..authz import admin_required, context
 from ..services import catalogue as catalogue_service
 from ..services import catalogue_import as catalogue_import_service
+from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
 from ..services import customers as customer_service
 from ..services import playground as playground_service
@@ -674,41 +675,105 @@ def tenant_profile(tenant_id):
     return render_template("tenant_profile.html", tenant=tenant, profile=profile, tab="profile")
 
 
+def _render_rules(
+    tenant: dict, *, errors: dict | None = None, submitted: dict | None = None
+) -> str:
+    """Render the rules tab from the tenant's *stored* configuration.
+
+    ``submitted`` overlays what a rejected save posted, so a failed change keeps the
+    operator's edits on screen next to the error instead of silently discarding them.
+    """
+    settings = context().settings
+    stored = bot_config_service.load_configuration(settings, tenant["id"])
+    fields = bot_config_service.field_values(stored)
+    if submitted:
+        fields = {**fields, **{key: value for key, value in submitted.items() if key in fields}}
+    products = catalogue_service.list_catalogue(settings, tenant["id"])
+    categories = sorted({p["category"] for p in products if p.get("category")})
+    return render_template(
+        "tenant_rules.html",
+        tenant=tenant,
+        documents=tenant_service.mask_documents(stored),
+        labels=tenant_service.RULE_DOCUMENTS,
+        tab="rules",
+        fields=fields,
+        categories=categories,
+        constants=tenant_service,
+        version=bot_config_service.version_of(stored),
+        errors=errors or {},
+        preview=tenant_service.bot_config_preview(stored),
+    )
+
+
+def _section_payload() -> dict:
+    """The submitted section form: repeated controls become lists, uploads join documents."""
+    payload = _form()
+    for key in bot_config_service.MULTI_VALUE_FIELDS:
+        if key in request.form or f"{bot_config_service.PRESENCE_PREFIX}{key}" in request.form:
+            payload[key] = request.form.getlist(key)
+    if "documents" in payload:
+        uploaded = [f.filename for f in request.files.getlist("document_uploads") if f.filename]
+        payload["documents"] = sorted(set(payload["documents"]) | set(uploaded))
+    return payload
+
+
 @admin_bp.route("/tenants/<tenant_id>/rules", methods=["GET", "POST"])
 @admin_required
 def tenant_rules(tenant_id):
-    import json  # noqa: PLC0415
-
     tenant = _tenant(tenant_id)
     settings = context().settings
     if request.method == "POST":
         if request.form.get("form_kind") == "whatsapp_onboarding":
-            payload = _form()
-            for key in ("payment_methods", "sellable_products"):
-                payload[key] = request.form.getlist(key)
-            uploaded = [f.filename for f in request.files.getlist("document_uploads") if f.filename]
-            payload["documents"] = sorted(
-                set(request.form.getlist("documents")) | set(uploaded)
-            )
             return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
                         lambda: tenant_service.update_rules_from_form(
-                            settings, g.admin_id, tenant["id"], payload))
+                            settings, g.admin_id, tenant["id"], _section_payload()))
         return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
                     lambda: tenant_service.update_rules(settings, g.admin_id, tenant["id"], _form()))
-    profile = tenant_service.get_profile(settings, tenant["id"])
-    documents = {
-        column: json.dumps(profile["settings"][column], indent=2, sort_keys=True)
-        for column, _label in tenant_service.RULE_DOCUMENTS
-    }
-    form_values = tenant_service.rules_form_values(settings, tenant["id"])
-    products = catalogue_service.list_catalogue(settings, tenant["id"])
-    categories = sorted({p["category"] for p in products if p.get("category")})
-    return render_template(
-        "tenant_rules.html", tenant=tenant, documents=documents,
-        labels=tenant_service.RULE_DOCUMENTS, tab="rules",
-        form_values=form_values, categories=categories,
-        constants=tenant_service, preview=tenant_service.bot_config_preview(profile["settings"]),
+    return _render_rules(tenant)
+
+
+@admin_bp.get("/tenants/<tenant_id>/rules/config")
+@admin_required
+def tenant_rules_config(tenant_id):
+    """The saved configuration for one tenant: the section forms load their state from this."""
+    tenant = _tenant(tenant_id)
+    return jsonify(
+        ok=True, **bot_config_service.configuration_snapshot(context().settings, tenant["id"])
     )
+
+
+@admin_bp.route("/tenants/<tenant_id>/rules/<section>", methods=["POST", "PATCH"])
+@admin_required
+def tenant_rules_section(tenant_id, section):
+    """Save one section -- or, with ``focus``, one field -- without touching anything else."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    payload = (
+        dict(request.get_json(silent=True) or {}) if request.is_json else _section_payload()
+    )
+    try:
+        stored = bot_config_service.apply_section(
+            settings,
+            g.admin_id,
+            tenant["id"],
+            section,
+            payload,
+            expected_version=payload.get(bot_config_service.VERSION_FIELD) or None,
+        )
+    except ServiceError as error:
+        if request.is_json:
+            return jsonify(ok=False, error=error.message), error.status
+        if error.status == 404:
+            abort(404)
+        return _render_rules(tenant, errors={section: error.message}, submitted=payload), error.status
+    if request.is_json:
+        return jsonify(
+            ok=True,
+            version=bot_config_service.version_of(stored),
+            fields=bot_config_service.field_values(stored),
+        )
+    flash(f"{bot_config_service.SECTION_LABELS.get(section, 'Configuration')} saved.", "ok")
+    return redirect(url_for("admin.tenant_rules", tenant_id=tenant["id"]))
 
 
 # ---------------------------------------------------------------- catalogue
