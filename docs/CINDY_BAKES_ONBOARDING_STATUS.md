@@ -365,10 +365,10 @@ inbound→AI→outbound loop has never actually executed.
 | The supplied app secret belongs to that subscribed app | **VERIFIED** — a `client_credentials` exchange for app `28834141379522438` succeeded, so signatures will validate |
 | Meta's webhook **callback URL** points at this deployment | **VERIFIED** — active subscription: `https://saas-project-production-cbf1.up.railway.app/webhooks/whatsapp`, object `whatsapp_business_account`, field `messages` at `v26.0` |
 | The `GET` verification handshake succeeds | **VERIFIED** — correct token → `200` echoing the challenge; wrong/empty token → `403` |
-| Inbound signature verification works against a real Meta signature | **NOT verified** — proven *capable* (secret matches, handshake passes) but no real event has arrived |
+| Inbound signature verification works against a Meta-format signature | **VERIFIED** — a request signed with HMAC-SHA256 over the app secret was accepted (`200 {"ignored":true,"ok":true}`); a bad signature was rejected (`403`); an unknown `phone_number_id` returned `404 "Unknown or inactive channel."`. All three left zero database writes. |
 | Outbound delivery works | **NOT verified** — send gate is on and the token authenticates, but no message has been sent |
 | Any real message has been sent or received | **NO — none** (customers 0, conversations 0, messages 0, webhook events 0, orders 0) |
-| Inbound signature verification works against a real Meta signature | **NOT verified** — no real webhook has arrived |
+| Inbound signature verification works against a Meta-format signature | **VERIFIED** — see above |
 | Outbound delivery works | **NOT verified** — send gate off; sending a test would message a real customer |
 | Any real message has been sent or received | **NO — none** |
 
