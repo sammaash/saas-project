@@ -535,6 +535,43 @@ and I will confirm the live response.
 3. **Customer test fixtures were written through a rolled-back connection**, so the second
    connection correctly saw nothing and the test misreported the application.
    Fixed with an explicitly committed fixture helper.
+4. **Every real WhatsApp message was silently dropped — the bot never replied (root cause of
+   the launch blocker).** `MESSAGE_ID_RE` in `platform_admin/services/whatsapp.py` was
+   `^[A-Za-z0-9_.:-]{1,200}$`, which excludes the base64 characters `+`, `/` and `=`. Every
+   genuine Meta message id ends in base64 padding, e.g.
+   `wamid.HBgMMjU0NzIzNTk1MzM0FQIAERgSRjk2NDBCNUIwQzFGQkI5RkQyAA==`, so
+   `parse_event` returned `None` for every real inbound message. The webhook answered
+   `200 {"ignored": true}` and **wrote nothing**: no customer, conversation, message or
+   webhook-event row was ever created, and no reply was ever sent. The operator saw the bot
+   ignore them completely.
+
+   The suite stayed green because its fixture used a simplified id (`wamid.test-1`) that
+   happened to satisfy the old pattern — a textbook case of a fixture that was easier than
+   reality. The pattern now allows base64 characters, and two regression tests use the real
+   wamid captured from a live send.
+
+   **Proven fix, on real traffic** (`platform_admin/services/whatsapp.py`):
+
+   ```text
+   05:02:11  254723595334  inbound   hello
+   05:02:14  254723595334  outbound  Hello and welcome to Cindy Bakes Delights! How may I help…
+   05:03:03  254723595334  inbound   lemon 2kgs
+   05:03:05  254723595334  outbound  A 2 kg Lemon cake is available made to order for KES 4,200…
+   05:06:10  254723595334  inbound   delivery on 31/10/2026 / Delivery to Syokimau health care
+   05:08:10  254723595334  inbound   or can i just talk to the owner
+   05:08:13  254723595334  outbound  Yes, you can speak with the owner…
+   05:12:02  254723595334  inbound   - 2 kg Lemon cake – KES 4,200 …
+   05:12:07  254723595334  outbound  Here's your quote for Cindy Bakes Delights…
+   ```
+
+   Eleven inbound messages, eleven replies, all webhook events `processed`. Outbound message
+   ids returned by Meta confirm the replies really left the API.
+
+   **Still failing after the fix:** `orders` is `0`. The bot converses, prices and quotes, but
+   no order record is created, so nothing reaches the dashboard. One reply also admitted
+   *"I can't see the details of the order you just placed"*, so the draft-order tool path is
+   not working end to end. This is the next defect to fix.
+
 ## 9. Incident disclosure (staging)
 
 While running the full suite, `.env` pointed `SAAS_DATABASE_URL` at **staging**, and
@@ -624,7 +661,8 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Verification handshake | **PASS** — correct token → 200 with challenge; wrong → 403 |
 | Inbound signature verification (Meta-format POST) | **PASS** — signed accepted, bad signature rejected, unknown channel → 404, zero writes |
 | AI provider can generate a reply | **PASS** — key valid (HTTP 200), configured model `gpt-5.6-luna` exists for that key |
-| End-to-end real message (inbound → AI → outbound) | **NOT PERFORMED** — no message has been sent or received; the loop has never run |
+| End-to-end real message (inbound → AI → outbound) | **PASS** — see the conversation timeline below |
+| Order persisted from a WhatsApp conversation | **FAIL** — 11 inbound messages, 11 replies, but `orders` is 0; the bot converses and quotes but never creates an order record |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
 
