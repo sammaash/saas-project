@@ -17,6 +17,7 @@ from saas.config import (
     order_policy_from_settings,
 )
 from saas.tools import (
+    ORDER_NOT_FOUND_MESSAGE,
     ToolContext,
     ToolRegistry,
     ToolResult,
@@ -200,8 +201,13 @@ class _FakeAdmin:
         self.calls.append("confirm_order")
         return self.data.get("quote", {})
 
-    def get_order_by_number(self, order_number):
+    def get_order_by_number(self, order_number, *, whatsapp_wa_id=None):
         self.calls.append("get_order_by_number")
+        self.last_wa_filter = whatsapp_wa_id
+        owner = self.data.get("order_owner")
+        if whatsapp_wa_id and owner and whatsapp_wa_id != owner:
+            # Mirrors the SQL predicate: a number that is not the owner's matches nothing.
+            return None
         return self.data.get("order")
 
     def get_order_payment_status(self, order_id):
@@ -440,6 +446,7 @@ class ConfirmOrderToolTests(unittest.TestCase):
 class GetOrderStatusToolTests(unittest.TestCase):
     def test_returns_order_status(self):
         fake = _FakeAdmin({
+            "order_owner": "wa-123",
             "order": {
                 "id": "order-1", "order_number": "ORD-0001",
                 "status": "confirmed",
@@ -464,7 +471,8 @@ class GetOrderStatusToolTests(unittest.TestCase):
         with patch("saas.tools.tenant_admin", return_value=fake):
             tool = GetOrderStatusTool()
             result = tool.execute(
-                ToolContext("tenant-a"), {"order_number": "ORD-0001"}
+                ToolContext("tenant-a", customer_wa_id="wa-123"),
+                {"order_number": "ORD-0001"},
             )
         self.assertTrue(result.ok)
         self.assertEqual(result.data["order_number"], "ORD-0001")
@@ -476,6 +484,62 @@ class GetOrderStatusToolTests(unittest.TestCase):
         result = tool.execute(ToolContext("tenant-a"), {})
         self.assertFalse(result.ok)
         self.assertIn("order number", result.error.lower())
+
+
+class OrderStatusPrivacyTests(unittest.TestCase):
+    """A customer may only read an order that belongs to the number they messaged from."""
+
+    STATUS = {
+        "id": "order-1", "order_number": "ORD-0001", "status": "confirmed",
+        "total": 1000, "required_deposit": 500, "amount_paid": 500,
+        "outstanding_balance": 500, "payment_status": "awaiting_final",
+    }
+    PAYMENT = {
+        "order_number": "ORD-0001", "status": "confirmed", "total": 1000,
+        "required_deposit": 500, "amount_paid": 500, "outstanding_balance": 500,
+        "payment_status": "awaiting_final", "fully_paid": False, "deposit_satisfied": True,
+    }
+
+    def _run(self, context, data=None):
+        fake = _FakeAdmin(data or {
+            "order_owner": "wa-owner",
+            "order": self.STATUS,
+            "payment_status": self.PAYMENT,
+        })
+        with patch("saas.tools.tenant_admin", return_value=fake):
+            result = GetOrderStatusTool().execute(context, {"order_number": "ORD-0001"})
+        return result, fake
+
+    def test_the_owner_sees_their_order(self):
+        result, fake = self._run(ToolContext("tenant-a", customer_wa_id="wa-owner"))
+        self.assertTrue(result.ok)
+        self.assertEqual(fake.last_wa_filter, "wa-owner")
+
+    def test_a_different_customer_sees_nothing(self):
+        result, fake = self._run(ToolContext("tenant-a", customer_wa_id="wa-intruder"))
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.data)
+        self.assertEqual(result.error, ORDER_NOT_FOUND_MESSAGE)
+        self.assertNotIn("1000", result.error)
+
+    def test_missing_identity_fails_closed_before_any_lookup(self):
+        result, fake = self._run(ToolContext("tenant-a"))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, ORDER_NOT_FOUND_MESSAGE)
+        self.assertEqual(fake.calls, [], "no query may run without a verified identity")
+
+    def test_staff_keep_the_tenant_wide_view(self):
+        result, fake = self._run(ToolContext("tenant-a", is_staff=True))
+        self.assertTrue(result.ok)
+        self.assertIsNone(fake.last_wa_filter)
+
+    def test_the_answer_is_identical_for_missing_and_foreign_orders(self):
+        missing, _ = self._run(
+            ToolContext("tenant-a", customer_wa_id="wa-owner"),
+            {"order": None},
+        )
+        foreign, _ = self._run(ToolContext("tenant-a", customer_wa_id="wa-other"))
+        self.assertEqual(missing.error, foreign.error)
 
 
 class GetPaymentStatusToolTests(unittest.TestCase):

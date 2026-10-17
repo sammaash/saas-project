@@ -456,11 +456,45 @@ class TenantAdmin:
         )
         return str(row["id"]) if row else None
 
-    def get_order_by_number(self, order_number: str) -> dict[str, Any] | None:
+    def get_order_by_number(
+        self, order_number: str, *, whatsapp_wa_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Fetch one order by its number.
+
+        ``whatsapp_wa_id`` restricts the result to orders that belong to that WhatsApp
+        identity. Every customer-facing caller MUST pass it: order numbers are allocated
+        sequentially per tenant, so an unbound lookup lets any customer read another
+        customer's order by guessing ``ORD-0007``. Staff and dashboard callers omit it and
+        keep their tenant-wide view.
+        """
+        if whatsapp_wa_id:
+            return self._one(
+                "select * from public.orders "
+                "where order_number = %s and whatsapp_wa_id = %s "
+                "and tenant_id = app.current_tenant_id()",
+                (order_number, whatsapp_wa_id),
+            )
         return self._one(
             "select * from public.orders "
             "where order_number = %s and tenant_id = app.current_tenant_id()",
             (order_number,),
+        )
+
+    def list_orders_by_whatsapp(
+        self, whatsapp_wa_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """The most recent orders belonging to one WhatsApp identity.
+
+        This is the safe way to offer "which of my orders?" in a menu: the caller never
+        types a number, and the predicate is the identity the message arrived from.
+        """
+        safe_limit = max(1, min(int(limit), 20))
+        return self._all(
+            "select id, order_number, status, total, amount_paid, created_at "
+            "from public.orders "
+            "where whatsapp_wa_id = %s and tenant_id = app.current_tenant_id() "
+            "order by created_at desc limit %s",
+            (whatsapp_wa_id, safe_limit),
         )
 
     def update_order(self, order_id: str, **values: Any) -> bool:

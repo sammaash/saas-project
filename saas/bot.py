@@ -527,6 +527,7 @@ class BotResponseEngine:
         context: TenantBotContext | None = None,
         customer_key: str | None = None,
         message_id: str | None = None,
+        is_staff: bool = False,
     ) -> BotResponse:
         started = time.perf_counter()
         context_started = time.perf_counter()
@@ -548,15 +549,21 @@ class BotResponseEngine:
         # Build the conversation message list that will grow with tool-result turns.
         registry = _tools.default_tool_registry()
         tenant_id_str = str(context.tenant.get("id"))
+        # Only an identity supplied by the caller is a real customer identity. The
+        # fallbacks below exist so drafts/handovers have a stable key for staff and
+        # playground turns; they must never authorise access to a customer's records.
+        verified_customer_wa_id = str(customer_key) if customer_key else None
         customer_key = customer_key or context.tenant.get("whatsapp_wa_id") or context.tenant.get(
             "id"
         )
         tool_context = _tools.ToolContext(
             tenant_id=tenant_id_str,
             customer_key=str(customer_key) if customer_key else None,
+            is_staff=is_staff,
             message_id=message_id,
             database_url=getattr(self._context_loader, "database_url", None),
             safe_test_mode=safe_test_mode,
+            customer_wa_id=verified_customer_wa_id,
             # Only what a human needs to read a handover: the last few short turns.
             context_turns=tuple(
                 {"role": turn.role, "text": turn.text[:400]}

@@ -350,6 +350,10 @@ def respond_to_customer(
             channel="admin-playground",
             safe_test_mode=True,
             context=tenant_context,
+            # The playground is an authenticated staff surface. Marking it as staff keeps
+            # order lookups working there without weakening the customer path, which
+            # requires a verified WhatsApp identity.
+            is_staff=True,
         )
     except BotContextError as error:
         raise v.ServiceError(str(error), 404) from error

@@ -88,6 +88,10 @@ class ToolContext:
     database_url: str | None = None
     safe_test_mode: bool = False
     context_turns: tuple[dict[str, str], ...] = ()
+    #: The WhatsApp identity the inbound message actually came from. ``customer_key`` is
+    #: NOT this: the engine falls back to tenant-level values for staff/playground calls,
+    #: so it must never be used to authorise a customer's access to their own records.
+    customer_wa_id: str | None = None
 
     def require_staff(self) -> None:
         if not self.is_staff:
@@ -664,6 +668,14 @@ class ConfirmOrderTool:
         )
 
 
+#: One answer for both "no such order" and "not your order". Distinguishing them would
+#: confirm that a guessed order number exists, which is exactly what enumeration needs.
+ORDER_NOT_FOUND_MESSAGE = (
+    "I couldn't find an order with that number for this WhatsApp number. "
+    "I can ask a colleague to check for you."
+)
+
+
 class GetOrderStatusTool:
     name = "get_order_status"
     description = (
@@ -685,16 +697,28 @@ class GetOrderStatusTool:
         if not order_number:
             return ToolResult(ok=False, error="Order number is required.")
 
+        # A customer may only read an order that belongs to the number they are messaging
+        # from; staff keep the tenant-wide view. Order numbers are sequential, so an
+        # unbound lookup is an enumeration hole. When no verified identity is available
+        # the lookup fails closed instead of silently widening to the whole tenant.
+        owner_filter = None if context.is_staff else context.customer_wa_id
+        if not context.is_staff and not owner_filter:
+            return ToolResult(ok=False, error=ORDER_NOT_FOUND_MESSAGE)
+
         try:
             with tenant_admin(tenant_id) as admin:
-                order = admin.get_order_by_number(order_number)
+                order = admin.get_order_by_number(
+                    order_number, whatsapp_wa_id=owner_filter
+                )
         except ValueError as error:
             return ToolResult(ok=False, error=str(error))
         except Exception:  # noqa: BLE001
             logger.exception("get_order_status failed for tenant %s", tenant_id)
             return ToolResult(ok=False, error="Could not look up the order.")
         if order is None:
-            return ToolResult(ok=False, error="Order not found.")
+            # The same answer whether the order does not exist or belongs to someone
+            # else: anything else would confirm that a guessed number is real.
+            return ToolResult(ok=False, error=ORDER_NOT_FOUND_MESSAGE)
 
         try:
             with tenant_admin(tenant_id) as admin:

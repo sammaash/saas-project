@@ -182,3 +182,60 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class OrderOwnershipLookupTests(SaasDatabaseTestCase):
+    """``get_order_by_number`` can bind a lookup to the sender's WhatsApp identity.
+
+    This is the database half of the privacy guarantee: the SQL predicate, not the tool
+    layer, is what makes another customer's order unreadable.
+    """
+
+    def _make_owned_order(self, wa_id: str | None) -> str:
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            order_id = ta.create_order(customer_name="Owner", whatsapp_wa_id=wa_id)
+            ta.add_order_item(
+                order_id, name="Chocolate Cake 1kg",
+                quantity=1, unit_price=Decimal("1000"),
+            )
+            return ta.get_order(order_id)["order_number"]
+
+    def test_the_owner_can_read_their_order(self):
+        number = self._make_owned_order("254700111222")
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            row = ta.get_order_by_number(number, whatsapp_wa_id="254700111222")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["order_number"], number)
+
+    def test_another_whatsapp_number_reads_nothing(self):
+        number = self._make_owned_order("254700111333")
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            self.assertIsNone(
+                ta.get_order_by_number(number, whatsapp_wa_id="254700999888")
+            )
+
+    def test_an_order_without_a_whatsapp_identity_is_not_visible_to_a_customer(self):
+        number = self._make_owned_order(None)
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            self.assertIsNone(
+                ta.get_order_by_number(number, whatsapp_wa_id="254700111444")
+            )
+
+    def test_staff_lookup_without_a_binding_still_works(self):
+        number = self._make_owned_order("254700111555")
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            self.assertIsNotNone(ta.get_order_by_number(number))
+
+    def test_the_customer_order_list_is_scoped_to_the_sender(self):
+        # Unique per run: orders persist between local runs, so a fixed identity would
+        # accumulate rows and make this assertion pass for the wrong reason.
+        wa_id = "2547" + uuid.uuid4().hex[:9]
+        self._make_owned_order(wa_id)
+        self._make_owned_order("2547" + uuid.uuid4().hex[:9])
+        with tenant_admin(TENANT_ONE_ID, app_backend_test_url()) as ta:
+            rows = ta.list_orders_by_whatsapp(wa_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            set(rows[0]), {"id", "order_number", "status", "total", "amount_paid", "created_at"}
+        )
+
