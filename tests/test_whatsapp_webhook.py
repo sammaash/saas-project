@@ -128,6 +128,46 @@ class WhatsAppWebhookTests(unittest.TestCase):
             self.app.extensions["platform"].settings, "tenant-1", "wamid.test-1", "processed"
         )
 
+    # A genuine Meta message id, captured from a live send on 2026-10-17. It ends in base64
+    # padding. An earlier MESSAGE_ID_RE excluded "+", "/" and "=", so every real inbound
+    # message failed validation and was silently ignored (200 {"ignored": true}, nothing
+    # written) while the simplified "wamid.test-1" fixture kept this suite green.
+    REAL_WAMID = "wamid.HBgMMjU0NzIzNTk1MzM0FQIAERgSRjk2NDBCNUIwQzFGQkI5RkQyAA=="
+
+    def _payload_with_real_id(self):
+        payload = _payload()
+        payload["entry"][0]["changes"][0]["value"]["messages"][0]["id"] = self.REAL_WAMID
+        return payload
+
+    def test_a_real_meta_message_id_parses(self):
+        from platform_admin.services import whatsapp as whatsapp_service
+
+        event = whatsapp_service.parse_event(self._payload_with_real_id())
+        self.assertIsNotNone(event, "a genuine Meta wamid must not be dropped")
+        self.assertEqual(event["message_id"], self.REAL_WAMID)
+        self.assertEqual(event["customer_key"], "+254700000001")
+
+    @patch("platform_admin.routes.whatsapp_service.update_event")
+    @patch("platform_admin.routes.whatsapp_service.save_conversation")
+    @patch("platform_admin.routes.whatsapp_service.send_text", return_value="wamid.reply-1")
+    @patch("platform_admin.routes.whatsapp_service.conversation_history", return_value=[])
+    @patch("platform_admin.routes.whatsapp_service.claim_event", return_value=True)
+    @patch("platform_admin.routes.whatsapp_service.resolve_channel")
+    @patch("platform_admin.routes.BotResponseEngine")
+    def test_a_real_meta_message_id_is_replied_to_not_ignored(
+        self, engine, resolve, claim, history, send, save, update
+    ):
+        resolve.return_value = {
+            "tenant_id": "tenant-1",
+            "channel_id": "channel-1",
+            "credentials_ref": "tenants/tenant-1/whatsapp",
+        }
+        engine.return_value.respond.return_value.text = "Welcome"
+        response = self._signed_post(self._payload_with_real_id())
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("ignored", response.json, "a real message must not be silently ignored")
+        send.assert_called_once()
+
     def test_webhook_post_does_not_require_dashboard_csrf(self):
         response = self._signed_post({"object": "not-whatsapp"})
         self.assertEqual(response.status_code, 200)

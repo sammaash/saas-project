@@ -18,7 +18,12 @@ from ..config import Settings
 from .validation import ServiceError
 
 PHONE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
-MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+# Meta's message ids look like "wamid.HBgMMjU0NzIzNTk1MzM0FQIAERgSRjk2NDBCNUIwQzFGQkI5RkQyAA==".
+# The payload is base64, so it can contain "+", "/" and "=" padding. An earlier pattern
+# excluded those characters, which made every real inbound message fail validation and be
+# silently ignored (200 {"ignored": true}, no rows written) while the tests passed because
+# their fixtures used a simplified id.
+MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.:+/=-]{1,200}$")
 CUSTOMER_KEY_RE = re.compile(r"^\+?[1-9][0-9]{6,30}$")
 
 
