@@ -30,6 +30,7 @@ from ..services import catalogue_import as catalogue_import_service
 from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
 from ..services import customers as customer_service
+from ..services import handover as handover_service
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -142,14 +143,39 @@ def whatsapp_webhook():
             turns,
             channel="whatsapp",
             safe_test_mode=False,
+            customer_key=customer_key,
+            message_id=event["message_id"],
         )
+        # A turn that needs a human handover is answered with wording the platform owns,
+        # chosen from whether the staff notification actually succeeded. Handover trouble
+        # must never silence the bot, so it falls back to the honest apology instead.
+        try:
+            handover_reply = handover_service.handle_turn(
+                settings,
+                tenant_id=tenant_id,
+                channel=channel,
+                phone_number_id=event["phone_number_id"],
+                customer_key=customer_key,
+                customer=customer,
+                conversation=conversation,
+                message_id=event["message_id"],
+                customer_message=event["text"],
+                bot_response=response,
+                history=history,
+            )
+        except Exception as error:  # noqa: BLE001 - never silence the bot
+            logger.error(
+                "Handover handling failed tenant=%s error=%s", tenant_id, type(error).__name__
+            )
+            handover_reply = handover_service.safe_reply(response)
+        reply_text = handover_reply or response.text
         outbound_id = whatsapp_service.send_text(
             settings,
             phone_number_id=event["phone_number_id"],
             tenant_id=tenant_id,
             credentials_ref=channel.get("credentials_ref"),
             recipient=customer_key,
-            text=response.text,
+            text=reply_text,
         )
         # Persist the outbound message only after a successful send.
         if conversation:
@@ -163,8 +189,8 @@ def whatsapp_webhook():
                     sender_type="assistant",
                     provider_message_id=outbound_id,
                     message_type="text",
-                    body_text=response.text,
-                    payload={"text": response.text},
+                    body_text=reply_text,
+                    payload={"text": reply_text},
                     delivery_status="sent",
                 )
                 customer_service.update_conversation_activity(
@@ -179,7 +205,7 @@ def whatsapp_webhook():
         history.extend(
             [
                 {"role": "user", "text": event["text"][:1000]},
-                {"role": "assistant", "text": response.text[:1000]},
+                {"role": "assistant", "text": reply_text[:1000]},
             ]
         )
         whatsapp_service.save_conversation(
@@ -774,6 +800,47 @@ def tenant_rules_section(tenant_id, section):
         )
     flash(f"{bot_config_service.SECTION_LABELS.get(section, 'Configuration')} saved.", "ok")
     return redirect(url_for("admin.tenant_rules", tenant_id=tenant["id"]))
+
+
+# ---------------------------------------------------------------- handovers
+@admin_bp.get("/tenants/<tenant_id>/handovers")
+@admin_required
+def tenant_handovers(tenant_id):
+    """Human-handover requests for one tenant: what staff still have to answer."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    status = (request.args.get("status") or "").strip()
+    return render_template(
+        "tenant_handovers.html",
+        tenant=tenant,
+        tab="handovers",
+        requests=handover_service.tenant_requests(settings, tenant["id"], status=status or None),
+        status=status,
+        statuses=handover_service.STAFF_STATUSES,
+        summary=handover_service.status_summary(settings, tenant["id"]),
+    )
+
+
+@admin_bp.post("/tenants/<tenant_id>/handovers/<handover_id>/status")
+@admin_required
+def tenant_handover_status(tenant_id, handover_id):
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    status = request.form.get("status") or ""
+    return _act("admin.tenant_handovers", tenant["id"], "Handover updated.",
+                lambda: handover_service.change_status(
+                    settings, g.admin_id, tenant["id"], handover_id, status))
+
+
+@admin_bp.post("/tenants/<tenant_id>/handovers/<handover_id>/notify")
+@admin_required
+def tenant_handover_notify(tenant_id, handover_id):
+    """Retry a staff notification that failed, using the tenant's active channel."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    return _act("admin.tenant_handovers", tenant["id"], "Staff notified.",
+                lambda: handover_service.renotify(
+                    settings, g.admin_id, tenant, handover_id))
 
 
 # ---------------------------------------------------------------- catalogue

@@ -528,6 +528,7 @@ class DefaultRegistryTests(unittest.TestCase):
             "get_order_draft",
             "get_order_status",
             "get_payment_status",
+            "request_staff_handover",
             "update_order_draft",
         ]
         for name in expected:

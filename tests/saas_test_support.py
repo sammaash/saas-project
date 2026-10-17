@@ -85,6 +85,7 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("customers", "tenant_id"),
     ("conversations", "tenant_id"),
     ("messages", "tenant_id"),
+    ("handover_requests", "tenant_id"),
     ("tenant_order_sequences", "tenant_id"),
 )
 
@@ -108,6 +109,7 @@ AUTHENTICATED_INACCESSIBLE_TABLES = frozenset(
         "conversations",
         "messages",
         "tenant_order_sequences",
+        "handover_requests",
     }
 )
 

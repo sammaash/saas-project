@@ -91,6 +91,13 @@ class BotResponseRequest:
 class BotResponse:
     text: str
     context: TenantBotContext
+    #: Set when a human handover was recorded during this turn. The host delivers the
+    #: notification and owns the customer-facing wording, because only the host knows
+    #: whether delivery actually succeeded.
+    handover: dict[str, Any] | None = None
+    #: True when a handover was attempted and recording it failed. The host must then
+    #: apologise rather than let any claim of "I shared your request" reach the customer.
+    handover_failed: bool = False
 
 
 class BotResponseProvider(Protocol):
@@ -120,6 +127,11 @@ class TenantBotContextLoader:
 
     def __init__(self, database_url: str | None):
         self._database_url = database_url
+
+    @property
+    def database_url(self) -> str | None:
+        """The DSN the loader reads with, so tools can use the same database."""
+        return self._database_url
 
     def load(self, tenant_id: str) -> TenantBotContext:
         started = time.perf_counter()
@@ -461,6 +473,26 @@ class BotResponseEngine:
             if safe_test_mode
             else "Return a customer-facing text response. External actions are handled elsewhere."
         )
+        handover = (
+            ""
+            if safe_test_mode
+            else (
+                "\n\nHANDOVER PROTOCOL\n"
+                "If the customer asks for a product the catalogue does not list, or for a "
+                "variant (size, flavour, quantity, date) the catalogue cannot confirm, do not "
+                "quote a price, do not promise availability, and do not ask them to contact "
+                "staff themselves. Record the request instead:\n"
+                '    TOOL_CALL: {"name": "request_staff_handover", "arguments": {"product": '
+                '"<what they asked for>", "reason": "unlisted_product", "size": "<if given>", '
+                '"flavour": "<if given>", "quantity": "<if given>", "needed_by": "<if given>", '
+                '"notes": "<anything else relevant>"}}\n'
+                "Use reason unavailable_variant when the product exists but that size/flavour/"
+                "date does not, and custom_order for a bespoke item. Include every "
+                "specification the customer gave, then reply briefly: the platform sends the "
+                "confirmation wording. If the tool reports a failure, apologise and say the "
+                "team could not be notified automatically."
+            )
+        )
         tenant_data = BotResponseEngine._without_empty(
             {
                 "business_name": context.tenant.get("name"),
@@ -480,7 +512,7 @@ class BotResponseEngine:
             "available; describe MADE_TO_ORDER items clearly and do not invent a lead time. "
             "Follow the saved persona and business rules where they "
             "do not conflict with safety. "
-            f"{safety}\n\nTENANT DATA (JSON):\n"
+            f"{safety}{handover}\n\nTENANT DATA (JSON):\n"
             f"{json.dumps(tenant_data, ensure_ascii=True, sort_keys=True, default=str, separators=(',', ':'))}"
         )
 
@@ -493,6 +525,8 @@ class BotResponseEngine:
         channel: str,
         safe_test_mode: bool,
         context: TenantBotContext | None = None,
+        customer_key: str | None = None,
+        message_id: str | None = None,
     ) -> BotResponse:
         started = time.perf_counter()
         context_started = time.perf_counter()
@@ -514,10 +548,21 @@ class BotResponseEngine:
         # Build the conversation message list that will grow with tool-result turns.
         registry = _tools.default_tool_registry()
         tenant_id_str = str(context.tenant.get("id"))
-        customer_key = context.tenant.get("whatsapp_wa_id") or context.tenant.get("id")
+        customer_key = customer_key or context.tenant.get("whatsapp_wa_id") or context.tenant.get(
+            "id"
+        )
         tool_context = _tools.ToolContext(
             tenant_id=tenant_id_str,
             customer_key=str(customer_key) if customer_key else None,
+            message_id=message_id,
+            database_url=getattr(self._context_loader, "database_url", None),
+            safe_test_mode=safe_test_mode,
+            # Only what a human needs to read a handover: the last few short turns.
+            context_turns=tuple(
+                {"role": turn.role, "text": turn.text[:400]}
+                for turn in list(request.history)[-4:]
+            )
+            + ({"role": "user", "text": request.customer_message[:400]},),
         )
 
         messages: list[dict[str, str]] = [
@@ -530,6 +575,8 @@ class BotResponseEngine:
 
         tool_call_rounds = 0
         final_text = ""
+        handover: dict[str, Any] | None = None
+        handover_failed = False
 
         provider_started = time.perf_counter()
         while tool_call_rounds <= _tools.MAX_TOOL_CALLS:
@@ -552,6 +599,13 @@ class BotResponseEngine:
 
             tool_call_rounds += 1
             results = _tools.execute_tool_calls(registry, tool_context, calls)
+            for entry in results:
+                if entry.get("tool") == "request_staff_handover":
+                    if entry.get("ok") and isinstance(entry.get("data"), dict):
+                        handover = entry["data"]
+                        handover_failed = False
+                    elif not entry.get("ok"):
+                        handover_failed = True
 
             # Feed tool results back as structured assistant-visible context so the
             # model can compose a final answer from real data.
@@ -574,7 +628,12 @@ class BotResponseEngine:
             final_text = text.strip()[:MAX_RESPONSE_LENGTH] if text else ""
 
         response_started = time.perf_counter()
-        response = BotResponse(text=final_text, context=context)
+        response = BotResponse(
+            text=final_text,
+            context=context,
+            handover=handover,
+            handover_failed=handover_failed,
+        )
         response_processing_ms = (time.perf_counter() - response_started) * 1_000
         logger.info(
             "Bot response timing total_ms=%.1f context_ms=%.1f request_processing_ms=%.1f "

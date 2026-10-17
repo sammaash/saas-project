@@ -25,6 +25,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from . import handover as _handover
 from .tenant_admin import tenant_admin
 
 logger = logging.getLogger("saas.tools")
@@ -73,11 +74,20 @@ class ToolContext:
     tenant_id is resolved by the host (from the session/channel), never from
     model input. customer_key identifies the end customer (e.g. WhatsApp WA ID).
     is_staff marks dashboard/staff callers who may use staff-only tools.
+
+    ``message_id`` is the inbound provider message id: it is the idempotency key for
+    anything a tool records on behalf of one message, so a redelivered webhook cannot
+    duplicate it. ``context_turns`` is the short recent history a tool may attach to
+    something a human has to read; it is never the whole conversation.
     """
 
     tenant_id: str
     customer_key: str | None = None
     is_staff: bool = False
+    message_id: str | None = None
+    database_url: str | None = None
+    safe_test_mode: bool = False
+    context_turns: tuple[dict[str, str], ...] = ()
 
     def require_staff(self) -> None:
         if not self.is_staff:
@@ -184,6 +194,103 @@ class GetBusinessRulesTool:
                 "business_hours": settings.get("business_hours"),
                 "timezone": settings.get("timezone"),
                 "bot_persona": settings.get("bot_persona"),
+            },
+        )
+
+
+class RequestStaffHandoverTool:
+    """Record a human handover for something the catalogue cannot confirm.
+
+    The tool only *records* the request. Delivery to the tenant's staff contact needs the
+    tenant's own WhatsApp channel and settings, so the host performs it immediately after
+    the turn and stores the outcome on the same row. That split is deliberate: the record is
+    durable before anything claims the request was shared, and a delivery problem is visible
+    and retryable instead of being hidden inside a tool call.
+    """
+
+    name = "request_staff_handover"
+    description = (
+        "Record a human-handover request when the customer asks for a product that is not "
+        "in the catalogue, or for a variant (size, flavour, quantity, date) the catalogue "
+        "cannot confirm. Never quote a price or promise availability for such a request."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "product": {
+                "type": "string",
+                "description": "What the customer asked for, in their own words.",
+            },
+            "reason": {
+                "type": "string",
+                "enum": list(_handover.REASONS),
+                "description": (
+                    "unlisted_product when the catalogue does not list it; "
+                    "unavailable_variant when the product exists but this size/flavour/date "
+                    "does not; custom_order for a bespoke item."
+                ),
+            },
+            "size": {"type": "string"},
+            "flavour": {"type": "string"},
+            "quantity": {"type": "string"},
+            "needed_by": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        "required": ["product"],
+        "additionalProperties": False,
+    }
+
+    #: Free-text specification fields a made-to-order business needs from the customer.
+    DETAIL_FIELDS = ("size", "flavour", "quantity", "needed_by", "notes")
+
+    def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        tenant_id = _resolve_tenant_id(context)
+        if context.safe_test_mode:
+            return ToolResult(
+                ok=False,
+                error=(
+                    "Test mode: a handover request would be recorded here, but nothing was "
+                    "written and no staff were notified."
+                ),
+            )
+        if not context.customer_key:
+            return ToolResult(ok=False, error="No customer identity is available to hand over.")
+        product = str(arguments.get("product") or "").strip()
+        if not product:
+            return ToolResult(ok=False, error="A product or request description is required.")
+        reason = str(arguments.get("reason") or "unlisted_product").strip()
+        if reason not in _handover.REASONS:
+            reason = "unlisted_product"
+        details = {
+            field: str(arguments.get(field)).strip()[:200]
+            for field in self.DETAIL_FIELDS
+            if str(arguments.get(field) or "").strip()
+        }
+        dedupe_key = context.message_id or (
+            f"tool:{context.customer_key}:{_handover.product_key(product)}"
+        )
+        try:
+            record, created = _handover.create_request(
+                tenant_id,
+                wa_id=context.customer_key,
+                requested_product=product,
+                dedupe_key=dedupe_key,
+                reason=reason,
+                details=details,
+                context=list(context.context_turns),
+                database_url=context.database_url,
+            )
+        except Exception:  # noqa: BLE001 - the model must be able to explain a failure
+            logger.exception("request_staff_handover failed for tenant %s", tenant_id)
+            return ToolResult(ok=False, error="Could not record the handover request.")
+        return ToolResult(
+            ok=True,
+            data={
+                "handover_id": str(record["id"]),
+                "requested_product": record["requested_product"],
+                "status": record["status"],
+                "duplicate": not created,
+                "recorded": True,
             },
         )
 
@@ -704,6 +811,7 @@ def default_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(GetCatalogueTool())
     registry.register(GetBusinessRulesTool())
+    registry.register(RequestStaffHandoverTool())
     registry.register(GetOrderDraftTool())
     registry.register(UpdateOrderDraftTool())
     registry.register(CalculateQuoteTool())
