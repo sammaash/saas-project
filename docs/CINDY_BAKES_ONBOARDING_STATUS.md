@@ -622,6 +622,8 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Meta webhook wired to this deployment (active, `messages`, v26.0) | **PASS** — read from the app's own subscription |
 | App secret matches the subscribed app `28834141379522438` | **PASS** — proven by a successful credential exchange |
 | Verification handshake | **PASS** — correct token → 200 with challenge; wrong → 403 |
+| Inbound signature verification (Meta-format POST) | **PASS** — signed accepted, bad signature rejected, unknown channel → 404, zero writes |
+| AI provider can generate a reply | **PASS** — key valid (HTTP 200), configured model `gpt-5.6-luna` exists for that key |
 | End-to-end real message (inbound → AI → outbound) | **NOT PERFORMED** — no message has been sent or received; the loop has never run |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
