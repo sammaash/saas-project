@@ -162,6 +162,7 @@ class WebhookCustomerPersistenceTests(unittest.TestCase):
             "credentials_ref": f"tenants/{TENANT_ID}/whatsapp",
         }
 
+    @patch("platform_admin.routes.customer_service.mark_message_sent")
     @patch("platform_admin.routes.customer_service.update_conversation_activity")
     @patch("platform_admin.routes.customer_service.save_message")
     @patch("platform_admin.routes.customer_service.get_or_create_conversation")
@@ -175,12 +176,13 @@ class WebhookCustomerPersistenceTests(unittest.TestCase):
     @patch("platform_admin.routes.BotResponseEngine")
     def test_inbound_and_outbound_messages_are_persisted(
         self, engine, resolve, claim, history, send, save_conv, update_event,
-        get_customer, get_conversation, save_message, touch,
+        get_customer, get_conversation, save_message, touch, mark_sent,
     ):
         resolve.return_value = self._channel()
         get_customer.return_value = {"id": CUSTOMER_ID}
         get_conversation.return_value = {"id": CONVERSATION_ID}
         engine.return_value.respond.return_value = MagicMock(text="Hi back")
+        save_message.side_effect = [{"id": "inbound-row"}, {"id": "outbox-row"}]
 
         response = self._signed_post()
 
@@ -193,7 +195,13 @@ class WebhookCustomerPersistenceTests(unittest.TestCase):
         self.assertEqual(inbound.kwargs["direction"], "inbound")
         self.assertEqual(inbound.kwargs["provider_message_id"], "wamid.test-1")
         self.assertEqual(outbound.kwargs["direction"], "outbound")
-        self.assertEqual(outbound.kwargs["delivery_status"], "sent")
+        # The intent row must not claim a provider id before the send; the wamid is
+        # attached afterwards, and it is the inbound id that guarantees one reply only.
+        self.assertEqual(outbound.kwargs["reply_to_provider_message_id"], "wamid.test-1")
+        self.assertNotIn("provider_message_id", outbound.kwargs)
+        self.assertNotIn("delivery_status", outbound.kwargs)
+        mark_sent.assert_called_once()
+        self.assertEqual(mark_sent.call_args.args[-1], "wamid.reply-1")
         touch.assert_called_once()
 
     @patch("platform_admin.routes.customer_service.get_or_create_customer")

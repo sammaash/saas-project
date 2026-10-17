@@ -125,7 +125,11 @@ class WhatsAppWebhookTests(unittest.TestCase):
         send.assert_called_once()
         save.assert_called_once()
         update.assert_called_once_with(
-            self.app.extensions["platform"].settings, "tenant-1", "wamid.test-1", "processed"
+            self.app.extensions["platform"].settings,
+            "tenant-1",
+            "wamid.test-1",
+            "processed",
+            response_message_id="wamid.reply-1",
         )
 
     # A genuine Meta message id, captured from a live send on 2026-10-17. It ends in base64

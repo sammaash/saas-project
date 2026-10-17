@@ -27,6 +27,32 @@ from .validation import ServiceError
 
 logger = logging.getLogger("platform_admin.customers")
 
+
+class DuplicateReplyError(ServiceError):
+    """A reply for this inbound message has already been recorded.
+
+    Raised when ``messages_outbound_reply_unique`` rejects a second outbound row for the
+    same inbound provider message. The caller must treat this as "look at the existing
+    row", never as a generic persistence failure: it is the database enforcing
+    at-most-one-reply-per-inbound-message.
+    """
+
+    def __init__(self, message: str = "This message has already been answered."):
+        super().__init__(message, 409)
+
+
+class SchemaOutOfDateError(ServiceError):
+    """A column this code needs does not exist yet (migration 0035 not applied).
+
+    The webhook treats this as "use the pre-0035 persistence path" rather than as an
+    error, so deploying this code ahead of the migration degrades instead of silently
+    losing outbound message history.
+    """
+
+    def __init__(self, message: str = "The database schema is older than this code."):
+        super().__init__(message, 503)
+
+
 # ---------------------------------------------------------------------------
 # Customers
 # ---------------------------------------------------------------------------
@@ -312,12 +338,14 @@ def save_message(
     delivery_status: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    reply_to_provider_message_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist one message.
 
     ``direction`` in ``inbound``/``outbound``; ``sender_type`` in
     ``customer``/``assistant``/``staff``/``system``. Returns the inserted row.
-    Raises ``ServiceError`` on provider-message-id duplication (idempotency).
+    Raises ``ServiceError`` on provider-message-id duplication (idempotency) and
+    ``DuplicateReplyError`` when this inbound message already has an outbound reply.
     """
     if direction not in ("inbound", "outbound"):
         raise ServiceError("Invalid message direction.", 400)
@@ -332,38 +360,188 @@ def save_message(
         raise ServiceError("Invalid delivery status.", 400)
 
     with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        # The new column is referenced ONLY when a value is supplied. That keeps the
+        # statement byte-for-byte equivalent to the pre-0035 one for every existing caller
+        # (inbound messages and dashboard writes), so an un-migrated database keeps
+        # persisting history instead of failing every insert.
+        columns = [
+            "tenant_id", "channel_id", "conversation_id", "direction", "sender_type",
+            "provider_message_id", "message_type", "body_text", "payload",
+            "provider_timestamp", "delivery_status", "error_code", "error_message",
+        ]
+        parameters: list[Any] = [
+            channel_id, conversation_id, direction, sender_type, provider_message_id,
+            message_type, body_text, Jsonb(payload) if payload is not None else None,
+            provider_timestamp, delivery_status, error_code, error_message,
+        ]
+        returning = (
+            "id, tenant_id, channel_id, conversation_id, direction, sender_type, "
+            "provider_message_id, message_type, body_text, payload, provider_timestamp, "
+            "received_at, delivery_status, error_code, error_message"
+        )
+        if reply_to_provider_message_id is not None:
+            columns.append("reply_to_provider_message_id")
+            parameters.append(reply_to_provider_message_id)
+            returning += ", reply_to_provider_message_id"
+        returning += ", created_at, updated_at"
+        placeholders = ", ".join("%s" for _ in parameters)
         try:
             cursor.execute(
-                """
-                insert into public.messages
-                    (tenant_id, channel_id, conversation_id, direction, sender_type,
-                     provider_message_id, message_type, body_text, payload,
-                     provider_timestamp, delivery_status, error_code, error_message)
-                values (app.current_tenant_id(), %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s)
-                returning id, tenant_id, channel_id, conversation_id, direction,
-                          sender_type, provider_message_id, message_type, body_text,
-                          payload, provider_timestamp, received_at, delivery_status,
-                          error_code, error_message, created_at, updated_at
-                """,
-                (
-                    channel_id, conversation_id, direction, sender_type,
-                    provider_message_id, message_type, body_text,
-                    Jsonb(payload) if payload is not None else None,
-                    provider_timestamp, delivery_status, error_code, error_message,
-                ),
+                f"insert into public.messages ({', '.join(columns)}) "
+                f"values (app.current_tenant_id(), {placeholders}) "
+                f"returning {returning}",
+                tuple(parameters),
             )
         except ServiceError:
             raise
-        except Exception as error:  # noqa: BLE001 - translate unique violation
+        except Exception as error:  # noqa: BLE001 - translate expected failures
+            constraint = getattr(getattr(error, "diag", None), "constraint_name", "") or ""
             message = str(error)
-            if "messages_provider_message_unique" in message:
+            if "reply_to_provider_message_id" in message and "does not exist" in message:
+                # 0035 has not been applied to this database yet.
+                raise SchemaOutOfDateError() from error
+            if type(error).__name__ == "UndefinedColumn":
+                raise SchemaOutOfDateError() from error
+            if "messages_outbound_reply_unique" in constraint or "messages_outbound_reply_unique" in message:
+                raise DuplicateReplyError() from error
+            if "messages_provider_message_unique" in constraint or "messages_provider_message_unique" in message:
                 raise ServiceError(
                     "A message with this provider message id already exists.", 409
                 ) from error
             raise ServiceError(f"Failed to save message: {message}", 500) from error
         row = cursor.fetchone()
         return _row_to_dict(cursor, row)
+
+
+def find_outbound_reply(
+    settings: Settings,
+    tenant_id: str,
+    channel_id: str,
+    inbound_provider_message_id: str,
+) -> dict[str, Any] | None:
+    """The outbound row recorded for one inbound message, if any.
+
+    ``provider_message_id`` being set means the reply reached Meta. It being null means an
+    earlier attempt recorded the intent but no successful send was recorded: the ambiguous
+    case, which is never automatically resent for a non-repeatable reply.
+    """
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            """
+            select id, tenant_id, channel_id, conversation_id, direction, sender_type,
+                   provider_message_id, message_type, body_text, payload,
+                   provider_timestamp, received_at, delivery_status,
+                   error_code, error_message, reply_to_provider_message_id,
+                   created_at, updated_at
+            from public.messages
+            where tenant_id = app.current_tenant_id()
+              and channel_id = %s
+              and direction = 'outbound'
+              and reply_to_provider_message_id = %s
+            """,
+            (channel_id, inbound_provider_message_id),
+        )
+        return _row_to_dict(cursor, cursor.fetchone())
+
+
+def mark_message_sent(
+    settings: Settings,
+    tenant_id: str,
+    message_id: str,
+    provider_message_id: str,
+) -> None:
+    """Attach the provider's wamid and mark the outbound row as sent."""
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            """
+            update public.messages
+            set provider_message_id = %s,
+                delivery_status = 'sent',
+                error_code = null,
+                error_message = null
+            where id = %s and tenant_id = app.current_tenant_id()
+            """,
+            (provider_message_id, message_id),
+        )
+
+
+def mark_message_failed(
+    settings: Settings,
+    tenant_id: str,
+    message_id: str,
+    *,
+    error_code: str | None,
+    error_message: str | None,
+) -> None:
+    """Record a failed send on the outbound row, keeping Meta's own diagnostic fields."""
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            """
+            update public.messages
+            set delivery_status = 'failed',
+                error_code = %s,
+                error_message = %s
+            where id = %s and tenant_id = app.current_tenant_id()
+            """,
+            (
+                (error_code or "")[:40] or None,
+                (error_message or "")[:500] or None,
+                message_id,
+            ),
+        )
+
+
+def update_delivery_status(
+    settings: Settings,
+    tenant_id: str,
+    *,
+    status: str,
+    provider_message_id: str | None = None,
+    row_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> int:
+    """Apply one delivery receipt. Returns the number of rows changed (0 or 1).
+
+    Status webhooks are neither ordered nor deduplicated, so the UPDATE allows only a
+    forward transition: null -> anything, sent -> anything, failed -> delivered/read,
+    delivered -> read. ``read`` is terminal, and ``failed`` arriving after a success is
+    ignored because the message demonstrably arrived.
+
+    Matching is by wamid where available, otherwise by the outbound row id sent as
+    ``biz_opaque_callback_data``. Rows are never created here: an unknown id is a no-op.
+    """
+    if status not in ("sent", "delivered", "read", "failed"):
+        return 0
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            """
+            update public.messages
+            set delivery_status = %s,
+                error_code = coalesce(%s, error_code),
+                error_message = coalesce(%s, error_message)
+            where tenant_id = app.current_tenant_id()
+              and (
+                    (%s::text is not null and provider_message_id = %s::text)
+                 or (%s::uuid is not null and id = %s::uuid)
+              )
+              and (
+                    delivery_status is null
+                 or delivery_status = 'sent'
+                 or (delivery_status = 'failed' and %s in ('delivered', 'read'))
+                 or (delivery_status = 'delivered' and %s = 'read')
+              )
+            """,
+            (
+                status,
+                (error_code or "")[:40] or None,
+                (error_message or "")[:500] or None,
+                provider_message_id, provider_message_id,
+                row_id, row_id,
+                status, status,
+            ),
+        )
+        return cursor.rowcount
 
 
 def list_messages(

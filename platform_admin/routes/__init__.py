@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import io
 import time
+import uuid
 from datetime import datetime
 
 from flask import (
@@ -68,12 +69,31 @@ def whatsapp_webhook():
         raw_body, request.headers.get("X-Hub-Signature-256"), settings.whatsapp_app_secret
     ):
         return jsonify(ok=False, error="Invalid webhook signature."), 403
+    payload = None
     try:
-        event = whatsapp_service.parse_event(request.get_json(silent=True))
+        payload = request.get_json(silent=True)
+        event = whatsapp_service.parse_event(payload)
     except (TypeError, ValueError):
         event = None
     if event is None:
+        # A delivery-status webhook describes a message we sent. It carries no customer
+        # message id, so it is never claimed in whatsapp_webhook_events; applying it is
+        # idempotent instead (see customers.update_delivery_status).
+        statuses = whatsapp_service.parse_status_events(payload)
+        if statuses:
+            _apply_delivery_statuses(settings, statuses)
+            return jsonify(ok=True, statuses=len(statuses))
         return jsonify(ok=True, ignored=True)
+    if event["kind"] != "text":
+        # Interactive replies are typed but not routed yet: menus are disabled, so nothing
+        # this platform sent can produce a tap. Acknowledge and ignore, exactly as an
+        # unsupported message behaved before typing existed.
+        logger.info(
+            "Interactive inbound acknowledged without routing channel=%s action_type=%s",
+            event["phone_number_id"],
+            event["action_type"],
+        )
+        return jsonify(ok=True, ignored=True, kind=event["kind"])
     channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
     if channel is None:
         return jsonify(ok=False, error="Unknown or inactive channel."), 404
@@ -169,16 +189,117 @@ def whatsapp_webhook():
             )
             handover_reply = handover_service.safe_reply(response)
         reply_text = handover_reply or response.text
-        outbound_id = whatsapp_service.send_text(
-            settings,
-            phone_number_id=event["phone_number_id"],
-            tenant_id=tenant_id,
-            credentials_ref=channel.get("credentials_ref"),
-            recipient=customer_key,
-            text=reply_text,
-        )
-        # Persist the outbound message only after a successful send.
+
+        # Record the intent to reply BEFORE sending. The partial unique index on
+        # (tenant_id, channel_id, reply_to_provider_message_id) is what makes a second
+        # outbound row for the same inbound message impossible, so a redelivery cannot
+        # produce a duplicate reply even if the claim table is ever bypassed.
+        outbox_row = None
+        outbox_supported = True
         if conversation:
+            try:
+                outbox_row = customer_service.save_message(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]),
+                    direction="outbound",
+                    sender_type="assistant",
+                    message_type="text",
+                    body_text=reply_text,
+                    payload={"text": reply_text},
+                    reply_to_provider_message_id=event["message_id"],
+                )
+            except customer_service.DuplicateReplyError:
+                existing = customer_service.find_outbound_reply(
+                    settings, tenant_id, channel_id, event["message_id"]
+                )
+                already_sent = (existing or {}).get("provider_message_id")
+                if already_sent:
+                    # The reply was already sent for this inbound message. Finish the
+                    # bookkeeping without sending a second one.
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "processed",
+                        response_message_id=str(already_sent),
+                    )
+                    return jsonify(
+                        ok=True, message_id=str(already_sent), duplicate_reply=True
+                    )
+                # Ambiguous: an earlier attempt recorded the reply but we never saw a
+                # successful send response. A free-form reply is not repeatable, so it is
+                # never resent automatically. Meta's status webhook resolves the row if
+                # the message did arrive (matched by the outbox row id).
+                logger.error(
+                    "Ambiguous outbound reply, not resending tenant=%s message_id=%s",
+                    tenant_id,
+                    event["message_id"],
+                )
+                whatsapp_service.update_event(
+                    settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+                )
+                return jsonify(ok=True, ambiguous=True)
+            except customer_service.SchemaOutOfDateError:
+                # Migration 0035 has not been applied here. Keep the pre-0035 behaviour
+                # (persist the outbound row after the send) instead of losing history.
+                outbox_supported = False
+                logger.warning(
+                    "Outbound correlation columns are absent; using pre-0035 persistence. "
+                    "Apply migration 0035 to enable reply correlation."
+                )
+            except Exception as error:  # noqa: BLE001 - never silence the bot
+                logger.error(
+                    "Outbound intent persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+        try:
+            outbound_id = whatsapp_service.send_text(
+                settings,
+                phone_number_id=event["phone_number_id"],
+                tenant_id=tenant_id,
+                credentials_ref=channel.get("credentials_ref"),
+                recipient=customer_key,
+                text=reply_text,
+            )
+        except ServiceError as error:
+            if outbox_row:
+                try:
+                    customer_service.mark_message_failed(
+                        settings,
+                        tenant_id,
+                        str(outbox_row["id"]),
+                        error_code=getattr(error, "provider_code", None)
+                        or type(error).__name__,
+                        error_message=getattr(error, "provider_message", None)
+                        or error.message,
+                    )
+                except Exception as mark_error:  # noqa: BLE001 - diagnostic only
+                    logger.error(
+                        "Failed-send recording failed tenant=%s error=%s",
+                        tenant_id,
+                        type(mark_error).__name__,
+                    )
+            raise
+        if outbox_row:
+            try:
+                customer_service.mark_message_sent(
+                    settings, tenant_id, str(outbox_row["id"]), outbound_id
+                )
+            except Exception as error:  # noqa: BLE001 - the reply already reached Meta
+                # Losing the wamid is survivable: the status webhook also carries the
+                # outbox row id, which is how the row is reconciled.
+                logger.error(
+                    "Outbound wamid persistence failed tenant=%s wamid=%s error=%s",
+                    tenant_id,
+                    outbound_id,
+                    type(error).__name__,
+                )
+        elif not outbox_supported and conversation:
+            # Pre-0035 schema: preserve the original behaviour of recording the outbound
+            # message after a successful send. Correlation is unavailable, history is not.
             try:
                 customer_service.save_message(
                     settings,
@@ -193,12 +314,20 @@ def whatsapp_webhook():
                     payload={"text": reply_text},
                     delivery_status="sent",
                 )
+            except Exception as error:  # noqa: BLE001 - non-fatal
+                logger.error(
+                    "Outbound message persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+        if conversation:
+            try:
                 customer_service.update_conversation_activity(
                     settings, tenant_id, str(conversation["id"])
                 )
             except Exception as error:  # noqa: BLE001 - non-fatal
                 logger.error(
-                    "Outbound message persistence failed tenant=%s error=%s",
+                    "Conversation activity update failed tenant=%s error=%s",
                     tenant_id,
                     type(error).__name__,
                 )
@@ -212,7 +341,11 @@ def whatsapp_webhook():
             settings, tenant_id, customer_key, history
         )
         whatsapp_service.update_event(
-            settings, tenant_id, event["message_id"], "processed"
+            settings,
+            tenant_id,
+            event["message_id"],
+            "processed",
+            response_message_id=outbound_id,
         )
         return jsonify(ok=True, message_id=outbound_id)
     except ServiceError as error:
@@ -228,6 +361,47 @@ def whatsapp_webhook():
             "WhatsApp webhook processing failed type=%s", type(error).__name__
         )
         return jsonify(ok=False, error="WhatsApp message processing failed."), 502
+
+
+def _apply_delivery_statuses(settings, statuses: list[dict[str, str]]) -> None:
+    """Apply delivery receipts to the outbound rows they refer to.
+
+    Delivery is Meta's own signal, so this never creates a row and never fails the
+    webhook: an unknown wamid or channel is logged and ignored. Matching is by wamid
+    first, then by the outbox row id echoed back as ``biz_opaque_callback_data``, which
+    is what resolves a send whose HTTP response we never saw.
+    """
+    for item in statuses:
+        channel = whatsapp_service.resolve_channel(settings, item["phone_number_id"])
+        if channel is None:
+            logger.warning("Delivery status for an unknown channel was ignored.")
+            continue
+        row_id = None
+        callback = item.get("biz_opaque_callback_data") or ""
+        if callback:
+            try:
+                row_id = str(uuid.UUID(callback))
+            except (ValueError, AttributeError, TypeError):
+                row_id = None
+        try:
+            changed = customer_service.update_delivery_status(
+                settings,
+                str(channel["tenant_id"]),
+                status=item["status"],
+                provider_message_id=item["provider_message_id"],
+                row_id=row_id,
+                error_code=item.get("error_code") or None,
+                error_message=item.get("error_message") or None,
+            )
+        except Exception as error:  # noqa: BLE001 - never fail a status webhook
+            logger.error(
+                "Delivery status update failed tenant=%s error=%s",
+                str(channel["tenant_id"]),
+                type(error).__name__,
+            )
+            continue
+        if not changed:
+            logger.info("Delivery status matched no message and was ignored.")
 
 
 # ----------------------------------------------------------------- customers
