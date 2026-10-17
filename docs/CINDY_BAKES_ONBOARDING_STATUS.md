@@ -319,6 +319,38 @@ production variable is a separate decision): `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_
 | Registered test number for end-to-end webhook verification | **not supplied** |
 | All of the above in the **Railway** service environment | **DONE** — set, redeploy verified healthy |
 
+### The last two unknowns, now closed
+
+Using the app secret as a credential (a standard `client_credentials` exchange, no asset
+created, no message sent):
+
+```text
+client_credentials exchange for app 28834141379522438
+  -> RESULT: the supplied app secret DOES belong to app 28834141379522438
+
+GET /28834141379522438/subscriptions
+  -> { "object": "whatsapp_business_account",
+       "callback_url": "https://saas-project-production-cbf1.up.railway.app/webhooks/whatsapp",
+       "active": true,
+       "fields": [ { "name": "messages", "version": "v26.0" } ] }
+```
+
+And the verification handshake, performed against the live endpoint exactly as Meta does it:
+
+```text
+live handshake, correct token : HTTP 200 body='CHALLENGE-12345'
+live handshake, wrong token   : HTTP 403
+live handshake, empty token   : HTTP 403
+```
+
+So Meta is posting `messages` to **our** deployment, with an **active** subscription, and the
+app secret used for `X-Hub-Signature-256` belongs to that same app. Every configured link in
+the inbound chain now checks out.
+
+What remains is not configuration but *observation*: no real event has arrived yet, so the
+inbound→AI→outbound loop has never actually executed.
+
+
 ### What is verified, and what is still NOT
 
 | Claim | Status |
@@ -330,8 +362,12 @@ production variable is a separate decision): `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_
 | The WABA is `APPROVED` and owns exactly this number | **VERIFIED** |
 | Template inventory | **VERIFIED** — only `hello_world` exists |
 | An app is subscribed to the WABA | **VERIFIED** — app `28834141379522438` |
-| The supplied app secret belongs to that subscribed app | **NOT verified** — needs the App dashboard; if wrong, every webhook is rejected |
-| Meta's webhook **callback URL** points at this deployment | **NOT verified** — not readable with a user token |
+| The supplied app secret belongs to that subscribed app | **VERIFIED** — a `client_credentials` exchange for app `28834141379522438` succeeded, so signatures will validate |
+| Meta's webhook **callback URL** points at this deployment | **VERIFIED** — active subscription: `https://saas-project-production-cbf1.up.railway.app/webhooks/whatsapp`, object `whatsapp_business_account`, field `messages` at `v26.0` |
+| The `GET` verification handshake succeeds | **VERIFIED** — correct token → `200` echoing the challenge; wrong/empty token → `403` |
+| Inbound signature verification works against a real Meta signature | **NOT verified** — proven *capable* (secret matches, handshake passes) but no real event has arrived |
+| Outbound delivery works | **NOT verified** — send gate is on and the token authenticates, but no message has been sent |
+| Any real message has been sent or received | **NO — none** (customers 0, conversations 0, messages 0, webhook events 0, orders 0) |
 | Inbound signature verification works against a real Meta signature | **NOT verified** — no real webhook has arrived |
 | Outbound delivery works | **NOT verified** — send gate off; sending a test would message a real customer |
 | Any real message has been sent or received | **NO — none** |
@@ -583,7 +619,10 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | WhatsApp credentials (`APP_SECRET`, `VERIFY_TOKEN`, tenant token) | **PASS** — set locally *and* in the Railway production service |
 | Outbound sending enabled | **ENABLED** on explicit authorisation (production redeployed, verified healthy) |
 | Production service live | **PASS** — `https://saas-project-production-cbf1.up.railway.app/login` → HTTP 200 |
-| End-to-end real-provider test (inbound webhook / outbound delivery) | **NOT PERFORMED** — needs a registered test number |
+| Meta webhook wired to this deployment (active, `messages`, v26.0) | **PASS** — read from the app's own subscription |
+| App secret matches the subscribed app `28834141379522438` | **PASS** — proven by a successful credential exchange |
+| Verification handshake | **PASS** — correct token → 200 with challenge; wrong → 403 |
+| End-to-end real message (inbound → AI → outbound) | **NOT PERFORMED** — no message has been sent or received; the loop has never run |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
 
