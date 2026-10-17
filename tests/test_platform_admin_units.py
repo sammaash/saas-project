@@ -380,6 +380,25 @@ class RequiredSchemaTests(unittest.TestCase):
         self.assertIn("sku", required["public.product_variants"])
         self.assertIn("public.quotations", required)
 
+    def test_the_contract_covers_the_handover_table_from_migration_0034(self):
+        self.assertIn("public.handover_requests", dict(REQUIRED_SCHEMA))
+
+    def test_startup_fails_closed_when_the_handover_table_is_missing(self):
+        tables = _complete_schema()
+        del tables["public.handover_requests"]
+        connection = _StubConnection(tables)
+        settings = Settings.from_env(dict(GOOD_ENV))
+        with patch("saas.db.connect", return_value=connection):
+            with self.assertRaises(ConfigError) as raised:
+                verify_database_schema(settings)
+        self.assertIn("public.handover_requests (table)", str(raised.exception))
+        self.assertTrue(connection.closed)
+
+    def test_startup_succeeds_when_the_handover_table_exists(self):
+        settings = Settings.from_env(dict(GOOD_ENV))
+        with patch("saas.db.connect", return_value=_StubConnection(_complete_schema())):
+            verify_database_schema(settings)
+
     def test_a_missing_table_is_reported(self):
         tables = _complete_schema()
         del tables["public.quotations"]

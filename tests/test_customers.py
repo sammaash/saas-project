@@ -118,13 +118,22 @@ class CustomerServiceValidationTests(unittest.TestCase):
 
 
 class RequiredSchemaContractTests(unittest.TestCase):
-    """The startup schema contract must include the 0033 tables."""
+    """The startup schema contract must include the 0033 and 0034 tables."""
 
     def test_new_tables_are_in_the_required_schema(self):
         required = dict(REQUIRED_SCHEMA)
-        for table in ("public.customers", "public.conversations", "public.messages"):
+        for table in (
+            "public.customers",
+            "public.conversations",
+            "public.messages",
+            "public.handover_requests",
+        ):
             with self.subTest(table=table):
                 self.assertIn(table, required)
+
+    def test_the_handover_table_is_required_by_existence_only(self):
+        """0034 creates the table in one atomic script, so no partial columns are possible."""
+        self.assertEqual(dict(REQUIRED_SCHEMA)["public.handover_requests"], ())
 
 
 class WebhookCustomerPersistenceTests(unittest.TestCase):

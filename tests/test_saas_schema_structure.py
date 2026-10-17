@@ -418,3 +418,37 @@ class ApplicationSchemaContractTests(SaasDatabaseTestCase):
         self.assertTrue(REQUIRED_SCHEMA, "the startup contract must not be empty")
         with psycopg.connect(test_database_url()) as conn:
             self.assertEqual(missing_schema_objects(conn), [])
+
+    def test_the_handover_table_and_its_idempotency_indexes_exist(self):
+        """REQUIRED_SCHEMA can only assert the table; the indexes carry its semantics.
+
+        Migration 0034 enforces duplicate protection with two unique indexes, not with
+        application code, so a database that has the table but not the indexes would accept
+        duplicate handovers silently. This asserts both, plus the two lookup indexes.
+        """
+        import psycopg
+
+        try:
+            from .saas_test_support import test_database_url
+        except ImportError:  # discovery inside the tests directory
+            from saas_test_support import test_database_url  # type: ignore[no-redef]
+
+        with psycopg.connect(test_database_url()) as conn, conn.cursor() as cursor:
+            cursor.execute("select to_regclass('public.handover_requests')")
+            self.assertIsNotNone(cursor.fetchone()[0], "migration 0034 is not applied")
+            cursor.execute(
+                "select indexname from pg_indexes "
+                "where schemaname = 'public' and tablename = 'handover_requests'"
+            )
+            present = {row[0] for row in cursor.fetchall()}
+
+        self.assertLessEqual(
+            {
+                "handover_requests_tenant_dedupe_unique",
+                "handover_requests_open_product_unique",
+                "handover_requests_tenant_status_idx",
+                "handover_requests_tenant_customer_idx",
+            },
+            present,
+            f"handover_requests is missing indexes: {sorted(present)}",
+        )
