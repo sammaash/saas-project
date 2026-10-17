@@ -21,6 +21,7 @@ from platform_admin.config import (
     ConfigError,
     Settings,
     missing_schema_objects,
+    project_refs,
     verify_database_schema,
 )
 from platform_admin.services import audit
@@ -430,6 +431,167 @@ class RequiredSchemaTests(unittest.TestCase):
         settings = Settings.from_env(dict(GOOD_ENV))
         with patch("saas.db.connect", return_value=_StubConnection(_complete_schema())):
             verify_database_schema(settings)
+
+
+class StagingEnvironmentGuardTests(unittest.TestCase):
+    """SAAS_ENVIRONMENT=staging must refuse any boot that could reach production.
+
+    The guard is inert unless staging is declared, so an existing deployment that has never
+    set SAAS_ENVIRONMENT keeps booting exactly as before -- that is asserted here too, because
+    a regression in that direction would break production on the next deploy.
+    """
+
+    PRODUCTION_REF = "prodref0000000000000"
+    STAGING_REF = "stagref0000000000000"
+
+    @staticmethod
+    def _pooled(role: str, ref: str) -> str:
+        return (
+            f"postgresql://{role}.{ref}:pw@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
+        )
+
+    def staging_env(self, **changes) -> dict[str, str]:
+        env = {
+            "PLATFORM_SECRET_KEY": "s" * 40,
+            "SUPABASE_URL": f"https://{self.STAGING_REF}.supabase.co",
+            "SUPABASE_ANON_KEY": _fake_jwt("anon"),
+            "SAAS_DATABASE_URL": self._pooled("app_backend", self.STAGING_REF),
+            "SAAS_PLATFORM_DATABASE_URL": self._pooled(
+                "saas_platform_admin", self.STAGING_REF
+            ),
+            "SAAS_ENVIRONMENT": "staging",
+            "SAAS_PRODUCTION_PROJECT_REF": self.PRODUCTION_REF,
+            "WHATSAPP_SEND_ENABLED": "0",
+        }
+        env.update(changes)
+        return {key: value for key, value in env.items() if value is not None}
+
+    # -- production behaviour is unchanged ------------------------------------
+    def test_an_undeclared_environment_still_boots_against_the_production_project(self):
+        settings = Settings.from_env(
+            self.staging_env(
+                SAAS_ENVIRONMENT=None,
+                SAAS_PRODUCTION_PROJECT_REF=None,
+                SUPABASE_URL=f"https://{self.PRODUCTION_REF}.supabase.co",
+                SAAS_DATABASE_URL=self._pooled("app_backend", self.PRODUCTION_REF),
+                SAAS_PLATFORM_DATABASE_URL=self._pooled(
+                    "saas_platform_admin", self.PRODUCTION_REF
+                ),
+                WHATSAPP_SEND_ENABLED=None,
+            )
+        )
+        self.assertEqual(settings.environment, "production")
+        self.assertFalse(settings.whatsapp_send_enabled)
+
+    def test_an_explicit_production_environment_skips_the_staging_checks(self):
+        settings = Settings.from_env(
+            self.staging_env(
+                SAAS_ENVIRONMENT="production",
+                SAAS_PRODUCTION_PROJECT_REF=None,
+                SAAS_DATABASE_URL=self._pooled("app_backend", self.PRODUCTION_REF),
+            )
+        )
+        self.assertEqual(settings.environment, "production")
+
+    # -- staging refuses production -------------------------------------------
+    def test_staging_boots_against_its_own_project(self):
+        settings = Settings.from_env(self.staging_env())
+        self.assertEqual(settings.environment, "staging")
+        self.assertFalse(settings.whatsapp_send_enabled, "sending stays off by default")
+
+    def test_staging_refuses_the_production_application_database(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=self._pooled("app_backend", self.PRODUCTION_REF)
+                )
+            )
+        self.assertIn("SAAS_DATABASE_URL", str(raised.exception))
+        self.assertIn(self.PRODUCTION_REF, str(raised.exception))
+
+    def test_staging_refuses_the_production_platform_database(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_PLATFORM_DATABASE_URL=self._pooled(
+                        "saas_platform_admin", self.PRODUCTION_REF
+                    )
+                )
+            )
+        self.assertIn("SAAS_PLATFORM_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_a_production_reference_in_the_direct_host_form(self):
+        with self.assertRaises(ConfigError):
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=(
+                        "postgresql://app_backend:pw@db."
+                        f"{self.PRODUCTION_REF}.supabase.co:5432/postgres"
+                    )
+                )
+            )
+
+    def test_staging_refuses_the_production_auth_project(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(SUPABASE_URL=f"https://{self.PRODUCTION_REF}.supabase.co")
+            )
+        self.assertIn("SUPABASE_URL", str(raised.exception))
+
+    def test_staging_requires_the_production_reference_to_be_named(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(self.staging_env(SAAS_PRODUCTION_PROJECT_REF=None))
+        self.assertIn("SAAS_PRODUCTION_PROJECT_REF", str(raised.exception))
+
+    # -- staging requires explicit WhatsApp and no owner credentials ----------
+    def test_staging_requires_an_explicit_sending_setting(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(self.staging_env(WHATSAPP_SEND_ENABLED=None))
+        self.assertIn("WHATSAPP_SEND_ENABLED", str(raised.exception))
+
+    def test_staging_accepts_sending_only_when_it_is_declared(self):
+        settings = Settings.from_env(self.staging_env(WHATSAPP_SEND_ENABLED="1"))
+        self.assertTrue(settings.whatsapp_send_enabled)
+
+    def test_staging_refuses_owner_credentials_on_the_web_service(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_OPERATOR_DATABASE_URL=f"postgresql://postgres:pw@db.{self.STAGING_REF}.supabase.co:5432/postgres"
+                )
+            )
+        self.assertIn("SAAS_OPERATOR_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_dev_mode_and_insecure_cookies(self):
+        for changes in (
+            {"PLATFORM_DEV_MODE": "1"},
+            {"PLATFORM_DEV_MODE": "1", "PLATFORM_INSECURE_COOKIES": "1"},
+        ):
+            with self.subTest(**changes), self.assertRaises(ConfigError):
+                Settings.from_env(self.staging_env(**changes))
+
+    def test_an_unknown_environment_is_rejected(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(self.staging_env(SAAS_ENVIRONMENT="qa"))
+        self.assertIn("SAAS_ENVIRONMENT", str(raised.exception))
+
+    # -- reference extraction --------------------------------------------------
+    def test_project_refs_reads_the_pooled_and_direct_forms(self):
+        self.assertIn(
+            self.STAGING_REF, project_refs(self._pooled("app_backend", self.STAGING_REF))
+        )
+        self.assertIn(
+            self.STAGING_REF,
+            project_refs(
+                f"postgresql://app_backend:pw@db.{self.STAGING_REF}.supabase.co:5432/postgres"
+            ),
+        )
+        self.assertIn(self.STAGING_REF, project_refs(f"https://{self.STAGING_REF}.supabase.co"))
+
+    def test_project_refs_ignores_a_local_database(self):
+        self.assertEqual(
+            project_refs("postgresql://app_backend:pw@localhost:5432/postgres"), set()
+        )
 
 
 class _AcceptAll(Authenticator):

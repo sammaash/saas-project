@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -21,6 +22,14 @@ REQUIRED_ENV = (
 )
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 FORBIDDEN_DB_USERS = frozenset({"service_role", "postgres", "supabase_admin"})
+
+#: Declared deployment environment. Absent means production, so an existing deployment that
+#: has never set it keeps booting exactly as before.
+ENVIRONMENTS = ("production", "staging")
+
+#: A Supabase project reference appears as a host label (``db.<ref>.supabase.co``) or as the
+#: username suffix (``app_backend.<ref>``, the pooled connection form).
+_PROJECT_REF_RE = re.compile(r"^[a-z0-9]{16,32}$")
 
 
 class ConfigError(RuntimeError):
@@ -67,6 +76,92 @@ def _database_user(url: str) -> str | None:
         return None
 
 
+def project_refs(url: str | None) -> set[str]:
+    """Tokens in a DSN that could name a Supabase project.
+
+    A reference appears either as a host label (``db.<ref>.supabase.co``) or as the username
+    suffix (``app_backend.<ref>``, the pooled connection form). Pooled *hosts* such as
+    ``aws-0-eu-central-1.pooler.supabase.com`` carry it only in the username.
+
+    Returning every candidate -- rather than one guess -- means a staging boot fails closed
+    even if the operator recorded the production reference in a different shape from the one
+    the DSN happens to use.
+    """
+    if not url:
+        return set()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return set()
+
+    candidates = {
+        label.lower()
+        for label in (parts.hostname or "").split(".")
+        if _PROJECT_REF_RE.match(label.lower())
+    }
+    username = (parts.username or "").lower()
+    if "." in username:
+        suffix = username.rsplit(".", 1)[-1]
+        if _PROJECT_REF_RE.match(suffix):
+            candidates.add(suffix)
+    return candidates
+
+
+def _staging_guard(environ: dict[str, str], app_url: str, platform_url: str) -> str:
+    """Refuse a staging boot that could reach production. Returns the environment name.
+
+    Production is untouched: with ``SAAS_ENVIRONMENT`` unset (or ``production``) this returns
+    immediately, so no existing deployment changes behaviour. When staging is declared, the
+    checks are mandatory rather than advisory -- a staging process that resolves to the
+    production project must not start at all.
+    """
+    environment = (environ.get("SAAS_ENVIRONMENT") or "production").strip().lower()
+    if environment not in ENVIRONMENTS:
+        raise ConfigError(
+            "SAAS_ENVIRONMENT must be one of: " + ", ".join(ENVIRONMENTS) + "."
+        )
+    if environment != "staging":
+        return environment
+
+    production_ref = (environ.get("SAAS_PRODUCTION_PROJECT_REF") or "").strip().lower()
+    if not production_ref:
+        raise ConfigError(
+            "SAAS_PRODUCTION_PROJECT_REF is required when SAAS_ENVIRONMENT=staging. "
+            "Naming the production project is what allows the staging boot to prove it is "
+            "pointing somewhere else."
+        )
+
+    for name, url in (
+        ("SAAS_DATABASE_URL", app_url),
+        ("SAAS_PLATFORM_DATABASE_URL", platform_url),
+        ("SUPABASE_URL", environ.get("SUPABASE_URL") or ""),
+    ):
+        if production_ref in project_refs(url):
+            raise ConfigError(
+                f"{name} resolves to the production Supabase project ({production_ref}). "
+                "Staging must use its own project."
+            )
+
+    if not (environ.get("WHATSAPP_SEND_ENABLED") or "").strip():
+        raise ConfigError(
+            "WHATSAPP_SEND_ENABLED must be set explicitly when SAAS_ENVIRONMENT=staging "
+            "(use 0 unless a dedicated staging test number is configured)."
+        )
+
+    if (environ.get("SAAS_OPERATOR_DATABASE_URL") or "").strip():
+        raise ConfigError(
+            "SAAS_OPERATOR_DATABASE_URL must not be present on the staging web service. "
+            "Run migrations and bootstrap_platform_admin.py from an operator shell instead."
+        )
+
+    if _flag(environ, "PLATFORM_DEV_MODE") or _flag(environ, "PLATFORM_INSECURE_COOKIES"):
+        raise ConfigError(
+            "PLATFORM_DEV_MODE and PLATFORM_INSECURE_COOKIES must be 0 when "
+            "SAAS_ENVIRONMENT=staging."
+        )
+    return environment
+
+
 @dataclass(frozen=True)
 class Settings:
     secret_key: str
@@ -85,6 +180,9 @@ class Settings:
     whatsapp_app_secret: str | None = None
     whatsapp_graph_api_version: str = "v21.0"
     whatsapp_send_enabled: bool = False
+    #: ``production`` unless ``SAAS_ENVIRONMENT`` declares otherwise. Only ``staging`` adds
+    #: the isolation checks in :func:`_staging_guard`.
+    environment: str = "production"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -109,6 +207,12 @@ class Settings:
         for name in ("SAAS_DATABASE_URL", "SAAS_PLATFORM_DATABASE_URL"):
             if (_database_user(environ[name]) or "").lower().split(".")[0] in FORBIDDEN_DB_USERS:
                 raise ConfigError(f"{name} must use the dedicated role, not a privileged or service_role login.")
+
+        # Refuses a staging boot that could reach production. Inert unless SAAS_ENVIRONMENT
+        # says staging, so an existing production deployment boots exactly as before.
+        environment = _staging_guard(
+            environ, environ["SAAS_DATABASE_URL"], environ["SAAS_PLATFORM_DATABASE_URL"]
+        )
 
         try:
             session_minutes = int(environ.get("PLATFORM_SESSION_MINUTES", "60"))
@@ -139,6 +243,7 @@ class Settings:
                 environ.get("WHATSAPP_GRAPH_API_VERSION", "v21.0").strip() or "v21.0"
             ),
             whatsapp_send_enabled=_flag(environ, "WHATSAPP_SEND_ENABLED"),
+            environment=environment,
         )
 
 
