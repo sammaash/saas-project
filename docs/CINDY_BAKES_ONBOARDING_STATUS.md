@@ -572,6 +572,18 @@ and I will confirm the live response.
    *"I can't see the details of the order you just placed"*, so the draft-order tool path is
    not working end to end. This is the next defect to fix.
 
+   **Investigated and ruled out:** the claim that only numbers the business had contacted first
+   could talk to the bot. There is **no allowlist, no first-contact requirement and no
+   customer-existence gate** in the inbound path — `get_or_create_customer` and
+   `get_or_create_conversation` both create rows on demand, and persistence failures are
+   non-fatal (lines 117–122) so they cannot silence a reply. Live evidence agrees: the inbound
+   path created the customer row for `254723595334` at `05:02:10`, the exact timestamp of that
+   number's first-ever message. The correlation was confounded — every number that later
+   "worked" had also sent its first *successfully processed* message after this fix deployed,
+   and each had previously been messaged by the business as part of testing. `tests/test_whatsapp_inbound_flow.py`
+   pins the real behaviour with eight database-backed tests, including a first message from a
+   never-seen number.
+
 ## 9. Incident disclosure (staging)
 
 While running the full suite, `.env` pointed `SAAS_DATABASE_URL` at **staging**, and
