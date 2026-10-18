@@ -15,13 +15,13 @@ import unittest
 import urllib.error
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from platform_admin.app import create_app
 from platform_admin.config import Settings
 from platform_admin.services import customers as customer_service
 from platform_admin.services import whatsapp as whatsapp_service
-from platform_admin.services.validation import ServiceError
 
 PHONE_ID = "phone-test-1"
 SECRET = "app-secret"
@@ -139,6 +139,44 @@ class TypedInboundParsingTests(unittest.TestCase):
         event = whatsapp_service.parse_event(payload)
         self.assertEqual(event["message_id"], "wamid.first")
         self.assertEqual(event["text"], "one")
+
+    def test_text_after_a_tap_in_the_same_batch_is_not_lost(self):
+        payload = _interactive_payload()
+        payload["entry"][0]["changes"][0]["value"]["messages"].append({
+            "id": "wamid.in-after-tap",
+            "from": "254700000001",
+            "type": "text",
+            "text": {"body": "actually, a question"},
+        })
+        event = whatsapp_service.parse_event(payload)
+        self.assertEqual(event["kind"], "text")
+        self.assertEqual(event["text"], "actually, a question")
+
+    def test_text_before_a_tap_still_wins(self):
+        payload = _text_payload(body="first")
+        payload["entry"][0]["changes"][0]["value"]["messages"].append({
+            "id": "wamid.in-tap-2",
+            "from": "254700000001",
+            "type": "interactive",
+            "interactive": {"type": "button_reply",
+                            "button_reply": {"id": "v1:menu", "title": "Menu"}},
+        })
+        self.assertEqual(whatsapp_service.parse_event(payload)["kind"], "text")
+
+    def test_a_tap_in_one_entry_does_not_hide_text_in_another(self):
+        payload = _interactive_payload()
+        payload["entry"].append({"changes": [{"value": {
+            "metadata": {"phone_number_id": PHONE_ID},
+            "messages": [{
+                "id": "wamid.in-later-entry",
+                "from": "254700000001",
+                "type": "text",
+                "text": {"body": "later entry"},
+            }],
+        }}]})
+        event = whatsapp_service.parse_event(payload)
+        self.assertEqual(event["kind"], "text")
+        self.assertEqual(event["text"], "later entry")
 
 
 class StatusParsingTests(unittest.TestCase):
@@ -593,6 +631,38 @@ class MigrationContractTests(unittest.TestCase):
         for destructive in ("drop table", "drop column", "delete from", "truncate"):
             self.assertNotIn(destructive, sql)
         self.assertNotIn("update public.", sql)
+
+
+class SchemaDetectionTests(unittest.TestCase):
+    """F5: only the outbox column may be read as "0035 is missing"."""
+
+    @staticmethod
+    def _error(column, message=None):
+        error = RuntimeError(message or f'column "{column}" does not exist')
+        error.diag = SimpleNamespace(column_name=column)
+        return error
+
+    def test_the_outbox_column_is_recognised_by_its_diagnostic(self):
+        self.assertTrue(
+            customer_service.missing_outbox_column(
+                self._error("reply_to_provider_message_id")
+            )
+        )
+
+    def test_the_outbox_column_is_recognised_from_the_message(self):
+        error = RuntimeError(
+            'column "reply_to_provider_message_id" of relation "messages" does not exist'
+        )
+        self.assertTrue(customer_service.missing_outbox_column(error))
+
+    def test_an_unrelated_missing_column_is_not_treated_as_0035(self):
+        self.assertFalse(
+            customer_service.missing_outbox_column(self._error("payload"))
+        )
+
+    def test_a_missing_table_is_not_treated_as_0035(self):
+        error = RuntimeError('relation "public.messages" does not exist')
+        self.assertFalse(customer_service.missing_outbox_column(error))
 
 
 if __name__ == "__main__":

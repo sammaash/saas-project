@@ -109,12 +109,18 @@ def parse_event(payload: Any) -> dict[str, str] | None:
       * ``text``        -- ``text`` carries the (truncated) body.
       * ``interactive`` -- ``action_type``/``action_id``/``action_title`` describe the tap.
 
+    Text wins over a tap when both appear in one payload: a batch is delivered in order,
+    but dropping a typed message because a button event arrived first would lose a real
+    customer request. A tap is therefore remembered and returned only if the payload
+    contains no text at all.
+
     Anything else (media, reactions, unsupported interactive types) still returns None,
     which the route acknowledges and ignores exactly as before. A customer-visible
     fallback for unsupported messages is a separate, unapproved change.
     """
     if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
         return None
+    interactive_event: dict[str, str] | None = None
     for entry in payload.get("entry", []):
         if not isinstance(entry, dict):
             continue
@@ -158,14 +164,19 @@ def parse_event(payload: Any) -> dict[str, str] | None:
                         )
                         if action_id:
                             title = reply.get("title") if isinstance(reply, dict) else None
-                            return {
-                                **base,
-                                "kind": "interactive",
-                                "action_type": str(action_type),
-                                "action_id": action_id,
-                                "action_title": title[:200] if isinstance(title, str) else "",
-                            }
-    return None
+                            # Remember the first tap but keep scanning: a text message
+                            # later in the same batch must not be lost.
+                            if interactive_event is None:
+                                interactive_event = {
+                                    **base,
+                                    "kind": "interactive",
+                                    "action_type": str(action_type),
+                                    "action_id": action_id,
+                                    "action_title": (
+                                        title[:200] if isinstance(title, str) else ""
+                                    ),
+                                }
+    return interactive_event
 
 
 def parse_status_events(payload: Any) -> list[dict[str, str]]:
@@ -358,6 +369,11 @@ def send_text(
     plain text reply is byte-for-byte what it was before this parameter existed. When it
     is supplied, Meta echoes it back on the status webhook, which is how an outbound row
     can be reconciled even if this call's response was lost.
+
+    It is deliberately unused today. Meta's status-webhook reference documents the field
+    as present only when the message was sent with it, but the request-side schema could
+    not be confirmed for this Graph version, and a real send has not been made. See
+    docs/OUTBOUND_DELIVERY.md before wiring it up.
     """
     if not settings.whatsapp_send_enabled:
         raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
