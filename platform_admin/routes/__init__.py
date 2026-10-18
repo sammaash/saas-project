@@ -230,8 +230,9 @@ def whatsapp_webhook():
                     )
                 # Ambiguous: an earlier attempt recorded the reply but we never saw a
                 # successful send response. A free-form reply is not repeatable, so it is
-                # never resent automatically. Meta's status webhook resolves the row if
-                # the message did arrive (matched by the outbox row id).
+                # never resent automatically. The row is left for manual reconciliation
+                # (docs/OUTBOUND_DELIVERY.md): this code does not send
+                # biz_opaque_callback_data yet, so a receipt cannot identify it.
                 logger.error(
                     "Ambiguous outbound reply, not resending tenant=%s message_id=%s",
                     tenant_id,
@@ -289,8 +290,9 @@ def whatsapp_webhook():
                     settings, tenant_id, str(outbox_row["id"]), outbound_id
                 )
             except Exception as error:  # noqa: BLE001 - the reply already reached Meta
-                # Losing the wamid is survivable: the status webhook also carries the
-                # outbox row id, which is how the row is reconciled.
+                # The reply went out but its wamid was not recorded. Nothing repairs this
+                # automatically: receipts match on the wamid, and this code does not send
+                # biz_opaque_callback_data yet. See docs/OUTBOUND_DELIVERY.md.
                 logger.error(
                     "Outbound wamid persistence failed tenant=%s wamid=%s error=%s",
                     tenant_id,
@@ -327,7 +329,7 @@ def whatsapp_webhook():
                 )
             except Exception as error:  # noqa: BLE001 - non-fatal
                 logger.error(
-                    "Conversation activity update failed tenant=%s error=%s",
+                    "Conversation activity refresh failed tenant=%s error=%s",
                     tenant_id,
                     type(error).__name__,
                 )
@@ -367,9 +369,11 @@ def _apply_delivery_statuses(settings, statuses: list[dict[str, str]]) -> None:
     """Apply delivery receipts to the outbound rows they refer to.
 
     Delivery is Meta's own signal, so this never creates a row and never fails the
-    webhook: an unknown wamid or channel is logged and ignored. Matching is by wamid
-    first, then by the outbox row id echoed back as ``biz_opaque_callback_data``, which
-    is what resolves a send whose HTTP response we never saw.
+    webhook: an unknown wamid or channel is logged and ignored. Matching is by wamid,
+    falling back to the outbox row id only if a sender supplied it as
+    ``biz_opaque_callback_data``. No caller supplies it yet, so every receipt today is
+    matched by wamid, and an outbound row without one needs manual reconciliation
+    (see docs/OUTBOUND_DELIVERY.md).
     """
     for item in statuses:
         channel = whatsapp_service.resolve_channel(settings, item["phone_number_id"])
@@ -395,7 +399,7 @@ def _apply_delivery_statuses(settings, statuses: list[dict[str, str]]) -> None:
             )
         except Exception as error:  # noqa: BLE001 - never fail a status webhook
             logger.error(
-                "Delivery status update failed tenant=%s error=%s",
+                "Delivery status write failed tenant=%s error=%s",
                 str(channel["tenant_id"]),
                 type(error).__name__,
             )
