@@ -231,7 +231,14 @@ def _notify(
         return None
     except Exception as error:  # noqa: BLE001 - the reason is stored, not swallowed
         message = getattr(error, "message", None) or str(error)
-        return f"{type(error).__name__}: {message}"[:500]
+        # Keep the stored label stable. A more specific subclass (WhatsAppSendError) must
+        # not change text that staff already recognise in the handover view.
+        name = (
+            "ServiceError"
+            if isinstance(error, v.ServiceError)
+            else type(error).__name__
+        )
+        return f"{name}: {message}"[:500]
 
 
 def deliver(
