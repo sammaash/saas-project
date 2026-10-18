@@ -53,6 +53,26 @@ class SchemaOutOfDateError(ServiceError):
         super().__init__(message, 503)
 
 
+#: The only column that migration 0035 adds to ``messages``.
+OUTBOX_COLUMN = "reply_to_provider_message_id"
+
+
+def missing_outbox_column(error: Exception) -> bool:
+    """True only when PostgreSQL says *this* column is missing.
+
+    Deliberately narrow. An earlier version treated any ``UndefinedColumn`` as "0035 has
+    not been applied", which would have mislabelled an unrelated schema fault as a pending
+    migration -- and then retried the same broken statement through the legacy path. The
+    diagnostic column name is authoritative; the message substring is a fallback for
+    drivers or proxies that do not populate ``diag``.
+    """
+    diag = getattr(error, "diag", None)
+    if getattr(diag, "column_name", None) == OUTBOX_COLUMN:
+        return True
+    text = str(error)
+    return OUTBOX_COLUMN in text and "does not exist" in text
+
+
 # ---------------------------------------------------------------------------
 # Customers
 # ---------------------------------------------------------------------------
@@ -397,10 +417,8 @@ def save_message(
         except Exception as error:  # noqa: BLE001 - translate expected failures
             constraint = getattr(getattr(error, "diag", None), "constraint_name", "") or ""
             message = str(error)
-            if "reply_to_provider_message_id" in message and "does not exist" in message:
+            if missing_outbox_column(error):
                 # 0035 has not been applied to this database yet.
-                raise SchemaOutOfDateError() from error
-            if type(error).__name__ == "UndefinedColumn":
                 raise SchemaOutOfDateError() from error
             if "messages_outbound_reply_unique" in constraint or "messages_outbound_reply_unique" in message:
                 raise DuplicateReplyError() from error
