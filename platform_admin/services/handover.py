@@ -299,6 +299,72 @@ def deliver(
 
 
 
+def staff_assistance_text(notified: bool) -> str:
+    """The menu's answer for "Talk to Staff", chosen by what actually happened.
+
+    Unlike the product-handover wording, this must not promise a price or a product
+    decision; it only says whether the team was reached.
+    """
+    if notified:
+        return (
+            "I've let the team know you'd like to speak with someone. A member of staff "
+            "will reply here as soon as they can."
+        )
+    return (
+        "I've recorded your request, but I couldn't reach the team just now. Please try "
+        "again shortly, or reply MENU to go back."
+    )
+
+
+def request_staff_assistance(
+    settings: Settings,
+    *,
+    tenant_id: str,
+    channel: dict[str, Any],
+    phone_number_id: str,
+    customer_key: str,
+    customer: dict[str, Any] | None,
+    conversation: dict[str, Any] | None,
+    message_id: str,
+    settings_document: dict[str, Any],
+    business_name: str = "our team",
+) -> tuple[bool, str]:
+    """Record and deliver a "Talk to Staff" request from the menu.
+
+    Reuses the durable handover store and the same one-shot notification path as the AI
+    handover turn. The record is created first, so a delivery failure is stored as
+    ``failed`` and remains visible to staff instead of being lost.
+    """
+    record, _created = handover_store.create_request(
+        tenant_id,
+        wa_id=customer_key,
+        requested_product="Staff assistance requested from the WhatsApp menu",
+        dedupe_key=f"menu:{message_id}",
+        reason="customer_request",
+        details={"source": "whatsapp_menu"},
+        customer_id=str(customer["id"]) if customer and customer.get("id") else None,
+        conversation_id=(
+            str(conversation["id"]) if conversation and conversation.get("id") else None
+        ),
+        customer_name=(customer or {}).get("name"),
+        database_url=settings.app_database_url,
+    )
+    # A repeated tap for the same open, already-notified request must not page staff
+    # again. A pending/failed record still gets a delivery attempt.
+    if str(record.get("status") or "") == "notified" and not _created:
+        return True, staff_assistance_text(True)
+    notified = deliver(
+        settings,
+        tenant_id=tenant_id,
+        channel=channel,
+        phone_number_id=phone_number_id,
+        record=record,
+        settings_document=settings_document,
+        business_name=business_name,
+    )
+    return notified, staff_assistance_text(notified)
+
+
 def _context_turns(
     history: list[dict[str, Any]] | None, customer_message: str
 ) -> list[dict[str, str]]:

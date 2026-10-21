@@ -588,6 +588,66 @@ class SenderPayloadTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 502)
         self.assertEqual(caught.exception.provider_code, "131047")
         self.assertEqual(caught.exception.provider_message, "Re-engagement message")
+        self.assertEqual(caught.exception.http_status, 400)
+        self.assertFalse(caught.exception.ambiguous)
+
+    @patch("platform_admin.services.whatsapp.access_token", return_value="test-token")
+    @patch("platform_admin.services.whatsapp.urllib.request.urlopen")
+    def test_server_error_is_ambiguous(self, urlopen, token):
+        urlopen.side_effect = urllib.error.HTTPError(
+            "https://graph.facebook.com/v21.0/phone-test-1/messages",
+            500,
+            "Server Error",
+            {},
+            io.BytesIO(b'{"error":{"code":1,"message":"unknown"}}'),
+        )
+        settings = Settings(secret_key="s" * 40, whatsapp_send_enabled=True)
+        with self.assertRaises(whatsapp_service.WhatsAppSendError) as caught:
+            whatsapp_service.send_text(
+                settings,
+                phone_number_id=PHONE_ID,
+                tenant_id="tenant-1",
+                credentials_ref="tenants/tenant-1/whatsapp",
+                recipient="254700000001",
+                text="Hello",
+            )
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertEqual(caught.exception.http_status, 500)
+
+    @patch("platform_admin.services.whatsapp.access_token", return_value="test-token")
+    @patch("platform_admin.services.whatsapp.urllib.request.urlopen")
+    def test_transport_failure_is_ambiguous(self, urlopen, token):
+        urlopen.side_effect = urllib.error.URLError("timed out")
+        settings = Settings(secret_key="s" * 40, whatsapp_send_enabled=True)
+        with self.assertRaises(whatsapp_service.WhatsAppSendError) as caught:
+            whatsapp_service.send_text(
+                settings,
+                phone_number_id=PHONE_ID,
+                tenant_id="tenant-1",
+                credentials_ref="tenants/tenant-1/whatsapp",
+                recipient="254700000001",
+                text="Hello",
+            )
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertIsNone(caught.exception.http_status)
+
+    @patch("platform_admin.services.whatsapp.access_token", return_value="test-token")
+    @patch("platform_admin.services.whatsapp.urllib.request.urlopen")
+    def test_success_without_a_message_id_is_ambiguous(self, urlopen, token):
+        response = MagicMock()
+        response.read.return_value = b'{"messages":[]}'
+        urlopen.return_value.__enter__.return_value = response
+        settings = Settings(secret_key="s" * 40, whatsapp_send_enabled=True)
+        with self.assertRaises(whatsapp_service.WhatsAppSendError) as caught:
+            whatsapp_service.send_text(
+                settings,
+                phone_number_id=PHONE_ID,
+                tenant_id="tenant-1",
+                credentials_ref="tenants/tenant-1/whatsapp",
+                recipient="254700000001",
+                text="Hello",
+            )
+        self.assertTrue(caught.exception.ambiguous)
 
 
 class MigrationContractTests(unittest.TestCase):

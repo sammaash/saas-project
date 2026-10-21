@@ -463,6 +463,25 @@ class TenantAdmin:
             (order_number,),
         )
 
+    def get_order_by_number_for_whatsapp(
+        self, order_number: str, whatsapp_wa_id: str
+    ) -> dict[str, Any] | None:
+        """An order only when it belongs to this WhatsApp identity in this tenant.
+
+        The customer-facing menu must never confirm that an order number exists for
+        somebody else: a missing number and another customer's number return the same
+        ``None``. RLS confines the statement to the tenant; the wa_id predicate confines
+        it to the sender.
+        """
+        if not (whatsapp_wa_id or "").strip():
+            return None
+        return self._one(
+            "select * from public.orders "
+            "where order_number = %s and whatsapp_wa_id = %s "
+            "and tenant_id = app.current_tenant_id()",
+            (order_number, whatsapp_wa_id),
+        )
+
     def update_order(self, order_id: str, **values: Any) -> bool:
         """Update draft details. Column names come from a whitelist, never input."""
         allowed = (

@@ -32,6 +32,7 @@ from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
 from ..services import customers as customer_service
 from ..services import handover as handover_service
+from ..services import menu as menu_service
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -46,6 +47,259 @@ whatsapp_bp = Blueprint("whatsapp", __name__)
 
 GENERIC_LOGIN_ERROR = "Invalid email or password."
 logger = logging.getLogger("platform_admin.playground")
+
+
+def _send_menu_reply(
+    settings,
+    channel: dict,
+    phone_number_id: str,
+    tenant_id: str,
+    recipient: str,
+    reply: "menu_service.MenuReply",
+) -> "menu_service.MenuSendResult":
+    """Try the native shape, then fall back to text only when it is safe.
+
+    A definite rejection (4xx, builder error, sending disabled) means Meta did not accept
+    the interactive message, so a text fallback cannot duplicate it. A timeout, reset,
+    5xx or malformed response is *ambiguous*: the message may already be delivered, so no
+    fallback is attempted and the caller must record an uncertain outcome.
+    """
+    body = reply.body or reply.text
+    interactive = reply.kind in ("list", "buttons") and len(body) <= 1024
+    if interactive:
+        try:
+            if reply.kind == "list":
+                wamid = whatsapp_service.send_list(
+                    settings,
+                    phone_number_id=phone_number_id,
+                    tenant_id=tenant_id,
+                    credentials_ref=channel.get("credentials_ref"),
+                    recipient=recipient,
+                    body=body,
+                    button_text=reply.button_text,
+                    sections=list(reply.sections),
+                    header=reply.header,
+                    footer=reply.footer,
+                )
+            else:
+                wamid = whatsapp_service.send_buttons(
+                    settings,
+                    phone_number_id=phone_number_id,
+                    tenant_id=tenant_id,
+                    credentials_ref=channel.get("credentials_ref"),
+                    recipient=recipient,
+                    body=body,
+                    buttons=list(reply.buttons),
+                    header=reply.header,
+                    footer=reply.footer,
+                )
+            return menu_service.MenuSendResult("sent", wamid=wamid)
+        except whatsapp_service.WhatsAppSendError as error:
+            if error.ambiguous:
+                logger.warning(
+                    "Ambiguous interactive send; not resending tenant=%s kind=%s code=%s",
+                    tenant_id,
+                    reply.kind,
+                    error.provider_code or error.http_status,
+                )
+                return menu_service.MenuSendResult(
+                    "uncertain",
+                    error_code=error.provider_code or "ambiguous_send",
+                    error_message=(error.provider_message or "WhatsApp outcome unknown")[:500],
+                )
+            logger.warning(
+                "Interactive send rejected; using text tenant=%s kind=%s code=%s",
+                tenant_id,
+                reply.kind,
+                error.provider_code or error.http_status,
+            )
+        except (ServiceError, ValueError) as error:
+            logger.warning(
+                "Interactive send unavailable; using text tenant=%s kind=%s error=%s",
+                tenant_id,
+                reply.kind,
+                type(error).__name__,
+            )
+        except Exception as error:  # noqa: BLE001 - outcome is unknown; never resend
+            logger.exception(
+                "Unexpected interactive send failure tenant=%s kind=%s",
+                tenant_id,
+                reply.kind,
+            )
+            return menu_service.MenuSendResult(
+                "uncertain",
+                error_code="menu_send_exception",
+                error_message=type(error).__name__,
+            )
+    try:
+        wamid = whatsapp_service.send_text(
+            settings,
+            phone_number_id=phone_number_id,
+            tenant_id=tenant_id,
+            credentials_ref=channel.get("credentials_ref"),
+            recipient=recipient,
+            text=reply.text,
+        )
+        return menu_service.MenuSendResult("sent", wamid=wamid)
+    except whatsapp_service.WhatsAppSendError as error:
+        return menu_service.MenuSendResult(
+            "uncertain" if error.ambiguous else "failed",
+            error_code=error.provider_code
+            or ("ambiguous_send" if error.ambiguous else "menu_delivery_failed"),
+            error_message=(error.provider_message or type(error).__name__)[:500],
+        )
+    except ServiceError as error:
+        return menu_service.MenuSendResult(
+            "failed",
+            error_code=type(error).__name__,
+            error_message=str(getattr(error, "message", error))[:500],
+        )
+    except ValueError as error:
+        return menu_service.MenuSendResult(
+            "failed", error_code="invalid_text", error_message=str(error)[:500]
+        )
+    except Exception as error:  # noqa: BLE001 - outcome is unknown; never resend
+        logger.exception("Unexpected text send failure tenant=%s", tenant_id)
+        return menu_service.MenuSendResult(
+            "uncertain",
+            error_code="menu_send_exception",
+            error_message=type(error).__name__,
+        )
+
+
+def _record_menu_outbound(
+    settings,
+    tenant_id: str,
+    channel_id: str,
+    conversation_id: str | None,
+    inbound_message_id: str,
+    reply: "menu_service.MenuReply",
+) -> tuple[dict | None, str]:
+    """Record the outbound intent before sending, reusing the existing message service.
+
+    Returns ``(row, state)`` where state is one of:
+    ``new`` (safe to send), ``already_sent`` (do not send), ``ambiguous`` (do not send),
+    ``unavailable`` (could not record; send anyway, without delivery correlation).
+    """
+    if not conversation_id:
+        return None, "unavailable"
+    message_type = "interactive" if reply.kind in ("list", "buttons") else "text"
+    common = {
+        "direction": "outbound",
+        "sender_type": "assistant",
+        "message_type": message_type,
+        "body_text": reply.text,
+        "payload": {"menu": {"kind": reply.kind}},
+    }
+    try:
+        try:
+            row = customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                conversation_id,
+                reply_to_provider_message_id=inbound_message_id,
+                **common,
+            )
+        except customer_service.SchemaOutOfDateError:
+            # 0035 is not applied: keep the outbound row and receipts, lose only the
+            # inbound-reply correlation and the at-most-one-reply backstop.
+            logger.warning(
+                "0035 not applied; recording menu reply without correlation tenant=%s",
+                tenant_id,
+            )
+            row = customer_service.save_message(
+                settings, tenant_id, channel_id, conversation_id, **common
+            )
+        return row, "new"
+    except customer_service.DuplicateReplyError:
+        try:
+            existing = customer_service.find_outbound_reply(
+                settings, tenant_id, channel_id, inbound_message_id
+            )
+        except Exception as error:  # noqa: BLE001 - do not resend on unknown state
+            logger.error(
+                "Duplicate menu reply lookup failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            return None, "ambiguous"
+        if existing and existing.get("provider_message_id"):
+            return existing, "already_sent"
+        return existing, "ambiguous"
+    except Exception as error:  # noqa: BLE001 - never block a menu reply on bookkeeping
+        logger.error(
+            "Menu outbound intent failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+        return None, "unavailable"
+
+
+def _finalize_menu_outbound(
+    settings,
+    tenant_id: str,
+    row: dict | None,
+    result: "menu_service.MenuSendResult",
+) -> None:
+    if not row or not row.get("id"):
+        return
+    try:
+        if result.outcome == "sent" and result.wamid:
+            customer_service.mark_message_sent(
+                settings, tenant_id, str(row["id"]), result.wamid
+            )
+            return
+        customer_service.mark_message_failed(
+            settings,
+            tenant_id,
+            str(row["id"]),
+            error_code=result.error_code
+            or ("ambiguous_send" if result.outcome == "uncertain" else "menu_delivery_failed"),
+            error_message=(
+                result.error_message
+                or (
+                    "WhatsApp outcome unknown"
+                    if result.outcome == "uncertain"
+                    else "Menu delivery failed"
+                )
+            )[:500],
+        )
+    except Exception as error:  # noqa: BLE001 - diagnostic only
+        logger.error(
+            "Menu outbound bookkeeping failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
+
+def _finalize_menu_event(
+    settings,
+    tenant_id: str,
+    inbound_message_id: str,
+    result: "menu_service.MenuSendResult",
+) -> None:
+    if result.outcome == "sent" and result.wamid:
+        whatsapp_service.update_event(
+            settings,
+            tenant_id,
+            inbound_message_id,
+            "processed",
+            response_message_id=result.wamid,
+        )
+        return
+    if result.outcome == "uncertain":
+        whatsapp_service.update_event(
+            settings, tenant_id, inbound_message_id, "failed", "menu_delivery_uncertain"
+        )
+        return
+    whatsapp_service.update_event(
+        settings,
+        tenant_id,
+        inbound_message_id,
+        "failed",
+        result.error_code or "menu_delivery_failed",
+    )
 
 
 @whatsapp_bp.get("/webhooks/whatsapp")
@@ -85,15 +339,114 @@ def whatsapp_webhook():
             return jsonify(ok=True, statuses=len(statuses))
         return jsonify(ok=True, ignored=True)
     if event["kind"] != "text":
-        # Interactive replies are typed but not routed yet: menus are disabled, so nothing
-        # this platform sent can produce a tap. Acknowledge and ignore, exactly as an
-        # unsupported message behaved before typing existed.
-        logger.info(
-            "Interactive inbound acknowledged without routing channel=%s action_type=%s",
-            event["phone_number_id"],
-            event["action_type"],
+        action_id = str(event.get("action_id") or "")
+        if not action_id.startswith(menu_service.ACTION_PREFIX + "."):
+            # Not one of our menu ids (or menus are off): acknowledge and ignore, exactly
+            # as an unsupported interactive message behaved before menus existed.
+            logger.info(
+                "Interactive inbound acknowledged without routing channel=%s action_type=%s",
+                event["phone_number_id"],
+                event["action_type"],
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
+        if channel is None:
+            return jsonify(ok=False, error="Unknown or inactive channel."), 404
+        tenant_id = str(channel["tenant_id"])
+        channel_id = str(channel["channel_id"])
+        document = menu_service.load_document(settings, tenant_id)
+        parsed = menu_service.parse_action(action_id)
+        if not menu_service.is_enabled(document) or (
+            parsed.selection is None and not parsed.expired
+        ):
+            logger.info(
+                "Interactive menu ignored (disabled or unknown) tenant=%s", tenant_id
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        if not whatsapp_service.claim_event(
+            settings, tenant_id, channel_id, event["message_id"], event["customer_key"]
+        ):
+            return jsonify(ok=True, duplicate=True)
+
+        customer = None
+        conversation = None
+        try:
+            customer = customer_service.get_or_create_customer(
+                settings, tenant_id, channel_id, event["customer_key"]
+            )
+            conversation = customer_service.get_or_create_conversation(
+                settings, tenant_id, customer["id"], channel_id
+            )
+            customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                str(conversation["id"]),
+                direction="inbound",
+                sender_type="customer",
+                provider_message_id=event["message_id"],
+                message_type="interactive",
+                body_text=event.get("action_title") or None,
+                payload=event,
+            )
+        except Exception as error:  # noqa: BLE001 - never block the acknowledgement
+            logger.error(
+                "Interactive persistence failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+
+        ctx = menu_service.MenuContext(
+            settings=settings,
+            tenant_id=tenant_id,
+            wa_id=event["customer_key"],
+            document=document,
+            channel=channel,
+            phone_number_id=event["phone_number_id"],
+            customer=customer,
+            conversation=conversation,
+            message_id=event["message_id"],
         )
-        return jsonify(ok=True, ignored=True, kind=event["kind"])
+        reply = menu_service.handle_action(ctx, action_id)
+        if reply is None:
+            whatsapp_service.update_event(
+                settings, tenant_id, event["message_id"], "failed", "menu_no_reply"
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        outbox_row, outbox_state = _record_menu_outbound(
+            settings,
+            tenant_id,
+            channel_id,
+            str(conversation["id"]) if conversation else None,
+            event["message_id"],
+            reply,
+        )
+        if outbox_state == "already_sent":
+            existing = (outbox_row or {}).get("provider_message_id")
+            whatsapp_service.update_event(
+                settings,
+                tenant_id,
+                event["message_id"],
+                "processed",
+                response_message_id=existing,
+            )
+            return jsonify(ok=True, menu=True, duplicate_reply=True)
+        if outbox_state == "ambiguous":
+            whatsapp_service.update_event(
+                settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+            )
+            return jsonify(ok=True, ambiguous=True)
+        result = _send_menu_reply(
+            settings,
+            channel,
+            event["phone_number_id"],
+            tenant_id,
+            event["customer_key"],
+            reply,
+        )
+        _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
+        _finalize_menu_event(settings, tenant_id, event["message_id"], result)
+        return jsonify(ok=True, menu=True, delivery=result.outcome)
     channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
     if channel is None:
         return jsonify(ok=False, error="Unknown or inactive channel."), 404
@@ -142,6 +495,63 @@ def whatsapp_webhook():
             tenant_id,
             type(error).__name__,
         )
+
+    # Explicit menu commands only: "menu", "order <number>" or an exact option name.
+    # Ordinary chat never reads settings and never leaves the existing AI path.
+    if menu_service.is_menu_command(event["text"]):
+        document = menu_service.load_document(settings, tenant_id)
+        if menu_service.is_enabled(document):
+            menu_ctx = menu_service.MenuContext(
+                settings=settings,
+                tenant_id=tenant_id,
+                wa_id=customer_key,
+                document=document,
+                channel=channel,
+                phone_number_id=event["phone_number_id"],
+                customer=customer,
+                conversation=conversation,
+                message_id=event["message_id"],
+            )
+            try:
+                menu_reply = menu_service.handle_text(menu_ctx, event["text"])
+            except Exception:  # noqa: BLE001 - a menu bug must not break the AI path
+                logger.exception("Menu text handling failed tenant=%s", tenant_id)
+                menu_reply = None
+            if menu_reply is not None:
+                outbox_row, outbox_state = _record_menu_outbound(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]) if conversation else None,
+                    event["message_id"],
+                    menu_reply,
+                )
+                if outbox_state == "already_sent":
+                    existing = (outbox_row or {}).get("provider_message_id")
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "processed",
+                        response_message_id=existing,
+                    )
+                    return jsonify(ok=True, menu=True, duplicate_reply=True)
+                if outbox_state == "ambiguous":
+                    whatsapp_service.update_event(
+                        settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+                    )
+                    return jsonify(ok=True, ambiguous=True)
+                result = _send_menu_reply(
+                    settings,
+                    channel,
+                    event["phone_number_id"],
+                    tenant_id,
+                    customer_key,
+                    menu_reply,
+                )
+                _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
+                _finalize_menu_event(settings, tenant_id, event["message_id"], result)
+                return jsonify(ok=True, menu=True, delivery=result.outcome)
 
     try:
         history = whatsapp_service.conversation_history(

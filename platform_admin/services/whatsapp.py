@@ -57,10 +57,17 @@ class WhatsAppSendError(ServiceError):
         *,
         provider_code: str | None = None,
         provider_message: str | None = None,
+        http_status: int | None = None,
+        ambiguous: bool = False,
     ):
         super().__init__(message, status)
         self.provider_code = provider_code
         self.provider_message = provider_message
+        #: HTTP status when Meta answered at all. None for transport failures.
+        self.http_status = http_status
+        #: True when the message may have been accepted even though this call failed.
+        #: Callers must never retry automatically in that case.
+        self.ambiguous = ambiguous
 
 
 def verify_signature(raw_body: bytes, header: str | None, app_secret: str | None) -> bool:
@@ -353,6 +360,184 @@ def _http_error_details(error: urllib.error.HTTPError) -> tuple[str | None, str 
     return code_text, message.strip()[:PROVIDER_ERROR_TEXT_MAX].replace("\x00", "")
 
 
+def _interactive_header(header: str | None, footer: str | None) -> dict[str, Any]:
+    envelope: dict[str, Any] = {}
+    if header:
+        envelope["header"] = {"type": "text", "text": header[:60]}
+    if footer:
+        envelope["footer"] = {"text": footer[:60]}
+    return envelope
+
+
+def build_button_payload(
+    *,
+    recipient: str,
+    body: str,
+    buttons: list[dict[str, str]],
+    header: str | None = None,
+    footer: str | None = None,
+    reply_to_row_id: str | None = None,
+) -> dict[str, Any]:
+    """A native WhatsApp reply-button message with at most three buttons.
+
+    Meta's limits are enforced here: three buttons, a 20-character title, a 1024-character
+    body and a 256-character id. Titles are truncated (display text); ids are never
+    truncated, because a shortened id would route to the wrong action -- an oversized id
+    is a programming error and raises instead.
+    """
+    if not 1 <= len(buttons) <= 3:
+        raise ValueError("WhatsApp reply-button messages accept between 1 and 3 buttons.")
+    actions: list[dict[str, Any]] = []
+    for button in buttons:
+        action_id = str(button.get("id") or "")
+        title = str(button.get("title") or "")
+        if not action_id or len(action_id) > ACTION_ID_MAX:
+            raise ValueError("A reply-button id must be between 1 and 256 characters.")
+        if not title.strip():
+            raise ValueError("A reply-button title is required.")
+        actions.append(
+            {"type": "reply", "reply": {"id": action_id, "title": title[:20]}}
+        )
+    interactive: dict[str, Any] = {
+        "type": "button",
+        "body": {"text": body[:1024]},
+        "action": {"buttons": actions},
+    }
+    interactive.update(_interactive_header(header, footer))
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "interactive",
+        "interactive": interactive,
+    }
+    if reply_to_row_id:
+        payload["biz_opaque_callback_data"] = reply_to_row_id
+    return payload
+
+
+def build_list_payload(
+    *,
+    recipient: str,
+    body: str,
+    button_text: str,
+    sections: list[dict[str, Any]],
+    header: str | None = None,
+    footer: str | None = None,
+    reply_to_row_id: str | None = None,
+) -> dict[str, Any]:
+    """A native WhatsApp list message: at most 10 rows across at most 10 sections.
+
+    Row titles are 24 characters, descriptions 72, the action button 20. Row ids are
+    routing keys and are never truncated; an oversized id raises.
+    """
+    if not sections:
+        raise ValueError("A list message needs at least one section.")
+    if len(sections) > 10:
+        raise ValueError("WhatsApp list messages accept at most 10 sections.")
+    cleaned: list[dict[str, Any]] = []
+    total = 0
+    for section in sections:
+        rows: list[dict[str, Any]] = []
+        for row in section.get("rows") or []:
+            action_id = str(row.get("id") or "")
+            title = str(row.get("title") or "")
+            if not action_id or len(action_id) > ACTION_ID_MAX:
+                raise ValueError("A list-row id must be between 1 and 256 characters.")
+            if not title.strip():
+                raise ValueError("A list-row title is required.")
+            item: dict[str, Any] = {"id": action_id, "title": title[:24]}
+            description = str(row.get("description") or "").strip()
+            if description:
+                item["description"] = description[:72]
+            rows.append(item)
+        total += len(rows)
+        if rows:
+            cleaned.append({"title": str(section.get("title") or "")[:24], "rows": rows})
+    if not 1 <= total <= 10:
+        raise ValueError("WhatsApp list messages accept between 1 and 10 rows in total.")
+    interactive: dict[str, Any] = {
+        "type": "list",
+        "body": {"text": body[:1024]},
+        "action": {"button": button_text[:20], "sections": cleaned},
+    }
+    interactive.update(_interactive_header(header, footer))
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "interactive",
+        "interactive": interactive,
+    }
+    if reply_to_row_id:
+        payload["biz_opaque_callback_data"] = reply_to_row_id
+    return payload
+
+
+def _post_message(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    payload: dict[str, Any],
+) -> str:
+    """POST one message payload to Meta and return the wamid.
+
+    All outbound shapes (text, reply buttons, list) share this path so the gate, the
+    credential lookup and the provider-error translation cannot drift apart.
+    """
+    if not settings.whatsapp_send_enabled:
+        raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
+    token = access_token(settings, tenant_id, credentials_ref)
+    outbound = urllib.request.Request(
+        f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
+        f"{phone_number_id}/messages",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(outbound, timeout=10) as response:  # noqa: S310
+            response_body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        code, provider_message = _http_error_details(error)
+        raise WhatsAppSendError(
+            "WhatsApp message delivery failed.",
+            502,
+            provider_code=code,
+            provider_message=provider_message,
+            http_status=error.code,
+            # A 4xx is a definite rejection. A 5xx or 408 may have been accepted before
+            # the failure, so it is ambiguous and must not be retried automatically.
+            ambiguous=error.code >= 500 or error.code == 408,
+        ) from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise WhatsAppSendError(
+            "WhatsApp message delivery failed.",
+            502,
+            provider_message=type(error).__name__,
+            ambiguous=True,
+        ) from error
+    except OSError as error:
+        # Connection reset / broken pipe after the request may have reached Meta.
+        raise WhatsAppSendError(
+            "WhatsApp message delivery failed.",
+            502,
+            provider_message=type(error).__name__,
+            ambiguous=True,
+        ) from error
+    except ValueError as error:
+        raise WhatsAppSendError(
+            "WhatsApp message delivery failed.", 502, ambiguous=True
+        ) from error
+    messages = response_body.get("messages") if isinstance(response_body, dict) else None
+    message_id = messages[0].get("id") if isinstance(messages, list) and messages else None
+    if not isinstance(message_id, str):
+        raise WhatsAppSendError(
+            "WhatsApp returned an invalid message response.", 502, ambiguous=True
+        )
+    return message_id
+
+
 def send_text(
     settings: Settings,
     *,
@@ -375,45 +560,76 @@ def send_text(
     not be confirmed for this Graph version, and a real send has not been made. See
     docs/OUTBOUND_DELIVERY.md before wiring it up.
     """
-    if not settings.whatsapp_send_enabled:
-        raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
-    token = access_token(settings, tenant_id, credentials_ref)
-    body: dict[str, Any] = {
+    payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
         "to": recipient,
         "type": "text",
         "text": {"body": text[:4096]},
     }
     if reply_to_row_id:
-        body["biz_opaque_callback_data"] = reply_to_row_id
-    outbound = urllib.request.Request(
-        f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
-        f"{phone_number_id}/messages",
-        data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
+        payload["biz_opaque_callback_data"] = reply_to_row_id
+    return _post_message(
+        settings,
+        phone_number_id=phone_number_id,
+        tenant_id=tenant_id,
+        credentials_ref=credentials_ref,
+        payload=payload,
     )
-    try:
-        with urllib.request.urlopen(outbound, timeout=10) as response:  # noqa: S310
-            response_body = json.loads(response.read().decode())
-    except urllib.error.HTTPError as error:
-        code, provider_message = _http_error_details(error)
-        raise WhatsAppSendError(
-            "WhatsApp message delivery failed.",
-            502,
-            provider_code=code,
-            provider_message=provider_message,
-        ) from error
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise WhatsAppSendError(
-            "WhatsApp message delivery failed.",
-            502,
-            provider_message=type(error).__name__,
-        ) from error
-    except ValueError as error:
-        raise WhatsAppSendError("WhatsApp message delivery failed.", 502) from error
-    messages = response_body.get("messages") if isinstance(response_body, dict) else None
-    message_id = messages[0].get("id") if isinstance(messages, list) and messages else None
-    if not isinstance(message_id, str):
-        raise ServiceError("WhatsApp returned an invalid message response.", 502)
-    return message_id
+
+
+def send_buttons(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    recipient: str,
+    body: str,
+    buttons: list[dict[str, str]],
+    header: str | None = None,
+    footer: str | None = None,
+) -> str:
+    """Send a native reply-button message (max 3 buttons) and return its wamid."""
+    return _post_message(
+        settings,
+        phone_number_id=phone_number_id,
+        tenant_id=tenant_id,
+        credentials_ref=credentials_ref,
+        payload=build_button_payload(
+            recipient=recipient,
+            body=body,
+            buttons=buttons,
+            header=header,
+            footer=footer,
+        ),
+    )
+
+
+def send_list(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    recipient: str,
+    body: str,
+    button_text: str,
+    sections: list[dict[str, Any]],
+    header: str | None = None,
+    footer: str | None = None,
+) -> str:
+    """Send a native list message (max 10 rows) and return its wamid."""
+    return _post_message(
+        settings,
+        phone_number_id=phone_number_id,
+        tenant_id=tenant_id,
+        credentials_ref=credentials_ref,
+        payload=build_list_payload(
+            recipient=recipient,
+            body=body,
+            button_text=button_text,
+            sections=sections,
+            header=header,
+            footer=footer,
+        ),
+    )
