@@ -5,6 +5,14 @@ data, credentials, WhatsApp identity or domains**. This document is the runbook 
 and using it. Nothing in it has been executed: no project, service, variable or migration has
 been created.
 
+> **Menu release status — 21 October 2026:** see
+> [`STAGING_MENU_RELEASE_PREP.md`](STAGING_MENU_RELEASE_PREP.md). The integration is locally
+> prepared, but staging is not certified: the available `.env.staging` is refused by
+> `db/staging_preflight.py`, the visible Railway `saas-staging` service is a PostgreSQL
+> database rather than the application service, and no verified staging Supabase project is
+> available. Do not push, migrate, or deploy until the checklist and owner approvals in that
+> document are satisfied.
+
 ## 1. Isolation model
 
 | Concern | Production | Staging |
@@ -115,14 +123,17 @@ platform  postgresql://saas_platform_admin.<STAGING_REF>:<platform-pw>@<staging-
 ```
 
 **5.3 Apply the schema** (operator DSN, from a workstation — never from Railway). The
-repository holds 34 migrations; `0034_handover_requests.sql` is the newest and must be applied
-before the dashboard code boots:
+repository now holds 35 migrations; `0035_menu_state_and_reply_correlation.sql` is the newest.
+The staging branch currently contains through `0034`; `0035` is the menu release migration and
+must be applied only after the menu-specific backup and rollback procedure in
+[`STAGING_MENU_RELEASE_PREP.md`](STAGING_MENU_RELEASE_PREP.md) is satisfied.
 
 ```bash
-export OP='postgresql://postgres:<owner-pw>@<staging-host>:5432/postgres'
-python db/run_migrations.py --database-url "$OP" --status   # expect 0033 newest, 0034 pending
-python db/run_migrations.py --database-url "$OP"            # applies 0034
-python db/run_migrations.py --database-url "$OP" --status   # expect 34 applied
+# Keep the operator DSN in the approved operator environment; do not put it in argv or logs.
+export SAAS_DATABASE_URL='<staging operator DSN from approved secret source>'
+python db/run_migrations.py --status   # expect 0034 applied, 0035 pending
+python db/run_migrations.py            # applies 0035
+python db/run_migrations.py --status   # expect 35 applied
 ```
 
 Do **not** pass `--include-local` or `--seed`: they install known development passwords and
@@ -190,10 +201,14 @@ synthetic sender for inbound payloads.
 ## 7. Rollback
 
 1. **Code** — redeploy the previous Railway deployment in the staging project.
-2. **Schema** — only after the code rollback: `drop table if exists public.handover_requests;`
+2. **Schema (0034)** — only after the code rollback: `drop table if exists public.handover_requests;`
    then `delete from public.saas_schema_migrations where version = '0034_handover_requests.sql';`
    This discards staging handover rows only; 0034 alters no existing table.
-3. **Project** — a staging Supabase project can be deleted outright; nothing in production
+3. **Schema (0035 menu)** — there is no down migration. Code rollback first, then either restore
+   the pre-migration backup or use the destructive manual object-removal procedure and ledger
+   deletion in [`STAGING_MENU_RELEASE_PREP.md`](STAGING_MENU_RELEASE_PREP.md). It discards
+   staging menu state and reply-correlation data; never run it against production.
+4. **Project** — a staging Supabase project can be deleted outright; nothing in production
    references it.
 
 ## 8. Branch and release flow
