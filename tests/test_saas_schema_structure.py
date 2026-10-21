@@ -411,12 +411,12 @@ class ApplicationSchemaContractTests(SaasDatabaseTestCase):
         from platform_admin.config import REQUIRED_SCHEMA, missing_schema_objects
 
         try:
-            from .saas_test_support import test_database_url
+            from .saas_test_support import require_test_database_url
         except ImportError:  # discovery inside the tests directory
-            from saas_test_support import test_database_url  # type: ignore[no-redef]
+            from saas_test_support import require_test_database_url  # type: ignore[no-redef]
 
         self.assertTrue(REQUIRED_SCHEMA, "the startup contract must not be empty")
-        with psycopg.connect(test_database_url()) as conn:
+        with psycopg.connect(require_test_database_url()) as conn:
             self.assertEqual(missing_schema_objects(conn), [])
 
     def test_the_handover_table_and_its_idempotency_indexes_exist(self):
@@ -429,11 +429,11 @@ class ApplicationSchemaContractTests(SaasDatabaseTestCase):
         import psycopg
 
         try:
-            from .saas_test_support import test_database_url
+            from .saas_test_support import require_test_database_url
         except ImportError:  # discovery inside the tests directory
-            from saas_test_support import test_database_url  # type: ignore[no-redef]
+            from saas_test_support import require_test_database_url  # type: ignore[no-redef]
 
-        with psycopg.connect(test_database_url()) as conn, conn.cursor() as cursor:
+        with psycopg.connect(require_test_database_url()) as conn, conn.cursor() as cursor:
             cursor.execute("select to_regclass('public.handover_requests')")
             self.assertIsNotNone(cursor.fetchone()[0], "migration 0034 is not applied")
             cursor.execute(

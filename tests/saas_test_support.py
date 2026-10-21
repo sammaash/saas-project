@@ -23,7 +23,9 @@ Two properties make this safe:
   * Every helper rolls its transaction back, so the suite never mutates seeded data.
 
 The suite skips without a database for local convenience. CI sets
-SAAS_REQUIRE_TEST_DATABASE=1, which turns missing configuration into a failure.
+SAAS_REQUIRE_TEST_DATABASE=1, which turns missing configuration into a failure. The test
+DSN is read **only** from SAAS_TEST_DATABASE_URL: application/operator DSNs are never
+fallbacks, and a Supabase, non-local or non-test-named target is rejected before connecting.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import json
 import os
 import unittest
 from typing import Any, Iterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 # ---------------------------------------------------------------------------
 # Deterministic seed identifiers -- kept in step with db/seeds/0001_dev_seed.sql.
@@ -129,35 +131,146 @@ TABLES_WITH_NULLABLE_TENANT_ID = ("audit_log",)
 # ---------------------------------------------------------------------------
 # Connections and identity switching
 # ---------------------------------------------------------------------------
+class TestDatabaseConfigurationError(RuntimeError):
+    """The test database configuration is missing or unsafe to use."""
+
+
+#: Any host containing one of these is a hosted Supabase endpoint, never a test database.
+SUPABASE_HOST_MARKERS = ("supabase.co", "supabase.com", "pooler.supabase.com")
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+NON_DISPOSABLE_NAMES = frozenset({"postgres", "template0", "template1"})
+
+
+def _is_loopback(host: str) -> bool:
+    return host.lower() in LOOPBACK_HOSTS or host.startswith("/")
+
+
+def _validate_test_database_url(url: str) -> str:
+    """Refuse anything that is not an explicitly disposable local test database.
+
+    The suite once fell back to ``SAAS_DATABASE_URL``; when that pointed at the production
+    pooler, database tests tried to authenticate against production. This guard makes such a
+    configuration an error instead of a silent connection attempt.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("postgres", "postgresql"):
+        raise TestDatabaseConfigurationError(
+            "SAAS_TEST_DATABASE_URL must be a postgres:// or postgresql:// URL."
+        )
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise TestDatabaseConfigurationError(
+            "SAAS_TEST_DATABASE_URL must include an explicit host."
+        )
+    if any(marker in host for marker in SUPABASE_HOST_MARKERS):
+        raise TestDatabaseConfigurationError(
+            "Refusing a Supabase host as a test database; use a disposable local PostgreSQL."
+        )
+    username = (parts.username or "").lower()
+    production_ref = (os.getenv("SAAS_PRODUCTION_PROJECT_REF") or "").strip().lower()
+    if production_ref and production_ref in url.lower():
+        raise TestDatabaseConfigurationError(
+            "Refusing a URL that names the production project reference."
+        )
+    if "." in username and len(username.rsplit(".", 1)[1]) >= 16:
+        raise TestDatabaseConfigurationError(
+            "Refusing a pooled Supabase username as a test database login."
+        )
+    if not _is_loopback(host) and os.getenv("SAAS_TEST_DATABASE_ALLOW_REMOTE") != "1":
+        raise TestDatabaseConfigurationError(
+            "Refusing a non-local test database without SAAS_TEST_DATABASE_ALLOW_REMOTE=1."
+        )
+    database = (parts.path or "").lstrip("/")
+    if not database:
+        raise TestDatabaseConfigurationError(
+            "SAAS_TEST_DATABASE_URL must name a database."
+        )
+    # libpq query parameters can silently override the visible host/database. A URL that
+    # looks local but carries ?host=... or ?dbname=... is not a safe test target.
+    query = parse_qs(parts.query, keep_blank_values=True)
+    redirecting = {"host", "hostaddr", "port", "dbname", "service", "options", "user"}
+    if redirecting.intersection(key.lower() for key in query):
+        raise TestDatabaseConfigurationError(
+            "Refusing a test URL whose query parameters can redirect the connection."
+        )
+    if database.lower() in NON_DISPOSABLE_NAMES:
+        raise TestDatabaseConfigurationError(
+            f"Refusing the shared '{database}' database as a test target."
+        )
+    confirmed = os.getenv("SAAS_TEST_DATABASE_CONFIRM") == database
+    if "test" not in database.lower() and not confirmed:
+        raise TestDatabaseConfigurationError(
+            "The test database name must contain 'test' or exactly match "
+            "SAAS_TEST_DATABASE_CONFIRM."
+        )
+    return url
+
+
 def test_database_url() -> str | None:
+    """The explicitly configured disposable test database, or None.
+
+    There is deliberately **no** fallback to SAAS_DATABASE_URL or
+    SAAS_OPERATOR_DATABASE_URL: those are application/operator credentials and may point at
+    production. An unsafe explicit value raises rather than being ignored.
+    """
+    explicit = os.getenv("SAAS_TEST_DATABASE_URL")
+    if not explicit:
+        return None
+    return _validate_test_database_url(explicit)
 
 
-    """Connection string for the isolation tests (CI points this at its service container)."""
-    test_database_url.__test__ = False
-
-    """Connection string for the isolation tests (CI points this at its service container)."""
-    if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
-        return os.getenv("SAAS_TEST_DATABASE_URL")
-    return os.getenv("SAAS_TEST_DATABASE_URL") or os.getenv("SAAS_DATABASE_URL")
+def require_test_database_url() -> str:
+    """The test database URL, or a clear failure. Used immediately before connecting."""
+    url = test_database_url()
+    if not url:
+        raise TestDatabaseConfigurationError(
+            "SAAS_TEST_DATABASE_URL is required for database tests. Provision a disposable "
+            "local PostgreSQL (for example a postgres:16 container), apply the migrations "
+            "to it, and export SAAS_TEST_DATABASE_URL for that database only."
+        )
+    return url
 
 
 def app_backend_test_url() -> str | None:
-    """Local test DSN for the app_backend role configured by db/local/."""
+    """Test DSN for app_backend, never derived from a production-looking target.
+
+    Prefer ``SAAS_TEST_APP_DATABASE_URL``. The local development password is used only
+    for a loopback database; a remote test database must provide its own credential.
+    """
+    explicit = os.getenv("SAAS_TEST_APP_DATABASE_URL")
     base = test_database_url()
+    if explicit:
+        _validate_test_database_url(explicit)
+        if base:
+            expected, actual = urlsplit(base), urlsplit(explicit)
+            if (expected.hostname, expected.port, expected.path) != (
+                actual.hostname,
+                actual.port,
+                actual.path,
+            ):
+                raise TestDatabaseConfigurationError(
+                    "SAAS_TEST_APP_DATABASE_URL must target the same test database."
+                )
+        return explicit
     if not base:
         return None
     parts = urlsplit(base)
-    if not parts.hostname:
-        return None
-    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-    netloc = f"app_backend:dev_app_backend_password@{hostname}"
+    host = parts.hostname or ""
+    if not _is_loopback(host):
+        raise TestDatabaseConfigurationError(
+            "Set SAAS_TEST_APP_DATABASE_URL for a non-local test database; the development "
+            "password is only allowed on loopback."
+        )
+    password = os.getenv("SAAS_TEST_APP_PASSWORD") or "dev_app_backend_password"
+    hostname = f"[{host}]" if ":" in host else host
+    netloc = f"app_backend:{quote(password, safe='')}@{hostname}"
     if parts.port:
         netloc += f":{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def database_available() -> bool:
-    return bool(test_database_url())
+    return test_database_url() is not None
 
 
 def _connect(url: str | None = None) -> Any:
@@ -167,7 +280,7 @@ def _connect(url: str | None = None) -> Any:
         raise RuntimeError(
             "psycopg is not installed. Run: pip install -r requirements.txt"
         ) from error
-    return psycopg.connect(url or test_database_url())
+    return psycopg.connect(url or require_test_database_url())
 
 
 @contextlib.contextmanager
@@ -228,15 +341,35 @@ def as_user(user_id: str | None, url: str | None = None) -> Iterator[Any]:
 
 
 def platform_admin_test_url() -> str | None:
-    """Local test DSN for the saas_platform_admin login configured by db/local/."""
+    """Test DSN for saas_platform_admin, never derived from a production-looking target."""
+    explicit = os.getenv("SAAS_TEST_PLATFORM_ADMIN_DATABASE_URL")
     base = test_database_url()
+    if explicit:
+        _validate_test_database_url(explicit)
+        if base:
+            expected, actual = urlsplit(base), urlsplit(explicit)
+            if (expected.hostname, expected.port, expected.path) != (
+                actual.hostname,
+                actual.port,
+                actual.path,
+            ):
+                raise TestDatabaseConfigurationError(
+                    "SAAS_TEST_PLATFORM_ADMIN_DATABASE_URL must target the test database."
+                )
+        return explicit
     if not base:
         return None
     parts = urlsplit(base)
-    if not parts.hostname:
-        return None
-    hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-    netloc = f"saas_platform_admin:dev_platform_admin_password@{hostname}"
+    host = parts.hostname or ""
+    if not _is_loopback(host):
+        raise TestDatabaseConfigurationError(
+            "Set SAAS_TEST_PLATFORM_ADMIN_DATABASE_URL for a non-local test database."
+        )
+    password = (
+        os.getenv("SAAS_TEST_PLATFORM_ADMIN_PASSWORD") or "dev_platform_admin_password"
+    )
+    hostname = f"[{host}]" if ":" in host else host
+    netloc = f"saas_platform_admin:{quote(password, safe='')}@{hostname}"
     if parts.port:
         netloc += f":{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
@@ -280,16 +413,16 @@ class SaasDatabaseTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not database_available():
+        url = test_database_url()
+        if not url:
             if os.getenv("SAAS_REQUIRE_TEST_DATABASE") == "1":
                 raise AssertionError(
-                    "SAAS_REQUIRE_TEST_DATABASE=1 but neither "
-                    "SAAS_TEST_DATABASE_URL nor SAAS_DATABASE_URL is configured."
+                    "SAAS_REQUIRE_TEST_DATABASE=1 but SAAS_TEST_DATABASE_URL is not "
+                    "configured. Database tests never fall back to SAAS_DATABASE_URL."
                 )
             raise unittest.SkipTest(
-                "No SAAS_TEST_DATABASE_URL / SAAS_DATABASE_URL configured, so the "
-                "PostgreSQL isolation tests are skipped. See "
-                "docs/PHASE_1_SAAS_FOUNDATION.md for how to run them."
+                "SAAS_TEST_DATABASE_URL is not configured; PostgreSQL isolation tests are "
+                "skipped. Use a disposable local database, never an application DSN."
             )
         cls._assert_foundation_present()
 
