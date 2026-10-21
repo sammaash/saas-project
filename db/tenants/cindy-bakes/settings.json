@@ -1,0 +1,55 @@
+{
+  "_note": "Operator-supplied tenant configuration for the Cindy Bakes Delights tenant. Values marked with a TODO are placeholders that still need the client's confirmation; everything else is the documented Cindy Bakes rule set (70% deposit, 3-day order deadline, KSh 32/km delivery).",
+  "profile": {
+    "name": "Cindy Bakes Delights",
+    "activity": "Bakery",
+    "timezone": "Africa/Nairobi",
+    "currency": "KES"
+  },
+  "business_rules": {
+    "business_type": "bakery",
+    "deposit_rate": 0.7,
+    "deposit_deadline_days": 3,
+    "delivery_rate_per_km": 32,
+    "personalisation_prices": {
+      "none": 0,
+      "option_a": 300
+    }
+  },
+  "bot_persona": {
+    "greeting": "Hello and welcome to Cindy Bakes Delights!",
+    "language": "en",
+    "name": "Cindy Bakes Assistant",
+    "tone": "friendly and professional"
+  },
+  "business_hours": {
+    "mon": {
+      "open": "08:00",
+      "close": "18:00"
+    },
+    "sat": {
+      "open": "09:00",
+      "close": "16:00"
+    }
+  },
+  "configuration": {
+    "identity": {
+      "business_name": "Cindy Bakes Delights",
+      "business_type": "Bakery",
+      "country": "Kenya",
+      "timezone": "Africa/Nairobi",
+      "currency": "KES"
+    },
+    "config": {
+      "provider": "meta_cloud_api"
+    },
+    "payment_methods": [
+      "M-Pesa"
+    ],
+    "delivery_available": true,
+    "use_catalogue_prices": true,
+    "allow_unlisted_products": false,
+    "escalate_complaints_to_human": true,
+    "message_retention_days": 90
+  }
+}

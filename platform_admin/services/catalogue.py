@@ -7,11 +7,13 @@ from typing import Any
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
+from .validation import ServiceError, translated
+
 from . import audit, validation as v
 
 
 def list_catalogue(settings: Settings, tenant_id: str) -> list[dict[str, Any]]:
-    with tenant_admin(tenant_id, settings.app_database_url) as ta:
+    with translated(), tenant_admin(tenant_id, settings.app_database_url) as ta:
         return ta.list_catalogue()
 
 

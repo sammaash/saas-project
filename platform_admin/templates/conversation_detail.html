@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tenant_tabs %}
+{% block content %}
+{{ tenant_tabs(tenant, tab) }}
+<h2>Conversation {{ conversation.id }}</h2>
+<table>
+  <tr><th>Customer</th><td><a href="{{ url_for('admin.customer_detail', tenant_id=tenant.id, customer_id=conversation.customer_id) }}">{{ conversation.customer_wa_id }} — {{ conversation.customer_name or '-' }}</a></td></tr>
+  <tr><th>Channel</th><td>{{ conversation.channel_id }}</td></tr>
+  <tr><th>Status</th><td><span class="badge {{ conversation.status }}">{{ conversation.status }}</span></td></tr>
+  <tr><th>Created</th><td>{{ conversation.created_at }}</td></tr>
+  <tr><th>Last message</th><td>{{ conversation.last_message_at or '-' }}</td></tr>
+</table>
+<h3>Messages</h3>
+<table>
+  <tr>
+    <th>Time</th>
+    <th>Direction</th>
+    <th>Sender</th>
+    <th>Type</th>
+    <th>Body</th>
+    <th>Status</th>
+  </tr>
+  {% for m in messages %}
+  <tr>
+    <td>{{ m.received_at }}</td>
+    <td>{{ m.direction }}</td>
+    <td>{{ m.sender_type }}</td>
+    <td>{{ m.message_type }}</td>
+    <td>{{ m.body_text or '(media / no text)' }}</td>
+    <td>{{ m.delivery_status or '-' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">No messages yet.</td></tr>
+  {% endfor %}
+</table>
+<p><a class="button" href="{{ url_for('admin.customer_detail', tenant_id=tenant.id, customer_id=conversation.customer_id) }}">Back to customer</a></p>
+{% endblock %}

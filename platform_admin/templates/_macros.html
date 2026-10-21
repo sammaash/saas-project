@@ -9,10 +9,9 @@
     ('profile', 'Business profile', 'admin.tenant_profile'),
     ('rules', 'Rules / AI', 'admin.tenant_rules'),
     ('catalogue', 'Catalogue', 'admin.tenant_catalogue'),
-    ('quotations', 'Quotations', 'admin.tenant_quotations'),
     ('whatsapp', 'WhatsApp / Meta', 'admin.tenant_whatsapp'),
-    ('members', 'Members', 'admin.tenant_members'),
-    ('subscription', 'Subscription', 'admin.tenant_subscription'),
+    ('customers', 'Customers & Messages', 'admin.customer_list'),
+    ('handovers', 'Handovers', 'admin.tenant_handovers'),
     ('audit', 'Audit log', 'admin.tenant_audit')] %}
     <a href="{{ url_for(endpoint, tenant_id=tenant.id) }}" class="{{ 'active' if tab == key else '' }}">{{ label }}</a>
   {% endfor %}

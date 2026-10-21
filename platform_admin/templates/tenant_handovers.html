@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+{% from "_macros.html" import csrf_field, tenant_tabs %}
+{{ tenant_tabs(tenant, tab) }}
+
+<h2>Human handover requests</h2>
+<p class="muted">When a customer asks for something the catalogue cannot confirm, the bot
+records the request here and notifies the staff contact configured for this client. The bot
+never quotes a price or promises availability for these — staff confirm both.</p>
+
+<p>
+  {% for name in ['pending', 'notified', 'failed', 'in_progress', 'resolved'] %}
+  <span class="badge">{{ name | replace('_', ' ') }}: {{ summary.get(name, 0) }}</span>
+  {% endfor %}
+</p>
+
+<p class="muted">Show:
+  <a href="{{ url_for('admin.tenant_handovers', tenant_id=tenant.id) }}">all</a>
+  {% for name in statuses %}
+  &middot; <a href="{{ url_for('admin.tenant_handovers', tenant_id=tenant.id, status=name) }}">{{ name | replace('_', ' ') }}</a>
+  {% endfor %}
+  &middot; <a href="{{ url_for('admin.tenant_handovers', tenant_id=tenant.id, status='notified') }}">notified</a>
+</p>
+
+{% for item in requests %}
+<section class="card config-section">
+  <h3>{{ item.requested_product }}
+    <span class="badge {{ 'active' if item.status in ('notified', 'resolved') else 'draft' }}">{{ item.status | replace('_', ' ') }}</span>
+  </h3>
+  <p class="muted">
+    Received {{ (item.created_at | string)[:16] }} &middot;
+    {{ (item.reason or '') | replace('_', ' ') }} &middot;
+    customer {{ item.wa_id }}{% if item.customer_name %} ({{ item.customer_name }}){% endif %}
+  </p>
+
+  {% if item.details %}
+  <p>{% for key, value in item.details.items() %}<strong>{{ key | replace('_', ' ') }}</strong>: {{ value }}{% if not loop.last %} &middot; {% endif %}{% endfor %}</p>
+  {% endif %}
+
+  {% if item.notification_error %}
+  <p class="flash error">Staff notification {{ 'failed' if item.status == 'failed' else 'note' }}:
+    {{ item.notification_error }}</p>
+  {% endif %}
+  {% if item.notification_target %}
+  <p class="muted">Notified {{ item.notification_target }} at {{ (item.notified_at | string)[:16] }}.</p>
+  {% endif %}
+
+  {% if item.context %}
+  <details>
+    <summary>Conversation context</summary>
+    <ul>
+      {% for turn in item.context %}
+      <li><strong>{{ turn.role }}</strong>: {{ turn.text }}</li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+
+  <div class="section-actions">
+    <form method="post" class="inline"
+          action="{{ url_for('admin.tenant_handover_status', tenant_id=tenant.id, handover_id=item.id) }}">
+      {{ csrf_field() }}
+      {% for name in statuses %}
+      <button type="submit" name="status" value="{{ name }}"
+              class="{{ 'secondary' if name != 'resolved' else '' }}">{{ name | replace('_', ' ') }}</button>
+      {% endfor %}
+    </form>
+    <form method="post" class="inline"
+          action="{{ url_for('admin.tenant_handover_notify', tenant_id=tenant.id, handover_id=item.id) }}">
+      {{ csrf_field() }}
+      <button type="submit" class="secondary">Notify staff again</button>
+    </form>
+  </div>
+</section>
+{% else %}
+<p class="muted">No handover requests{{ ' with that status' if status else '' }} yet.</p>
+{% endfor %}
+{% endblock %}

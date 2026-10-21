@@ -1,14 +1,355 @@
 {% extends "base.html" %}
 {% block content %}
-{% from "_macros.html" import csrf_field, tenant_tabs %}
+{% from "_macros.html" import tenant_tabs %}
 {{ tenant_tabs(tenant, tab) }}
-<h2>Business rules / AI behaviour</h2>
-<p class="muted">Each document is a JSON object stored for this tenant only.</p>
-<form method="post" class="card">
-  {{ csrf_field() }}
-  {% for column, label in labels %}
-  <label>{{ label }} <textarea name="{{ column }}" rows="8" spellcheck="false">{{ documents[column] }}</textarea></label>
+
+{# ---------------------------------------------------------------------------
+   Section-level and field-level saves.
+
+   Each section is its own form, so a save can only ever submit the fields of that
+   section. ``config_version`` is the ``tenant_settings.updated_at`` the page was rendered
+   from: the server rejects the save with a 409 if another session saved first.
+   A submit button named ``focus`` narrows the save to one field (or one day).
+   --------------------------------------------------------------------------- #}
+
+{% macro text_field(name, label, value, maxlength=200, placeholder='') %}
+<label>{{ label }}
+  <input name="{{ name }}" maxlength="{{ maxlength }}"
+         {% if placeholder %}placeholder="{{ placeholder }}"{% endif %}
+         value="{{ value if value is not none else '' }}">
+  {% if value in (none, '') %}<span class="muted">Not set</span>{% endif %}
+</label>
+{% endmacro %}
+
+{% macro number_field(name, label, value, minimum=1, maximum=None, placeholder='') %}
+<label>{{ label }}
+  <input type="number" name="{{ name }}" min="{{ minimum }}"
+         {% if maximum is not none %}max="{{ maximum }}"{% endif %}
+         {% if placeholder %}placeholder="{{ placeholder }}"{% endif %}
+         value="{{ value if value is not none else '' }}">
+  {% if value in (none, '') %}<span class="muted">Not set</span>{% endif %}
+</label>
+{% endmacro %}
+
+{% macro select_field(name, label, value, options, placeholder='Not set') %}
+<label>{{ label }}
+  <select name="{{ name }}">
+    <option value="">{{ placeholder }}</option>
+    {% for option in options %}
+    <option value="{{ option }}" {{ 'selected' if value == option else '' }}>{{ option | replace('_', ' ') }}</option>
+    {% endfor %}
+  </select>
+  {% if value in (none, '') %}<span class="muted">Not set</span>{% endif %}
+</label>
+{% endmacro %}
+
+{% macro checkbox_group(name, label, options, selected) %}
+<fieldset>
+  <legend>{{ label }}</legend>
+  <input type="hidden" name="present_{{ name }}" value="1">
+  {% for option in options %}
+  <label class="check"><input type="checkbox" name="{{ name }}" value="{{ option }}"
+    {{ 'checked' if option in (selected or []) else '' }}> {{ option | replace('_', ' ') }}</label>
   {% endfor %}
-  <button type="submit">Save</button>
+  {% if not selected %}<p class="muted">Nothing selected yet.</p>{% endif %}
+</fieldset>
+{% endmacro %}
+
+{% macro section_form(section, action_label, tenant_id, version) %}
+<form method="post" class="config-form"
+      action="{{ url_for('admin.tenant_rules_section', tenant_id=tenant_id, section=section) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="config_version" value="{{ version }}">
+  {{ caller() }}
+  <div class="section-actions">
+    <button type="submit">{{ action_label }}</button>
+    <span class="section-state muted">Saved</span>
+  </div>
 </form>
+{% endmacro %}
+
+<h2>WhatsApp AI agent configuration</h2>
+<p class="muted">Every section below shows what is saved for <strong>{{ tenant.name }}</strong>.
+Fields marked <em>Not set</em> have never been configured — they are not defaults, and
+leaving one alone never writes a value for it.</p>
+<p class="muted">A section button saves that section only. A field button (for example
+<em>Save greeting only</em>) saves a single setting. No save ever touches another section,
+and a failed save leaves the stored configuration exactly as it was.</p>
+
+{% if errors.get('__all__') %}<p class="flash error">{{ errors['__all__'] }}</p>{% endif %}
+
+<section class="card config-section" id="config-identity">
+  <h3>A. WhatsApp identity</h3>
+  {% if errors.get('identity') %}<p class="flash error">{{ errors.identity }}</p>{% endif %}
+  {% call section_form('identity', 'Save WhatsApp identity', tenant.id, version) %}
+    {{ text_field('wa_display_name', 'WhatsApp display name', fields.wa_display_name,
+                  100, 'Autolamps Kenya') }}
+    {{ select_field('business_type', 'Business type', fields.business_type,
+                    constants.WHATSAPP_BUSINESS_TYPES, 'Not set') }}
+    <p class="muted">The business type drives the AI persona, not the product category.</p>
+    {{ text_field('whatsapp_number', 'WhatsApp number', fields.whatsapp_number,
+                  20, '+254700000000') }}
+  {% endcall %}
+</section>
+
+<section class="card config-section" id="config-persona">
+  <h3>B. Bot persona</h3>
+  {% if errors.get('persona') %}<p class="flash error">{{ errors.persona }}</p>{% endif %}
+  {% call section_form('persona', 'Save bot persona', tenant.id, version) %}
+    {{ select_field('tone', 'Tone', fields.tone, constants.BOT_TONES, 'Not set') }}
+    {{ text_field('bot_name', 'Bot name in chat (max 20 characters)', fields.bot_name,
+                  20, 'Lamps Assistant') }}
+  {% endcall %}
+</section>
+
+<section class="card config-section" id="config-hours">
+  <h3>C. Business hours + greeting</h3>
+  {% if errors.get('hours') %}<p class="flash error">{{ errors.hours }}</p>{% endif %}
+  {% call section_form('hours', 'Save business hours', tenant.id, version) %}
+    <label>Greeting (first message, sent 24/7)
+      <textarea name="greeting" rows="2"
+                placeholder="Karibu! Mimi ni Lamps Assistant.">{{ fields.greeting or '' }}</textarea>
+      {% if not fields.greeting %}<span class="muted">Not set</span>{% endif %}
+    </label>
+    <div class="section-actions">
+      <button type="submit" name="focus" value="greeting" class="secondary">Save greeting only</button>
+    </div>
+
+    <h4>Human hours (timezone Africa/Nairobi)</h4>
+    <p class="muted">Leave a day's times blank if you have not decided them yet; the bot
+    answers 24/7 regardless. Only the day you save is changed by a day button.</p>
+    {% for day in constants.BUSINESS_DAYS %}
+    <div class="grid day-row">
+      <label class="check"><input type="checkbox" name="day_open_{{ day }}" value="1"
+        {{ 'checked' if fields['day_open_' ~ day] else '' }}> {{ day | title }}</label>
+      <label>Opens <input type="time" name="day_open_time_{{ day }}"
+        value="{{ fields['day_open_time_' ~ day] or '' }}"></label>
+      <label>Closes <input type="time" name="day_close_time_{{ day }}"
+        value="{{ fields['day_close_time_' ~ day] or '' }}"></label>
+      <div class="section-actions">
+        <button type="submit" name="focus" value="human_hours.{{ day }}" class="secondary">
+          Save {{ day | title }}</button>
+      </div>
+    </div>
+    {% endfor %}
+
+    <label>Offline message
+      <textarea name="human_offline_message" rows="2"
+                placeholder="Team yetu iko offline sai. Watarudi kesho 8am.">{{ fields.human_offline_message or '' }}</textarea>
+      {% if not fields.human_offline_message %}<span class="muted">Not set</span>{% endif %}
+    </label>
+    <p class="muted">When a customer asks for a human, the platform checks these hours: inside
+    them the bot pauses for 2 hours and alerts the team, otherwise the offline message is
+    sent and the bot keeps saving the intent.</p>
+  {% endcall %}
+</section>
+
+<section class="card config-section" id="config-rules">
+  <h3>D. Business rules — describe your business</h3>
+  {% if errors.get('rules') %}<p class="flash error">{{ errors.rules }}</p>{% endif %}
+  {% call section_form('rules', 'Save business rules', tenant.id, version) %}
+    <label>Andika biashara yako hufanya kazi vipi, 3-4 lines
+      <textarea name="description_paragraph" rows="4" maxlength="4000"
+                placeholder="Sisi huuza taa za gari Toyota na Nissan. Bei ni fixed…">{{ fields.description_paragraph or '' }}</textarea>
+      {% if not fields.description_paragraph %}<span class="muted">Not set</span>{% endif %}
+    </label>
+    {{ select_field('pricing_rule', 'Pricing rule', fields.pricing_rule,
+                    ['Fixed', 'Negotiable', 'Quote-based']) }}
+    {{ select_field('discount_allowed', 'Discount allowed', fields.discount_allowed,
+                    ['No', 'Up to 5%', 'Up to 10%']) }}
+    {{ select_field('out_of_stock', 'Out of stock', fields.out_of_stock,
+                    ['Suggest alternative', 'Take order', 'Escalate to human']) }}
+    <div class="section-actions">
+      <button type="submit" name="focus" value="out_of_stock" class="secondary">
+        Save out-of-stock rule only</button>
+    </div>
+    {{ checkbox_group('payment_methods', 'Payment methods', constants.PAYMENT_METHODS,
+                      fields.payment_methods) }}
+    {{ select_field('delivery', 'Delivery', fields.delivery,
+                    ['Pickup only', 'Delivery within Nairobi', 'Countrywide']) }}
+    {{ text_field('return_policy', 'Return policy', fields.return_policy, 500,
+                  'Return within 3 days if damaged') }}
+    <label>Order flow
+      <span class="badge">Derived: {{ constants.order_flow_badge(fields.order_flow_derived) }}</span></label>
+
+    <fieldset>
+      <legend>Sellable product categories (loaded from the Products sheet)</legend>
+      <input type="hidden" name="present_sellable_products" value="1">
+      {% set sellable = fields.sellable_products or [] %}
+      {% for category in categories %}
+      <label class="check"><input type="checkbox" name="sellable_products" value="{{ category }}"
+        {{ 'checked' if category in sellable else '' }}> {{ category }}</label>
+      {% endfor %}
+      {% for category in sellable if category not in categories %}
+      <label class="check"><input type="checkbox" name="sellable_products" value="{{ category }}" checked>
+        {{ category }} <span class="muted">(saved, not in the current catalogue)</span></label>
+      {% endfor %}
+      {% if not categories %}<p class="muted">No categories yet — upload the catalogue first.</p>{% endif %}
+    </fieldset>
+
+    {{ number_field('escalation_tries', 'Escalate after (tries)', fields.escalation_tries, 1, none, '2') }}
+    {{ select_field('escalation_transfer', 'Escalation transfers to', fields.escalation_transfer,
+                    constants.ESCALATION_TARGETS) }}
+    {{ text_field('escalation_whatsapp', 'Escalation WhatsApp number', fields.escalation_whatsapp,
+                  20, '+254700123456') }}
+    <div class="section-actions">
+      <button type="submit" name="focus" value="escalation.whatsapp" class="secondary">
+        Save escalation number only</button>
+    </div>
+  {% endcall %}
+</section>
+
+
+<section class="card config-section" id="config-logic">
+  <h3>E. WhatsApp logic</h3>
+  {% if errors.get('logic') %}<p class="flash error">{{ errors.logic }}</p>{% endif %}
+  {% call section_form('logic', 'Save WhatsApp logic', tenant.id, version) %}
+    {{ select_field('on_photo', 'On photo', fields.on_photo, constants.ON_PHOTO_CHOICES) }}
+    {{ select_field('on_part_not_found', 'On part not found', fields.on_part_not_found,
+                    constants.ON_PART_NOT_FOUND_CHOICES) }}
+    {{ select_field('on_price_asked', 'On price asked', fields.on_price_asked,
+                    constants.ON_PRICE_ASKED_CHOICES) }}
+    {{ select_field('pricing_visibility', 'Pricing visibility', fields.pricing_visibility,
+                    constants.PRICING_VISIBILITY_CHOICES) }}
+    {{ number_field('spam_repeat', 'Spam rule — same question repeated (times)',
+                    fields.spam_repeat, 1, none, '3') }}
+    {{ select_field('spam_action', 'then', fields.spam_action, constants.SPAM_ACTIONS) }}
+  {% endcall %}
+</section>
+
+<section class="card config-section" id="config-api">
+  <h3>F. WhatsApp API configuration</h3>
+  {% if errors.get('api') %}<p class="flash error">{{ errors.api }}</p>{% endif %}
+  {% call section_form('api', 'Save API configuration', tenant.id, version) %}
+    <label>Provider <input value="meta_cloud_api" disabled></label>
+    <input type="hidden" name="provider" value="meta_cloud_api">
+    {{ select_field('window_24h_action', '24-hour window expired', fields.window_24h_action,
+                    constants.WINDOW_24H_ACTIONS) }}
+    {{ text_field('followup_template_name', 'Follow-up template name (approved in Meta Manager)',
+                  fields.followup_template_name, 100, 'order_followup_1') }}
+    <div class="section-actions">
+      <button type="submit" name="focus" value="followup_template_name" class="secondary">
+        Save template name only</button>
+    </div>
+    {{ text_field('human_handover_number', 'Human handover number',
+                  fields.human_handover_number, 20, '+254700123456') }}
+    {{ select_field('auto_close_ticket_after', 'Auto-close ticket after',
+                    fields.auto_close_ticket_after, constants.AUTO_CLOSE_CHOICES) }}
+    <p class="muted">WhatsApp access tokens and the app secret are server environment
+    variables. They are never stored here and never shown on this page.</p>
+  {% endcall %}
+</section>
+
+
+<section class="card config-section" id="config-knowledge">
+  <h3>G. Knowledge base (RAG)</h3>
+  {% if errors.get('knowledge') %}<p class="flash error">{{ errors.knowledge }}</p>{% endif %}
+  {% call section_form('knowledge', 'Save knowledge base', tenant.id, version) %}
+    {{ text_field('website_link', 'Website link', fields.website_link, 300, 'https://autolamps.co.ke') }}
+    <div class="section-actions">
+      <button type="submit" name="focus" value="website_link" class="secondary">
+        Save website URL only</button>
+    </div>
+    <label class="check"><input type="checkbox" name="include_subpages" value="1"
+      {{ 'checked' if fields.include_subpages else '' }}> Include subpages</label>
+    <input type="hidden" name="present_include_subpages" value="1">
+    {{ number_field('max_pages', 'Max pages', fields.max_pages, 1, 100, '20') }}
+
+    <label>FAQs — one pair per two lines
+      <textarea name="faqs_bulk" rows="5" spellcheck="false"
+                placeholder="Q: Mnafungua saa ngapi?&#10;A: Mon-Sat 8am-6pm">{{ fields.faqs_bulk }}</textarea>
+      {% if not fields.faqs %}<span class="muted">Not set</span>{% endif %}
+    </label>
+    <fieldset>
+      <legend>Documents (PDF/DOCX)</legend>
+      <input type="hidden" name="present_documents" value="1">
+      {% for document in fields.documents %}
+      <label class="check"><input type="checkbox" name="documents" value="{{ document }}" checked>
+        {{ document }}</label>
+      {% endfor %}
+      {% if not fields.documents %}<p class="muted">No documents registered yet.</p>{% endif %}
+      <label>Add documents
+        <input type="file" name="document_uploads" accept=".pdf,.docx" multiple></label>
+    </fieldset>
+    <p class="muted">Uploads are registered by the Knowledge Base save. RAG priority: FAQ &gt;
+    Products sheet (price, stock, availability) &gt; Extra info &gt; Website &gt; Documents.
+    IN_STOCK sells now; MADE_TO_ORDER asks for lead time.</p>
+    <label>Extra information (policies, branches, warranty…)
+      <textarea name="extra_info" rows="3" maxlength="4000"
+                placeholder="Hatuna branch. Warranty 6 months.">{{ fields.extra_info or '' }}</textarea>
+      {% if not fields.extra_info %}<span class="muted">Not set</span>{% endif %}
+    </label>
+  {% endcall %}
+</section>
+
+
+<h4>Saved FAQs</h4>
+<p class="muted">Each FAQ is saved on its own, so editing one never rewrites the others.</p>
+{% if errors.get('faq') %}<p class="flash error">{{ errors.faq }}</p>{% endif %}
+{% for faq in fields.faqs %}
+<form method="post" class="faq-row"
+      action="{{ url_for('admin.tenant_rules_section', tenant_id=tenant.id, section='faq') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="config_version" value="{{ version }}">
+  <input type="hidden" name="faq_index" value="{{ loop.index0 }}">
+  <label>Question <input name="faq_question" maxlength="500" value="{{ faq.question or '' }}"></label>
+  <label>Answer <textarea name="faq_answer" rows="2" maxlength="2000">{{ faq.answer or '' }}</textarea></label>
+  <div class="section-actions">
+    <button type="submit">Save this FAQ</button>
+    <button type="submit" name="faq_remove" value="1" class="secondary">Remove this FAQ</button>
+  </div>
+</form>
+{% else %}
+<p class="muted">No FAQs saved yet.</p>
+{% endfor %}
+
+<h4>Registered documents</h4>
+<p class="muted">Removing a document is always this explicit action.</p>
+{% if errors.get('document') %}<p class="flash error">{{ errors.document }}</p>{% endif %}
+{% for document in fields.documents %}
+<form method="post" class="document-row"
+      action="{{ url_for('admin.tenant_rules_section', tenant_id=tenant.id, section='document') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="config_version" value="{{ version }}">
+  <input type="hidden" name="document_name" value="{{ document }}">
+  <span>{{ document }}</span>
+  <button type="submit" class="secondary">Remove</button>
+</form>
+{% else %}
+<p class="muted">No documents registered yet.</p>
+{% endfor %}
+
+<h2>New client onboarding</h2>
+<form method="post" action="{{ url_for('admin.tenant_rules', tenant_id=tenant.id) }}"
+      id="save-all-sections">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="form_kind" value="whatsapp_onboarding">
+  <p class="muted">A brand-new client can still be configured in one action: this submits
+  every section above at once and keeps the original onboarding requirements (display name,
+  business type, tone, greeting and business description must be filled in).</p>
+  <button type="submit">Save every section at once</button>
+</form>
+
+<h2>Bot JSON output</h2>
+<p class="muted">Read-only: this is the single configuration the bot consumes. It is rebuilt
+from the stored settings on every page load, so it always shows what the bot would receive.</p>
+<pre>{{ preview | tojson(indent=2) }}</pre>
+
+<details class="card">
+  <summary>Advanced: raw JSON documents</summary>
+  <p class="muted">Each document is a JSON object stored for this tenant only, shown exactly
+  as stored so that saving it back cannot drop anything. These values are stored in plain
+  text: keep credentials out of them (WhatsApp access tokens and the app secret live in
+  server environment variables).</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% for column, label in labels %}
+    <label>{{ label }} <textarea name="{{ column }}" rows="8" spellcheck="false">{{ documents[column] }}</textarea></label>
+    {% endfor %}
+    <button type="submit">Save raw JSON</button>
+  </form>
+</details>
+
+<script src="{{ url_for('static', filename='tenant_rules.js') }}" defer></script>
 {% endblock %}
+

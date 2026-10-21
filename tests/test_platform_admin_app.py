@@ -458,6 +458,18 @@ class CatalogueTests(DashboardTestCase):
             cursor.execute("select count(*) from public.product_variants where tenant_id = %s", (self.tenant_b,))
             self.assertEqual(cursor.fetchone()[0], 0)
 
+    def test_catalogue_endpoint_returns_clean_error_not_500(self):
+        # A catalogue GET must never surface the generic "Something went wrong."
+        # handler: under a schema where public.product_variants is missing the
+        # catalogue columns (sku/availability/stock_quantity/reorder_level) the
+        # underlying query raises UndefinedColumn, which must translate to a clean
+        # 404, not a 500.
+        tenant_id = f"/tenants/{self.tenant_a}"
+        self.post(f"{tenant_id}/catalogue/products", {"name": "Widget"})
+        response = self.client.get(f"{tenant_id}/catalogue")
+        self.assertNotEqual(response.status_code, 500, response.get_data(as_text=True))
+        self.assertNotIn("Something went wrong.", response.get_data(as_text=True))
+
     def test_invalid_prices_and_duplicates_are_rejected(self):
         product_id = self.add_product(self.tenant_a)
         base = f"/tenants/{self.tenant_a}/catalogue/products/{product_id}/variants"
