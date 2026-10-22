@@ -1,12 +1,15 @@
-"""Local-only adapter between the dashboard and the real WhatsApp menu service.
+"""Adapter between the dashboard and the real WhatsApp menu service.
 
 The simulator never calls the WhatsApp webhook and never sends a message. It builds a
 ``MenuContext`` with a simulation customer identity, calls the same
 ``platform_admin.services.menu`` functions as the live channel, and returns the actual
 ``MenuReply`` objects for server-side rendering.
 
-The simulator is deliberately limited to loopback application databases. The normal
-``/playground`` AI path is not changed by this module.
+The simulator is limited to loopback application databases by default. A deployment may
+explicitly opt in to the configured non-loopback database with
+``MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=true``; that mode is intended for controlled
+testing and is documented with its production write risks. The normal ``/playground``
+AI path is not changed by this module.
 """
 
 from __future__ import annotations
@@ -26,15 +29,29 @@ SIMULATOR_WA_PREFIX = "simulator-"
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def remote_database_allowed(settings: Settings) -> bool:
+    """True only for the explicit, strictly parsed remote-database opt-in."""
+    return getattr(settings, "menu_simulator_allow_remote_database", False) is True
+
+
 def require_local_database(settings: Settings) -> None:
-    """Refuse the simulator when the application database is not loopback."""
+    """Refuse the simulator unless the database is loopback or explicitly allowed.
+
+    The default remains loopback-only. ``MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=true``
+    permits the already-configured ``SAAS_DATABASE_URL``; no second connection path or
+    credential source is introduced. An empty or malformed host always fails closed.
+    """
     try:
         host = (urlsplit(settings.app_database_url or "").hostname or "").lower()
     except ValueError as error:
         raise ServiceError("The menu simulator cannot inspect the database URL.", 403) from error
-    if host not in LOCAL_HOSTS:
+    if host in LOCAL_HOSTS:
+        return
+    if not host or not remote_database_allowed(settings):
         raise ServiceError(
-            "The WhatsApp Menu Simulator is available only with a loopback local database.",
+            "The WhatsApp Menu Simulator is available only with a loopback local database. "
+            "Set MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=true to use the configured remote "
+            "database explicitly.",
             403,
         )
 
@@ -60,7 +77,7 @@ def _active_channel(settings: Settings, tenant_id: str) -> dict[str, Any] | None
 def _simulation_identity(
     settings: Settings, tenant_id: str, admin_id: str, channel: dict[str, Any] | None
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return local-only customer/conversation rows for staff handover."""
+    """Return simulator-only customer/conversation rows for staff handover."""
     if channel is None:
         return None, None
     channel_id = str(channel.get("id") or "")
@@ -88,7 +105,8 @@ def make_context(
     message_id: str,
     include_identity: bool = False,
 ) -> menu.MenuContext:
-    """Build a real menu context using only local simulator identity."""
+    """Build a real menu context using only the synthetic simulator identity."""
+    require_local_database(settings)
     channel = _active_channel(settings, tenant_id)
     customer = None
     conversation = None

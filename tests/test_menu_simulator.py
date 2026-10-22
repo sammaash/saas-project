@@ -13,7 +13,7 @@ from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
 from platform_admin.app import create_app
-from platform_admin.config import Settings
+from platform_admin.config import ConfigError, Settings
 from platform_admin.services import menu as menu_service
 from platform_admin.services import menu_simulator as simulator_service
 from platform_admin.services.validation import ServiceError
@@ -21,6 +21,20 @@ from platform_admin.services.validation import ServiceError
 ADMIN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 TENANT_A = "11111111-1111-4111-8111-111111111111"
 TENANT_B = "22222222-2222-4222-8222-222222222222"
+
+REMOTE_ENV = {
+    "PLATFORM_SECRET_KEY": "k" * 40,
+    "SUPABASE_URL": "https://project.supabase.co",
+    "SUPABASE_ANON_KEY": "anon-key",
+    "SAAS_DATABASE_URL": "postgresql://app_backend:pw@db.invalid:5432/app",
+    "SAAS_PLATFORM_DATABASE_URL": "postgresql://saas_platform_admin:pw@db.invalid:5432/app",
+}
+
+
+def _env(**overrides: str) -> dict[str, str]:
+    values = dict(REMOTE_ENV)
+    values.update(overrides)
+    return values
 
 
 def _tenant(tenant_id: str, slug: str) -> dict[str, str]:
@@ -258,6 +272,95 @@ class MenuSimulatorAdapterTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ServiceError, "loopback"):
             simulator_service.require_local_database(settings)
+
+    def test_remote_database_is_allowed_only_with_explicit_true(self):
+        rejected = Settings.from_env(_env())
+        self.assertFalse(simulator_service.remote_database_allowed(rejected))
+        with self.assertRaisesRegex(ServiceError, "loopback"):
+            simulator_service.require_local_database(rejected)
+
+        allowed = Settings.from_env(
+            _env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE="true")
+        )
+        self.assertTrue(simulator_service.remote_database_allowed(allowed))
+        simulator_service.require_local_database(allowed)
+
+    def test_loopback_database_continues_to_work_without_the_flag(self):
+        settings = Settings.from_env(
+            _env(SAAS_DATABASE_URL="postgresql://app_backend:pw@127.0.0.1:5432/app")
+        )
+        self.assertFalse(settings.menu_simulator_allow_remote_database)
+        simulator_service.require_local_database(settings)
+
+    def test_false_flag_values_keep_remote_databases_rejected(self):
+        for value in ("false", "0", "no", "off"):
+            with self.subTest(value=value):
+                settings = Settings.from_env(
+                    _env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=value)
+                )
+                self.assertFalse(settings.menu_simulator_allow_remote_database)
+                with self.assertRaisesRegex(ServiceError, "loopback"):
+                    simulator_service.require_local_database(settings)
+
+    def test_invalid_flag_values_fail_closed(self):
+        for value in ("1", "yes", "on", "maybe", "2", "", "true false", "  "):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Settings.from_env(
+                    _env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=value)
+                )
+
+    def test_remote_flag_must_be_exactly_true_and_a_host_must_exist(self):
+        truthy_string = Settings(
+            secret_key="k" * 40,
+            app_database_url="postgresql://app_backend@db.invalid/app",
+            menu_simulator_allow_remote_database="true",
+        )
+        with self.assertRaisesRegex(ServiceError, "loopback"):
+            simulator_service.require_local_database(truthy_string)
+
+        missing_host = Settings(
+            secret_key="k" * 40,
+            app_database_url=None,
+            menu_simulator_allow_remote_database=True,
+        )
+        with self.assertRaisesRegex(ServiceError, "loopback"):
+            simulator_service.require_local_database(missing_host)
+
+    def test_remote_mode_uses_the_existing_url_and_synthetic_identity(self):
+        settings = Settings.from_env(
+            _env(
+                MENU_SIMULATOR_ALLOW_REMOTE_DATABASE="true",
+                WHATSAPP_SEND_ENABLED="1",
+            )
+        )
+        with patch(
+            "platform_admin.services.menu_simulator.channel_service.list_channels",
+            return_value=[],
+        ):
+            context = simulator_service.make_context(
+                settings,
+                TENANT_A,
+                ADMIN_ID,
+                {"configuration": {"menu": {"enabled": True}}},
+                message_id="sim-test",
+            )
+        self.assertEqual(context.tenant_id, TENANT_A)
+        self.assertEqual(context.wa_id, f"{simulator_service.SIMULATOR_WA_PREFIX}{ADMIN_ID}")
+        self.assertEqual(context.settings.app_database_url, settings.app_database_url)
+        self.assertFalse(context.settings.whatsapp_send_enabled)
+
+    def test_remote_status_uses_the_supplied_configured_settings(self):
+        settings = Settings.from_env(
+            _env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE="true")
+        )
+        with patch(
+            "platform_admin.services.menu_simulator.menu.load_document",
+            return_value={"configuration": {"menu": {"enabled": True}}},
+        ) as load:
+            enabled, document = simulator_service.status(settings, TENANT_A)
+        self.assertTrue(enabled)
+        self.assertEqual(document["configuration"]["menu"]["enabled"], True)
+        load.assert_called_once_with(settings, TENANT_A)
 
     def test_reply_view_preserves_list_ids_and_button_ids(self):
         list_reply = _main_reply()

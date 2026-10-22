@@ -40,6 +40,25 @@ def _flag(environ: dict[str, str], name: str) -> bool:
     return environ.get(name, "0") == "1"
 
 
+#: This opt-in is deliberately strict: only the literal boolean ``true`` enables remote
+#: access. Conventional false spellings are accepted as false; anything else fails closed.
+_TRUE_FLAGS = frozenset({"true"})
+_FALSE_FLAGS = frozenset({"false", "0", "no", "off"})
+
+
+def _strict_flag(environ: dict[str, str], name: str, *, default: bool = False) -> bool:
+    """Read a boolean environment flag, failing closed on anything unrecognised."""
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in _TRUE_FLAGS:
+        return True
+    if value in _FALSE_FLAGS:
+        return False
+    raise ConfigError(f"{name} must be exactly 'true' or 'false'.")
+
+
 def require_https(url: str, *, dev_mode: bool = False) -> str:
     """Return ``url`` if it is https (http only for loopback in explicit dev mode)."""
     parts = urlsplit(url)
@@ -180,6 +199,9 @@ class Settings:
     whatsapp_app_secret: str | None = None
     whatsapp_graph_api_version: str = "v21.0"
     whatsapp_send_enabled: bool = False
+    #: Explicit opt-in for the Menu Simulator to use a non-loopback configured database.
+    #: Default false keeps the simulator local-only.
+    menu_simulator_allow_remote_database: bool = False
     #: ``production`` unless ``SAAS_ENVIRONMENT`` declares otherwise. Only ``staging`` adds
     #: the isolation checks in :func:`_staging_guard`.
     environment: str = "production"
@@ -243,6 +265,9 @@ class Settings:
                 environ.get("WHATSAPP_GRAPH_API_VERSION", "v21.0").strip() or "v21.0"
             ),
             whatsapp_send_enabled=_flag(environ, "WHATSAPP_SEND_ENABLED"),
+            menu_simulator_allow_remote_database=_strict_flag(
+                environ, "MENU_SIMULATOR_ALLOW_REMOTE_DATABASE"
+            ),
             environment=environment,
         )
 

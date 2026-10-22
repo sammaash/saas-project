@@ -322,6 +322,26 @@ class ConfigTests(unittest.TestCase):
                     Settings.from_env(self.env(**{name: f"postgresql://{user}:pw@db.example.com/postgres"}))
         Settings.from_env(self.env(SAAS_DATABASE_URL="postgresql://app_backend.projectref:pw@pooler.example.com/postgres"))
 
+    def test_menu_simulator_remote_flag_is_strict_and_defaults_false(self):
+        self.assertFalse(
+            Settings.from_env(self.env()).menu_simulator_allow_remote_database
+        )
+        settings = Settings.from_env(
+            self.env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE="true")
+        )
+        self.assertTrue(settings.menu_simulator_allow_remote_database)
+        for value in ("false", "0", "no", "off"):
+            with self.subTest(value=value):
+                settings = Settings.from_env(
+                    self.env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=value)
+                )
+                self.assertFalse(settings.menu_simulator_allow_remote_database)
+        for value in ("1", "yes", "on", "maybe", "2", "", "true false", "  "):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Settings.from_env(
+                    self.env(MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=value)
+                )
+
     def test_numeric_settings_are_validated(self):
         for name, value in (("PLATFORM_SESSION_MINUTES", "0"), ("PLATFORM_SESSION_MINUTES", "x"),
                             ("PLATFORM_SESSION_MINUTES", "100000"), ("PLATFORM_TRUSTED_PROXIES", "-1"),

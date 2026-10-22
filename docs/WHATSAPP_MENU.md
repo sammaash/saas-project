@@ -84,6 +84,45 @@ all other sections. The menu simulator resets its conversation snapshot when the
 signature changes, so a builder save is visible on the next simulator load without a
 process restart.
 
+## Menu Simulator
+
+`/playground/menu` renders real `MenuReply` objects from
+`platform_admin.services.menu` for the selected tenant. It never calls the WhatsApp
+webhook, never calls a WhatsApp provider, and never sends a message. `make_context()`
+forces `whatsapp_send_enabled=False`, uses synthetic `sim-<uuid>` message ids, and uses a
+synthetic customer identity (`simulator-<admin-id>`) instead of a real phone number.
+
+### Database access
+
+- The simulator is **loopback-only by default**.
+- Set `MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=true` to allow the already-configured
+  non-loopback `SAAS_DATABASE_URL`. The simulator uses that existing configured
+  connection; it does not introduce a second connection path, credential source, or
+  hardcoded production URL.
+- Unset or `false` keeps loopback-only behavior. Only the literal `true` (case-insensitive)
+  enables remote access; other spellings such as `1`, `yes` or `on` fail closed at startup
+  with a `ConfigError`.
+- The normal `/playground` AI path is unchanged.
+
+### Production write risk
+
+Remote mode is intended for controlled testing. If `SAAS_DATABASE_URL` points at a
+production database, simulator actions may write there:
+
+- Creating or reusing the synthetic `simulator-<admin-id>` customer and its conversation
+  in the selected tenant/channel (`customers`, `conversations`). This can happen for
+  read-only menu actions too because the simulator prepares the same identity used by
+  staff handover.
+- The **Talk to Staff** action creates a `handover_requests` row for that synthetic
+  customer. With `whatsapp_send_enabled=False`, the staff notification attempt fails
+  without a provider call and the row is recorded as failed/visible for the operator.
+
+The simulator does **not** write tenant configuration/menu settings, catalogue data,
+orders, messages, webhook events, or audit rows, and it never changes another tenant or a
+real customer. Tenant scope still comes from the authorized dashboard tenant, and RLS
+still applies. Use a dedicated test tenant and clean up synthetic rows after testing;
+never enable remote mode casually against a customer-facing tenant.
+
 ## Commands and flows
 
 | Entry | Behaviour |
@@ -178,8 +217,9 @@ sends a real WhatsApp message.
 `tests/test_tenant_config_partial_updates.py` covers the Menu Builder: rendering defaults,
 saving a custom welcome/language/order/labels, disabling a row, rejecting duplicate ids,
 blank labels, unknown actions and invalid positions, tenant isolation, and simulator
-refresh after a save. `tests/test_menu_simulator.py` covers the simulator's safe reply view
-and configured menu handling.
+refresh after a save. `tests/test_menu_simulator.py` covers the simulator's safe reply view,
+configured menu handling, the loopback default, the explicit remote-database opt-in,
+invalid flag values, synthetic identity, and forced send suppression.
 
 `tests/test_menu_db.py` adds database-backed order-privacy and staff-assistance tests. The
 database suites require an explicit `SAAS_TEST_DATABASE_URL` naming a disposable local
