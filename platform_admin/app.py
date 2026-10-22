@@ -71,6 +71,15 @@ def create_app(
 
         bot_provider = OpenAIChatProvider(settings.openai_api_key, settings.openai_model)
 
+    if bot_provider is None:
+        # Not fatal (the playground is optional) but must be visible in server logs:
+        # deployments that forget OPENAI_API_KEY otherwise only discover it when a
+        # user hits the Bot Playground and receives the 503.
+        logger.warning(
+            "AI provider is not configured: OPENAI_API_KEY is not set in the server "
+            "environment, so the Bot Playground and bot replies are disabled."
+        )
+
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=settings.secret_key,

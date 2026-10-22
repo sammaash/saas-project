@@ -148,6 +148,9 @@ catalogue, and prices and totals are calculated server-side. Cart and conversati
 are short-lived, tenant-scoped, and stored only in the signed admin session. Demo checkout
 does not persist an order, reserve inventory, request payment, or send a WhatsApp message.
 Delivery and payment methods are shown only when explicitly present in tenant configuration.
+The WhatsApp Menu Simulator at `/playground/menu` is loopback-only by default. A controlled
+deployment may set `MENU_SIMULATOR_ALLOW_REMOTE_DATABASE=true` to use the already-configured
+remote database; see `docs/WHATSAPP_MENU.md` for the production write risks and safety rules.
 The page progressively enhances these server-rendered forms with same-origin `fetch()`
 requests, optimistic customer bubbles, a real pending indicator, and in-place chat and panel
 updates. The authenticated HTML form flow remains available when JavaScript is unavailable.

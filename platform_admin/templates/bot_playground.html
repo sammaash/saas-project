@@ -17,6 +17,11 @@
     {% endif %}
   </div>
 
+  <nav class="tabs playground-tabs" aria-label="Simulator mode">
+    <a href="{{ url_for('admin.bot_playground', tenant_id=tenant.id if tenant else '') }}" class="active">AI Playground</a>
+    <a href="{{ url_for('admin.menu_simulator', tenant_id=tenant.id if tenant else '') }}">WhatsApp Menu Simulator</a>
+  </nav>
+
   <form method="get" action="{{ url_for('admin.bot_playground') }}" class="tenant-picker">
     <label>Simulating tenant
       <select name="tenant_id">

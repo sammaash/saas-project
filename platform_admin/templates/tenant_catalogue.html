@@ -3,6 +3,7 @@
 {% from "_macros.html" import csrf_field, tenant_tabs %}
 {{ tenant_tabs(tenant, tab) }}
 <h2>Catalogue</h2>
+<p><a class="button" href="{{ url_for('admin.tenant_quotations', tenant_id=tenant.id) }}">Quotations</a></p>
 
 <section class="card">
   <h3>Excel import</h3>

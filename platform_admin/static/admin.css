@@ -30,6 +30,21 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; 
 .inactive { opacity: .7; }
 pre, code { font-size: .8rem; word-break: break-all; white-space: pre-wrap; }
 
+/* WhatsApp AI configuration tab: one form per section, one save per section. */
+.config-section { border-left: 3px solid transparent; }
+.config-section.dirty { border-left-color: #d59b28; }
+.config-section h3 { margin-top: 0; }
+.config-section h4 { margin-bottom: .25rem; }
+.section-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .6rem; }
+.section-state { font-size: .8rem; }
+.section-state.dirty { color: #8a6d1f; font-weight: 600; }
+button.secondary { background: #5f676d; }
+.day-row { align-items: end; }
+.faq-row { border-top: 1px solid #eee; padding-top: .5rem; }
+.faq-row label { margin: .25rem 0; }
+.document-row { display: flex; align-items: center; gap: .75rem; margin: .35rem 0; }
+.document-row span { flex: 1; font-size: .9rem; }
+
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .playground-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
 .playground-title h1 { margin: .35rem 0; }
@@ -126,3 +141,77 @@ pre, code { font-size: .8rem; word-break: break-all; white-space: pre-wrap; }
   .cart-line { grid-template-columns: 1fr 58px; }
   .cart-line > strong { grid-column: 1 / -1; }
 }
+/* WhatsApp customer-menu simulator: native list/button replies inside the phone. */
+.playground-tabs { margin: 0 0 1rem; }
+.menu-simulator-reply {
+  width: calc(100% - 1rem);
+  margin: -.2rem 0 .8rem .5rem;
+  padding: .65rem;
+  border: 1px solid #b9e3d9;
+  border-radius: 10px;
+  background: #f2fbf8;
+}
+.menu-simulator-reply > strong { color: #075e54; }
+.menu-simulator-section-title {
+  margin: .55rem 0 .3rem;
+  color: #53645f;
+  font-size: .75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.menu-simulator-option { margin: .3rem 0; }
+.menu-simulator-option button {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: .55rem .65rem;
+  border: 1px solid #b9e3d9;
+  border-radius: 7px;
+  background: #fff;
+  color: #075e54;
+  text-align: left;
+}
+.menu-simulator-option button span {
+  margin-top: .15rem;
+  color: #53645f;
+  font-size: .75rem;
+}
+.menu-simulator-footer {
+  display: block;
+  margin-top: .45rem;
+  color: #667781;
+  font-size: .72rem;
+}
+.button-link {
+  display: inline-block;
+  padding: .55rem .75rem;
+  border-radius: 6px;
+  background: #00a884;
+  color: #fff;
+  font-weight: 700;
+  text-decoration: none;
+}
+/* WhatsApp Menu Builder: editable option rows and a safe server-side preview. */
+.menu-builder-table { width: 100%; border-collapse: collapse; margin: .75rem 0; }
+.menu-builder-table th { text-align: left; font-size: .78rem; color: #53645f; }
+.menu-builder-table th,
+.menu-builder-table td { padding: .3rem; border-bottom: 1px solid #edf0f1; vertical-align: middle; }
+.menu-builder-table input,
+.menu-builder-table select { margin: 0; min-width: 0; }
+.menu-builder-table td:nth-child(1) { width: 18%; }
+.menu-builder-table td:nth-child(2) { width: 26%; }
+.menu-builder-table td:nth-child(3) { width: 22%; }
+.menu-builder-table td:nth-child(4),
+.menu-builder-table td:nth-child(5) { width: 9%; }
+.menu-builder-enabled { text-align: center; }
+.menu-builder-preview {
+  margin-top: 1rem;
+  padding: .85rem;
+  border: 1px dashed #b9e3d9;
+  border-radius: 10px;
+  background: #f7fffc;
+}
+.menu-builder-preview strong { display: block; margin: .35rem 0; color: #075e54; }
+.menu-builder-preview ol { margin: .35rem 0 0 1.25rem; padding: 0; }
+.menu-builder-preview li { margin: .2rem 0; }

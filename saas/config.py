@@ -11,6 +11,7 @@ unset, nothing in the existing application changes behaviour.
 from __future__ import annotations
 
 import os
+from decimal import Decimal, InvalidOperation
 
 # The role the backend connects as for tenant-scoped queries. It must never be the table
 # owner and must never be Supabase's service_role, because service_role BYPASSES RLS and
@@ -73,3 +74,43 @@ def platform_db_role() -> str:
 def app_db_role() -> str:
     """The fixed role required for tenant-scoped SaaS connections."""
     return APP_DB_ROLE
+
+
+# ---------------------------------------------------------------------------
+# Order policy configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_DEPOSIT_RATE = Decimal("0.5")   # 50% deposit required by default
+DEFAULT_DELIVERY_FEE_KES = Decimal("0")  # no delivery fee by default
+
+
+def order_policy_from_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract the order policy from tenant settings.
+
+    The policy lives in the ``business_rules`` JSON document on
+    ``public.tenant_settings``. Falls back to sensible defaults when unset so
+    that a tenant can operate without configuring anything, while still being
+    able to override deposit rate and delivery fee.
+    """
+    business_rules: dict[str, Any] = {}
+    if settings and isinstance(settings.get("business_rules"), dict):
+        business_rules = settings["business_rules"]
+
+    deposit_rate_raw = business_rules.get("deposit_rate")
+    delivery_fee_raw = business_rules.get("delivery_fee")
+
+    try:
+        deposit_rate = Decimal(str(deposit_rate_raw)) if deposit_rate_raw is not None else DEFAULT_DEPOSIT_RATE
+    except (InvalidOperation, TypeError, ValueError):
+        deposit_rate = DEFAULT_DEPOSIT_RATE
+
+    try:
+        delivery_fee = Decimal(str(delivery_fee_raw)) if delivery_fee_raw is not None else DEFAULT_DELIVERY_FEE_KES
+    except (InvalidOperation, TypeError, ValueError):
+        delivery_fee = DEFAULT_DELIVERY_FEE_KES
+
+    return {
+        "deposit_rate": deposit_rate,
+        "delivery_fee": delivery_fee,
+        "currency": settings.get("currency", "KES") if settings else "KES",
+    }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import io
 import time
+import uuid
 from datetime import datetime
 
 from flask import (
@@ -27,7 +28,12 @@ from ..auth import AuthError
 from ..authz import admin_required, context
 from ..services import catalogue as catalogue_service
 from ..services import catalogue_import as catalogue_import_service
+from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
+from ..services import customers as customer_service
+from ..services import handover as handover_service
+from ..services import menu as menu_service
+from ..services import menu_simulator as menu_simulator_service
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -42,6 +48,259 @@ whatsapp_bp = Blueprint("whatsapp", __name__)
 
 GENERIC_LOGIN_ERROR = "Invalid email or password."
 logger = logging.getLogger("platform_admin.playground")
+
+
+def _send_menu_reply(
+    settings,
+    channel: dict,
+    phone_number_id: str,
+    tenant_id: str,
+    recipient: str,
+    reply: "menu_service.MenuReply",
+) -> "menu_service.MenuSendResult":
+    """Try the native shape, then fall back to text only when it is safe.
+
+    A definite rejection (4xx, builder error, sending disabled) means Meta did not accept
+    the interactive message, so a text fallback cannot duplicate it. A timeout, reset,
+    5xx or malformed response is *ambiguous*: the message may already be delivered, so no
+    fallback is attempted and the caller must record an uncertain outcome.
+    """
+    body = reply.body or reply.text
+    interactive = reply.kind in ("list", "buttons") and len(body) <= 1024
+    if interactive:
+        try:
+            if reply.kind == "list":
+                wamid = whatsapp_service.send_list(
+                    settings,
+                    phone_number_id=phone_number_id,
+                    tenant_id=tenant_id,
+                    credentials_ref=channel.get("credentials_ref"),
+                    recipient=recipient,
+                    body=body,
+                    button_text=reply.button_text,
+                    sections=list(reply.sections),
+                    header=reply.header,
+                    footer=reply.footer,
+                )
+            else:
+                wamid = whatsapp_service.send_buttons(
+                    settings,
+                    phone_number_id=phone_number_id,
+                    tenant_id=tenant_id,
+                    credentials_ref=channel.get("credentials_ref"),
+                    recipient=recipient,
+                    body=body,
+                    buttons=list(reply.buttons),
+                    header=reply.header,
+                    footer=reply.footer,
+                )
+            return menu_service.MenuSendResult("sent", wamid=wamid)
+        except whatsapp_service.WhatsAppSendError as error:
+            if error.ambiguous:
+                logger.warning(
+                    "Ambiguous interactive send; not resending tenant=%s kind=%s code=%s",
+                    tenant_id,
+                    reply.kind,
+                    error.provider_code or error.http_status,
+                )
+                return menu_service.MenuSendResult(
+                    "uncertain",
+                    error_code=error.provider_code or "ambiguous_send",
+                    error_message=(error.provider_message or "WhatsApp outcome unknown")[:500],
+                )
+            logger.warning(
+                "Interactive send rejected; using text tenant=%s kind=%s code=%s",
+                tenant_id,
+                reply.kind,
+                error.provider_code or error.http_status,
+            )
+        except (ServiceError, ValueError) as error:
+            logger.warning(
+                "Interactive send unavailable; using text tenant=%s kind=%s error=%s",
+                tenant_id,
+                reply.kind,
+                type(error).__name__,
+            )
+        except Exception as error:  # noqa: BLE001 - outcome is unknown; never resend
+            logger.exception(
+                "Unexpected interactive send failure tenant=%s kind=%s",
+                tenant_id,
+                reply.kind,
+            )
+            return menu_service.MenuSendResult(
+                "uncertain",
+                error_code="menu_send_exception",
+                error_message=type(error).__name__,
+            )
+    try:
+        wamid = whatsapp_service.send_text(
+            settings,
+            phone_number_id=phone_number_id,
+            tenant_id=tenant_id,
+            credentials_ref=channel.get("credentials_ref"),
+            recipient=recipient,
+            text=reply.text,
+        )
+        return menu_service.MenuSendResult("sent", wamid=wamid)
+    except whatsapp_service.WhatsAppSendError as error:
+        return menu_service.MenuSendResult(
+            "uncertain" if error.ambiguous else "failed",
+            error_code=error.provider_code
+            or ("ambiguous_send" if error.ambiguous else "menu_delivery_failed"),
+            error_message=(error.provider_message or type(error).__name__)[:500],
+        )
+    except ServiceError as error:
+        return menu_service.MenuSendResult(
+            "failed",
+            error_code=type(error).__name__,
+            error_message=str(getattr(error, "message", error))[:500],
+        )
+    except ValueError as error:
+        return menu_service.MenuSendResult(
+            "failed", error_code="invalid_text", error_message=str(error)[:500]
+        )
+    except Exception as error:  # noqa: BLE001 - outcome is unknown; never resend
+        logger.exception("Unexpected text send failure tenant=%s", tenant_id)
+        return menu_service.MenuSendResult(
+            "uncertain",
+            error_code="menu_send_exception",
+            error_message=type(error).__name__,
+        )
+
+
+def _record_menu_outbound(
+    settings,
+    tenant_id: str,
+    channel_id: str,
+    conversation_id: str | None,
+    inbound_message_id: str,
+    reply: "menu_service.MenuReply",
+) -> tuple[dict | None, str]:
+    """Record the outbound intent before sending, reusing the existing message service.
+
+    Returns ``(row, state)`` where state is one of:
+    ``new`` (safe to send), ``already_sent`` (do not send), ``ambiguous`` (do not send),
+    ``unavailable`` (could not record; send anyway, without delivery correlation).
+    """
+    if not conversation_id:
+        return None, "unavailable"
+    message_type = "interactive" if reply.kind in ("list", "buttons") else "text"
+    common = {
+        "direction": "outbound",
+        "sender_type": "assistant",
+        "message_type": message_type,
+        "body_text": reply.text,
+        "payload": {"menu": {"kind": reply.kind}},
+    }
+    try:
+        try:
+            row = customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                conversation_id,
+                reply_to_provider_message_id=inbound_message_id,
+                **common,
+            )
+        except customer_service.SchemaOutOfDateError:
+            # 0035 is not applied: keep the outbound row and receipts, lose only the
+            # inbound-reply correlation and the at-most-one-reply backstop.
+            logger.warning(
+                "0035 not applied; recording menu reply without correlation tenant=%s",
+                tenant_id,
+            )
+            row = customer_service.save_message(
+                settings, tenant_id, channel_id, conversation_id, **common
+            )
+        return row, "new"
+    except customer_service.DuplicateReplyError:
+        try:
+            existing = customer_service.find_outbound_reply(
+                settings, tenant_id, channel_id, inbound_message_id
+            )
+        except Exception as error:  # noqa: BLE001 - do not resend on unknown state
+            logger.error(
+                "Duplicate menu reply lookup failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            return None, "ambiguous"
+        if existing and existing.get("provider_message_id"):
+            return existing, "already_sent"
+        return existing, "ambiguous"
+    except Exception as error:  # noqa: BLE001 - never block a menu reply on bookkeeping
+        logger.error(
+            "Menu outbound intent failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+        return None, "unavailable"
+
+
+def _finalize_menu_outbound(
+    settings,
+    tenant_id: str,
+    row: dict | None,
+    result: "menu_service.MenuSendResult",
+) -> None:
+    if not row or not row.get("id"):
+        return
+    try:
+        if result.outcome == "sent" and result.wamid:
+            customer_service.mark_message_sent(
+                settings, tenant_id, str(row["id"]), result.wamid
+            )
+            return
+        customer_service.mark_message_failed(
+            settings,
+            tenant_id,
+            str(row["id"]),
+            error_code=result.error_code
+            or ("ambiguous_send" if result.outcome == "uncertain" else "menu_delivery_failed"),
+            error_message=(
+                result.error_message
+                or (
+                    "WhatsApp outcome unknown"
+                    if result.outcome == "uncertain"
+                    else "Menu delivery failed"
+                )
+            )[:500],
+        )
+    except Exception as error:  # noqa: BLE001 - diagnostic only
+        logger.error(
+            "Menu outbound bookkeeping failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
+
+def _finalize_menu_event(
+    settings,
+    tenant_id: str,
+    inbound_message_id: str,
+    result: "menu_service.MenuSendResult",
+) -> None:
+    if result.outcome == "sent" and result.wamid:
+        whatsapp_service.update_event(
+            settings,
+            tenant_id,
+            inbound_message_id,
+            "processed",
+            response_message_id=result.wamid,
+        )
+        return
+    if result.outcome == "uncertain":
+        whatsapp_service.update_event(
+            settings, tenant_id, inbound_message_id, "failed", "menu_delivery_uncertain"
+        )
+        return
+    whatsapp_service.update_event(
+        settings,
+        tenant_id,
+        inbound_message_id,
+        "failed",
+        result.error_code or "menu_delivery_failed",
+    )
 
 
 @whatsapp_bp.get("/webhooks/whatsapp")
@@ -65,12 +324,130 @@ def whatsapp_webhook():
         raw_body, request.headers.get("X-Hub-Signature-256"), settings.whatsapp_app_secret
     ):
         return jsonify(ok=False, error="Invalid webhook signature."), 403
+    payload = None
     try:
-        event = whatsapp_service.parse_event(request.get_json(silent=True))
+        payload = request.get_json(silent=True)
+        event = whatsapp_service.parse_event(payload)
     except (TypeError, ValueError):
         event = None
     if event is None:
+        # A delivery-status webhook describes a message we sent. It carries no customer
+        # message id, so it is never claimed in whatsapp_webhook_events; applying it is
+        # idempotent instead (see customers.update_delivery_status).
+        statuses = whatsapp_service.parse_status_events(payload)
+        if statuses:
+            _apply_delivery_statuses(settings, statuses)
+            return jsonify(ok=True, statuses=len(statuses))
         return jsonify(ok=True, ignored=True)
+    if event["kind"] != "text":
+        action_id = str(event.get("action_id") or "")
+        if not action_id.startswith(menu_service.ACTION_PREFIX + "."):
+            # Not one of our menu ids (or menus are off): acknowledge and ignore, exactly
+            # as an unsupported interactive message behaved before menus existed.
+            logger.info(
+                "Interactive inbound acknowledged without routing channel=%s action_type=%s",
+                event["phone_number_id"],
+                event["action_type"],
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
+        if channel is None:
+            return jsonify(ok=False, error="Unknown or inactive channel."), 404
+        tenant_id = str(channel["tenant_id"])
+        channel_id = str(channel["channel_id"])
+        document = menu_service.load_document(settings, tenant_id)
+        parsed = menu_service.parse_action(action_id)
+        if not menu_service.is_enabled(document) or (
+            parsed.selection is None and not parsed.expired
+        ):
+            logger.info(
+                "Interactive menu ignored (disabled or unknown) tenant=%s", tenant_id
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        if not whatsapp_service.claim_event(
+            settings, tenant_id, channel_id, event["message_id"], event["customer_key"]
+        ):
+            return jsonify(ok=True, duplicate=True)
+
+        customer = None
+        conversation = None
+        try:
+            customer = customer_service.get_or_create_customer(
+                settings, tenant_id, channel_id, event["customer_key"]
+            )
+            conversation = customer_service.get_or_create_conversation(
+                settings, tenant_id, customer["id"], channel_id
+            )
+            customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                str(conversation["id"]),
+                direction="inbound",
+                sender_type="customer",
+                provider_message_id=event["message_id"],
+                message_type="interactive",
+                body_text=event.get("action_title") or None,
+                payload=event,
+            )
+        except Exception as error:  # noqa: BLE001 - never block the acknowledgement
+            logger.error(
+                "Interactive persistence failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+
+        ctx = menu_service.MenuContext(
+            settings=settings,
+            tenant_id=tenant_id,
+            wa_id=event["customer_key"],
+            document=document,
+            channel=channel,
+            phone_number_id=event["phone_number_id"],
+            customer=customer,
+            conversation=conversation,
+            message_id=event["message_id"],
+        )
+        reply = menu_service.handle_action(ctx, action_id)
+        if reply is None:
+            whatsapp_service.update_event(
+                settings, tenant_id, event["message_id"], "failed", "menu_no_reply"
+            )
+            return jsonify(ok=True, ignored=True, kind=event["kind"])
+        outbox_row, outbox_state = _record_menu_outbound(
+            settings,
+            tenant_id,
+            channel_id,
+            str(conversation["id"]) if conversation else None,
+            event["message_id"],
+            reply,
+        )
+        if outbox_state == "already_sent":
+            existing = (outbox_row or {}).get("provider_message_id")
+            whatsapp_service.update_event(
+                settings,
+                tenant_id,
+                event["message_id"],
+                "processed",
+                response_message_id=existing,
+            )
+            return jsonify(ok=True, menu=True, duplicate_reply=True)
+        if outbox_state == "ambiguous":
+            whatsapp_service.update_event(
+                settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+            )
+            return jsonify(ok=True, ambiguous=True)
+        result = _send_menu_reply(
+            settings,
+            channel,
+            event["phone_number_id"],
+            tenant_id,
+            event["customer_key"],
+            reply,
+        )
+        _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
+        _finalize_menu_event(settings, tenant_id, event["message_id"], result)
+        return jsonify(ok=True, menu=True, delivery=result.outcome)
     channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
     if channel is None:
         return jsonify(ok=False, error="Unknown or inactive channel."), 404
@@ -82,9 +459,110 @@ def whatsapp_webhook():
         event["customer_key"],
     ):
         return jsonify(ok=True, duplicate=True)
+
+    tenant_id = str(channel["tenant_id"])
+    channel_id = str(channel["channel_id"])
+    customer_key = event["customer_key"]
+
+    # --- tenant-isolated customer / conversation / message persistence -------
+    # These writes are non-fatal: a persistence problem must not prevent a
+    # 200 to Meta (which would trigger redelivery), but they are logged so
+    # the gap is visible. The existing whatsapp_conversations jsonb writes are
+    # preserved during the transition.
+    customer = None
+    conversation = None
+    try:
+        customer = customer_service.get_or_create_customer(
+            settings, tenant_id, channel_id, customer_key
+        )
+        conversation = customer_service.get_or_create_conversation(
+            settings, tenant_id, customer["id"], channel_id
+        )
+        customer_service.save_message(
+            settings,
+            tenant_id,
+            channel_id,
+            str(conversation["id"]),
+            direction="inbound",
+            sender_type="customer",
+            provider_message_id=event["message_id"],
+            message_type="text",
+            body_text=event["text"],
+            payload=event,
+        )
+    except Exception as error:  # noqa: BLE001 - never block webhook ack on persistence
+        logger.error(
+            "Customer/conversation/inbound persistence failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
+    # Explicit menu commands: "menu", "order <number>", a legacy option name, or a
+    # possibly configured row label. Lowercase ordinary chat stays on the AI path
+    # without a settings read; the authoritative label check happens after load.
+    if (
+        menu_service.is_menu_command(event["text"])
+        or menu_service.could_be_configured_label(event["text"])
+    ):
+        document = menu_service.load_document(settings, tenant_id)
+        if menu_service.is_enabled(document) and menu_service.is_menu_command(
+            event["text"], document
+        ):
+            menu_ctx = menu_service.MenuContext(
+                settings=settings,
+                tenant_id=tenant_id,
+                wa_id=customer_key,
+                document=document,
+                channel=channel,
+                phone_number_id=event["phone_number_id"],
+                customer=customer,
+                conversation=conversation,
+                message_id=event["message_id"],
+            )
+            try:
+                menu_reply = menu_service.handle_text(menu_ctx, event["text"])
+            except Exception:  # noqa: BLE001 - a menu bug must not break the AI path
+                logger.exception("Menu text handling failed tenant=%s", tenant_id)
+                menu_reply = None
+            if menu_reply is not None:
+                outbox_row, outbox_state = _record_menu_outbound(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]) if conversation else None,
+                    event["message_id"],
+                    menu_reply,
+                )
+                if outbox_state == "already_sent":
+                    existing = (outbox_row or {}).get("provider_message_id")
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "processed",
+                        response_message_id=existing,
+                    )
+                    return jsonify(ok=True, menu=True, duplicate_reply=True)
+                if outbox_state == "ambiguous":
+                    whatsapp_service.update_event(
+                        settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+                    )
+                    return jsonify(ok=True, ambiguous=True)
+                result = _send_menu_reply(
+                    settings,
+                    channel,
+                    event["phone_number_id"],
+                    tenant_id,
+                    customer_key,
+                    menu_reply,
+                )
+                _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
+                _finalize_menu_event(settings, tenant_id, event["message_id"], result)
+                return jsonify(ok=True, menu=True, delivery=result.outcome)
+
     try:
         history = whatsapp_service.conversation_history(
-            settings, str(channel["tenant_id"]), event["customer_key"]
+            settings, tenant_id, customer_key
         )
         turns = [
             ConversationTurn(str(item.get("role", "")), str(item.get("text", "")))
@@ -97,31 +575,196 @@ def whatsapp_webhook():
         response = BotResponseEngine(
             TenantBotContextLoader(settings.app_database_url), provider
         ).respond(
-            str(channel["tenant_id"]),
+            tenant_id,
             event["text"],
             turns,
             channel="whatsapp",
             safe_test_mode=False,
+            customer_key=customer_key,
+            message_id=event["message_id"],
         )
-        outbound_id = whatsapp_service.send_text(
-            settings,
-            phone_number_id=event["phone_number_id"],
-            tenant_id=str(channel["tenant_id"]),
-            credentials_ref=channel.get("credentials_ref"),
-            recipient=event["customer_key"],
-            text=response.text,
-        )
+        # A turn that needs a human handover is answered with wording the platform owns,
+        # chosen from whether the staff notification actually succeeded. Handover trouble
+        # must never silence the bot, so it falls back to the honest apology instead.
+        try:
+            handover_reply = handover_service.handle_turn(
+                settings,
+                tenant_id=tenant_id,
+                channel=channel,
+                phone_number_id=event["phone_number_id"],
+                customer_key=customer_key,
+                customer=customer,
+                conversation=conversation,
+                message_id=event["message_id"],
+                customer_message=event["text"],
+                bot_response=response,
+                history=history,
+            )
+        except Exception as error:  # noqa: BLE001 - never silence the bot
+            logger.error(
+                "Handover handling failed tenant=%s error=%s", tenant_id, type(error).__name__
+            )
+            handover_reply = handover_service.safe_reply(response)
+        reply_text = handover_reply or response.text
+
+        # Record the intent to reply BEFORE sending. The partial unique index on
+        # (tenant_id, channel_id, reply_to_provider_message_id) is what makes a second
+        # outbound row for the same inbound message impossible, so a redelivery cannot
+        # produce a duplicate reply even if the claim table is ever bypassed.
+        outbox_row = None
+        outbox_supported = True
+        if conversation:
+            try:
+                outbox_row = customer_service.save_message(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]),
+                    direction="outbound",
+                    sender_type="assistant",
+                    message_type="text",
+                    body_text=reply_text,
+                    payload={"text": reply_text},
+                    reply_to_provider_message_id=event["message_id"],
+                )
+            except customer_service.DuplicateReplyError:
+                existing = customer_service.find_outbound_reply(
+                    settings, tenant_id, channel_id, event["message_id"]
+                )
+                already_sent = (existing or {}).get("provider_message_id")
+                if already_sent:
+                    # The reply was already sent for this inbound message. Finish the
+                    # bookkeeping without sending a second one.
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "processed",
+                        response_message_id=str(already_sent),
+                    )
+                    return jsonify(
+                        ok=True, message_id=str(already_sent), duplicate_reply=True
+                    )
+                # Ambiguous: an earlier attempt recorded the reply but we never saw a
+                # successful send response. A free-form reply is not repeatable, so it is
+                # never resent automatically. The row is left for manual reconciliation
+                # (docs/OUTBOUND_DELIVERY.md): this code does not send
+                # biz_opaque_callback_data yet, so a receipt cannot identify it.
+                logger.error(
+                    "Ambiguous outbound reply, not resending tenant=%s message_id=%s",
+                    tenant_id,
+                    event["message_id"],
+                )
+                whatsapp_service.update_event(
+                    settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
+                )
+                return jsonify(ok=True, ambiguous=True)
+            except customer_service.SchemaOutOfDateError:
+                # Migration 0035 has not been applied here. Keep the pre-0035 behaviour
+                # (persist the outbound row after the send) instead of losing history.
+                outbox_supported = False
+                logger.warning(
+                    "Outbound correlation columns are absent; using pre-0035 persistence. "
+                    "Apply migration 0035 to enable reply correlation."
+                )
+            except Exception as error:  # noqa: BLE001 - never silence the bot
+                logger.error(
+                    "Outbound intent persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+        try:
+            outbound_id = whatsapp_service.send_text(
+                settings,
+                phone_number_id=event["phone_number_id"],
+                tenant_id=tenant_id,
+                credentials_ref=channel.get("credentials_ref"),
+                recipient=customer_key,
+                text=reply_text,
+            )
+        except ServiceError as error:
+            if outbox_row:
+                try:
+                    customer_service.mark_message_failed(
+                        settings,
+                        tenant_id,
+                        str(outbox_row["id"]),
+                        error_code=getattr(error, "provider_code", None)
+                        or type(error).__name__,
+                        error_message=getattr(error, "provider_message", None)
+                        or error.message,
+                    )
+                except Exception as mark_error:  # noqa: BLE001 - diagnostic only
+                    logger.error(
+                        "Failed-send recording failed tenant=%s error=%s",
+                        tenant_id,
+                        type(mark_error).__name__,
+                    )
+            raise
+        if outbox_row:
+            try:
+                customer_service.mark_message_sent(
+                    settings, tenant_id, str(outbox_row["id"]), outbound_id
+                )
+            except Exception as error:  # noqa: BLE001 - the reply already reached Meta
+                # The reply went out but its wamid was not recorded. Nothing repairs this
+                # automatically: receipts match on the wamid, and this code does not send
+                # biz_opaque_callback_data yet. See docs/OUTBOUND_DELIVERY.md.
+                logger.error(
+                    "Outbound wamid persistence failed tenant=%s wamid=%s error=%s",
+                    tenant_id,
+                    outbound_id,
+                    type(error).__name__,
+                )
+        elif not outbox_supported and conversation:
+            # Pre-0035 schema: preserve the original behaviour of recording the outbound
+            # message after a successful send. Correlation is unavailable, history is not.
+            try:
+                customer_service.save_message(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    str(conversation["id"]),
+                    direction="outbound",
+                    sender_type="assistant",
+                    provider_message_id=outbound_id,
+                    message_type="text",
+                    body_text=reply_text,
+                    payload={"text": reply_text},
+                    delivery_status="sent",
+                )
+            except Exception as error:  # noqa: BLE001 - non-fatal
+                logger.error(
+                    "Outbound message persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+        if conversation:
+            try:
+                customer_service.update_conversation_activity(
+                    settings, tenant_id, str(conversation["id"])
+                )
+            except Exception as error:  # noqa: BLE001 - non-fatal
+                logger.error(
+                    "Conversation activity refresh failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
         history.extend(
             [
                 {"role": "user", "text": event["text"][:1000]},
-                {"role": "assistant", "text": response.text[:1000]},
+                {"role": "assistant", "text": reply_text[:1000]},
             ]
         )
         whatsapp_service.save_conversation(
-            settings, str(channel["tenant_id"]), event["customer_key"], history
+            settings, tenant_id, customer_key, history
         )
         whatsapp_service.update_event(
-            settings, str(channel["tenant_id"]), event["message_id"], "processed"
+            settings,
+            tenant_id,
+            event["message_id"],
+            "processed",
+            response_message_id=outbound_id,
         )
         return jsonify(ok=True, message_id=outbound_id)
     except ServiceError as error:
@@ -137,6 +780,127 @@ def whatsapp_webhook():
             "WhatsApp webhook processing failed type=%s", type(error).__name__
         )
         return jsonify(ok=False, error="WhatsApp message processing failed."), 502
+
+
+def _apply_delivery_statuses(settings, statuses: list[dict[str, str]]) -> None:
+    """Apply delivery receipts to the outbound rows they refer to.
+
+    Delivery is Meta's own signal, so this never creates a row and never fails the
+    webhook: an unknown wamid or channel is logged and ignored. Matching is by wamid,
+    falling back to the outbox row id only if a sender supplied it as
+    ``biz_opaque_callback_data``. No caller supplies it yet, so every receipt today is
+    matched by wamid, and an outbound row without one needs manual reconciliation
+    (see docs/OUTBOUND_DELIVERY.md).
+    """
+    for item in statuses:
+        channel = whatsapp_service.resolve_channel(settings, item["phone_number_id"])
+        if channel is None:
+            logger.warning("Delivery status for an unknown channel was ignored.")
+            continue
+        row_id = None
+        callback = item.get("biz_opaque_callback_data") or ""
+        if callback:
+            try:
+                row_id = str(uuid.UUID(callback))
+            except (ValueError, AttributeError, TypeError):
+                row_id = None
+        try:
+            changed = customer_service.update_delivery_status(
+                settings,
+                str(channel["tenant_id"]),
+                status=item["status"],
+                provider_message_id=item["provider_message_id"],
+                row_id=row_id,
+                error_code=item.get("error_code") or None,
+                error_message=item.get("error_message") or None,
+            )
+        except Exception as error:  # noqa: BLE001 - never fail a status webhook
+            logger.error(
+                "Delivery status write failed tenant=%s error=%s",
+                str(channel["tenant_id"]),
+                type(error).__name__,
+            )
+            continue
+        if not changed:
+            logger.info("Delivery status matched no message and was ignored.")
+
+
+# ----------------------------------------------------------------- customers
+@admin_bp.get("/tenants/<tenant_id>/customers")
+@admin_required
+def customer_list(tenant_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "20") or "20"), 100))
+    search = (request.args.get("search") or "").strip() or None
+    rows, total = customer_service.list_customers(
+        settings, tenant_id, search=search, page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "customer_list.html",
+        tenant=g.tenant,
+        customers=rows,
+        total=total,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        search=search or "",
+        tab="customers",
+    )
+
+
+@admin_bp.get("/tenants/<tenant_id>/customers/<customer_id>")
+@admin_required
+def customer_detail(tenant_id, customer_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    customer = customer_service.get_customer(settings, tenant_id, customer_id)
+    if customer is None:
+        abort(404)
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "50") or "50"), 200))
+    conversations, total = customer_service.list_conversations(
+        settings, tenant_id, customer_id=customer_id, page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "customer_detail.html",
+        tenant=g.tenant,
+        customer=customer,
+        conversations=conversations,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        tab="customers",
+    )
+
+
+@admin_bp.get("/tenants/<tenant_id>/conversations/<conversation_id>")
+@admin_required
+def conversation_detail(tenant_id, conversation_id):
+    _tenant(tenant_id)
+    settings = context().settings
+    conversation = customer_service.get_conversation(settings, tenant_id, conversation_id)
+    if conversation is None:
+        abort(404)
+    page = max(1, int(request.args.get("page", "1") or "1"))
+    page_size = max(1, min(int(request.args.get("page_size", "50") or "50"), 200))
+    messages, total = customer_service.list_messages(
+        settings, tenant_id, str(conversation["id"]), page=page, page_size=page_size
+    )
+    pages = (total + page_size - 1) // page_size if total else 1
+    return render_template(
+        "conversation_detail.html",
+        tenant=g.tenant,
+        conversation=conversation,
+        messages=messages,
+        page=page,
+        pages=pages,
+        page_size=page_size,
+        tab="customers",
+    )
 
 
 # --------------------------------------------------------------------- auth
@@ -532,25 +1296,160 @@ def tenant_profile(tenant_id):
     return render_template("tenant_profile.html", tenant=tenant, profile=profile, tab="profile")
 
 
+def _render_rules(
+    tenant: dict, *, errors: dict | None = None, submitted: dict | None = None
+) -> str:
+    """Render the rules tab from the tenant's *stored* configuration.
+
+    ``submitted`` overlays what a rejected save posted, so a failed change keeps the
+    operator's edits on screen next to the error instead of silently discarding them.
+    """
+    settings = context().settings
+    stored = bot_config_service.load_configuration(settings, tenant["id"])
+    fields = bot_config_service.field_values(stored)
+    if submitted:
+        fields = {**fields, **{key: value for key, value in submitted.items() if key in fields}}
+        if submitted.get("present_menu_options"):
+            submitted_options = []
+            for index in range(menu_service.MAX_MENU_OPTIONS):
+                option = {
+                    "id": submitted.get(f"option_id_{index}", ""),
+                    "label": submitted.get(f"option_label_{index}", ""),
+                    "action": submitted.get(f"option_action_{index}", ""),
+                    "enabled": submitted.get(f"option_enabled_{index}") == "1",
+                    "position": submitted.get(f"option_position_{index}", ""),
+                }
+                if any(option[key] for key in ("id", "label", "action")):
+                    submitted_options.append(option)
+            fields["menu_options"] = submitted_options
+    products = catalogue_service.list_catalogue(settings, tenant["id"])
+    categories = sorted({p["category"] for p in products if p.get("category")})
+    return render_template(
+        "tenant_rules.html",
+        tenant=tenant,
+        documents=tenant_service.mask_documents(stored),
+        labels=tenant_service.RULE_DOCUMENTS,
+        tab="rules",
+        fields=fields,
+        categories=categories,
+        constants=tenant_service,
+        menu_actions=menu_service.MENU_ACTIONS,
+        version=bot_config_service.version_of(stored),
+        errors=errors or {},
+        preview=tenant_service.bot_config_preview(stored),
+    )
+
+
+def _section_payload() -> dict:
+    """The submitted section form: repeated controls become lists, uploads join documents."""
+    payload = _form()
+    for key in bot_config_service.MULTI_VALUE_FIELDS:
+        if key in request.form or f"{bot_config_service.PRESENCE_PREFIX}{key}" in request.form:
+            payload[key] = request.form.getlist(key)
+    if "documents" in payload:
+        uploaded = [f.filename for f in request.files.getlist("document_uploads") if f.filename]
+        payload["documents"] = sorted(set(payload["documents"]) | set(uploaded))
+    return payload
+
+
 @admin_bp.route("/tenants/<tenant_id>/rules", methods=["GET", "POST"])
 @admin_required
 def tenant_rules(tenant_id):
-    import json  # noqa: PLC0415
-
     tenant = _tenant(tenant_id)
     settings = context().settings
     if request.method == "POST":
+        if request.form.get("form_kind") == "whatsapp_onboarding":
+            return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
+                        lambda: tenant_service.update_rules_from_form(
+                            settings, g.admin_id, tenant["id"], _section_payload()))
         return _act("admin.tenant_rules", tenant["id"], "Rules and AI configuration saved.",
                     lambda: tenant_service.update_rules(settings, g.admin_id, tenant["id"], _form()))
-    profile = tenant_service.get_profile(settings, tenant["id"])
-    documents = {
-        column: json.dumps(profile["settings"][column], indent=2, sort_keys=True)
-        for column, _label in tenant_service.RULE_DOCUMENTS
-    }
-    return render_template(
-        "tenant_rules.html", tenant=tenant, documents=documents,
-        labels=tenant_service.RULE_DOCUMENTS, tab="rules",
+    return _render_rules(tenant)
+
+
+@admin_bp.get("/tenants/<tenant_id>/rules/config")
+@admin_required
+def tenant_rules_config(tenant_id):
+    """The saved configuration for one tenant: the section forms load their state from this."""
+    tenant = _tenant(tenant_id)
+    return jsonify(
+        ok=True, **bot_config_service.configuration_snapshot(context().settings, tenant["id"])
     )
+
+
+@admin_bp.route("/tenants/<tenant_id>/rules/<section>", methods=["POST", "PATCH"])
+@admin_required
+def tenant_rules_section(tenant_id, section):
+    """Save one section -- or, with ``focus``, one field -- without touching anything else."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    payload = (
+        dict(request.get_json(silent=True) or {}) if request.is_json else _section_payload()
+    )
+    try:
+        stored = bot_config_service.apply_section(
+            settings,
+            g.admin_id,
+            tenant["id"],
+            section,
+            payload,
+            expected_version=payload.get(bot_config_service.VERSION_FIELD) or None,
+        )
+    except ServiceError as error:
+        if request.is_json:
+            return jsonify(ok=False, error=error.message), error.status
+        if error.status == 404:
+            abort(404)
+        return _render_rules(tenant, errors={section: error.message}, submitted=payload), error.status
+    if request.is_json:
+        return jsonify(
+            ok=True,
+            version=bot_config_service.version_of(stored),
+            fields=bot_config_service.field_values(stored),
+        )
+    flash(f"{bot_config_service.SECTION_LABELS.get(section, 'Configuration')} saved.", "ok")
+    return redirect(url_for("admin.tenant_rules", tenant_id=tenant["id"]))
+
+
+# ---------------------------------------------------------------- handovers
+@admin_bp.get("/tenants/<tenant_id>/handovers")
+@admin_required
+def tenant_handovers(tenant_id):
+    """Human-handover requests for one tenant: what staff still have to answer."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    status = (request.args.get("status") or "").strip()
+    return render_template(
+        "tenant_handovers.html",
+        tenant=tenant,
+        tab="handovers",
+        requests=handover_service.tenant_requests(settings, tenant["id"], status=status or None),
+        status=status,
+        statuses=handover_service.STAFF_STATUSES,
+        summary=handover_service.status_summary(settings, tenant["id"]),
+    )
+
+
+@admin_bp.post("/tenants/<tenant_id>/handovers/<handover_id>/status")
+@admin_required
+def tenant_handover_status(tenant_id, handover_id):
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    status = request.form.get("status") or ""
+    return _act("admin.tenant_handovers", tenant["id"], "Handover updated.",
+                lambda: handover_service.change_status(
+                    settings, g.admin_id, tenant["id"], handover_id, status))
+
+
+@admin_bp.post("/tenants/<tenant_id>/handovers/<handover_id>/notify")
+@admin_required
+def tenant_handover_notify(tenant_id, handover_id):
+    """Retry a staff notification that failed, using the tenant's active channel."""
+    tenant = _tenant(tenant_id)
+    settings = context().settings
+    return _act("admin.tenant_handovers", tenant["id"], "Staff notified.",
+                lambda: handover_service.renotify(
+                    settings, g.admin_id, tenant, handover_id))
 
 
 # ---------------------------------------------------------------- catalogue
@@ -933,6 +1832,222 @@ def bot_playground_api():
 @admin_required
 def tenant_bot_playground(tenant_id):
     return _render_playground(tenant_id, form_message="")
+
+
+# ------------------------------------------------------- WhatsApp menu simulator
+MENU_SIMULATOR_SESSION = "menu_simulator_states"
+
+
+def _menu_simulator_states() -> dict:
+    states = session.get(MENU_SIMULATOR_SESSION)
+    return states if isinstance(states, dict) else {}
+
+
+def _menu_simulator_key(tenant_id: str) -> str:
+    return f"{g.admin_id}:{tenant_id}"
+
+
+def _menu_simulator_signature(document: dict) -> str:
+    """A stable signature so a saved builder change refreshes the simulator."""
+    return repr(menu_service.menu_config(document))
+
+
+def _new_menu_simulator_state(settings, tenant_id: str) -> tuple[bool, dict]:
+    enabled, document = menu_simulator_service.status(settings, tenant_id)
+    signature = _menu_simulator_signature(document)
+    if not enabled:
+        return False, {
+            "enabled": False,
+            "signature": signature,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "text": menu_simulator_service.disabled_message(tenant_id),
+                    "reply": None,
+                }
+            ],
+        }
+    reply = menu_service.main_menu(document)
+    return True, {
+        "enabled": True,
+        "signature": signature,
+        "messages": [
+            {
+                "role": "assistant",
+                "text": reply.text,
+                "reply": menu_simulator_service.reply_view(reply),
+            }
+        ],
+    }
+
+
+def _render_menu_simulator(
+    tenant_id: str | None,
+    *,
+    state: dict | None = None,
+    error: str | None = None,
+):
+    settings = context().settings
+    tenants = tenant_service.list_tenants(settings, g.admin_id)
+    selected_id = _preferred_tenant_id(
+        tenant_id,
+        request.args.get("tenant_slug") or request.form.get("tenant_slug"),
+        tenants=tenants,
+    )
+    if selected_id is None:
+        return render_template(
+            "menu_simulator.html",
+            tenants=[],
+            tenant=None,
+            selected_tenant_id=None,
+            menu_enabled=False,
+            state={"messages": []},
+            error=error,
+        )
+    tenant = next((entry for entry in tenants if str(entry["id"]) == str(selected_id)), None)
+    if tenant is None:
+        tenant = tenant_service.get_tenant(settings, g.admin_id, selected_id)
+    if tenant is None:
+        return render_template(
+            "menu_simulator.html",
+            tenants=tenants,
+            tenant=None,
+            selected_tenant_id=None,
+            menu_enabled=False,
+            state={"messages": []},
+            error=error,
+        )
+    enabled, document = menu_simulator_service.status(settings, tenant["id"])
+    signature = _menu_simulator_signature(document)
+    if state is not None and (
+        bool(state.get("enabled")) != enabled or state.get("signature") != signature
+    ):
+        state = None
+    if state is None:
+        states = _menu_simulator_states()
+        key = _menu_simulator_key(str(tenant["id"]))
+        state = states.get(key)
+        if (
+            not state
+            or bool(state.get("enabled")) != enabled
+            or state.get("signature") != signature
+        ):
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+            states[key] = state
+            session[MENU_SIMULATOR_SESSION] = states
+    return render_template(
+        "menu_simulator.html",
+        tenants=tenants,
+        tenant=tenant,
+        selected_tenant_id=str(selected_id),
+        menu_enabled=enabled,
+        state=state,
+        error=error,
+    )
+
+
+@admin_bp.route("/playground/menu", methods=["GET", "POST"])
+@admin_required
+def menu_simulator():
+    if request.method == "GET":
+        return _render_menu_simulator(request.args.get("tenant_id"))
+
+    tenant_id = request.form.get("tenant_id", "")
+    try:
+        tenant = _tenant(tenant_id)
+        settings = context().settings
+        enabled, document = menu_simulator_service.status(settings, tenant["id"])
+        if not enabled:
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+            return _render_menu_simulator(tenant["id"], state=state)
+
+        states = _menu_simulator_states()
+        key = _menu_simulator_key(str(tenant["id"]))
+        state = states.get(key)
+        if not state or not state.get("enabled"):
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+
+        action = request.form.get("action") or "text"
+        if action == "reset":
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+        elif action == "text":
+            text = (request.form.get("customer_message") or "").strip()[:2000]
+            if not text:
+                raise ServiceError("Type a customer message first.")
+            state["messages"].append({"role": "customer", "text": text, "reply": None})
+            menu_context = menu_simulator_service.make_context(
+                settings,
+                tenant["id"],
+                g.admin_id,
+                document,
+                message_id=f"sim-{uuid.uuid4().hex}",
+                include_identity=True,
+            )
+            reply = menu_service.handle_text(menu_context, text)
+            if reply is None:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": (
+                            "That isn't a menu command. Reply MENU or choose one of "
+                            "the options shown above."
+                        ),
+                        "reply": None,
+                    }
+                )
+            else:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": reply.text,
+                        "reply": menu_simulator_service.reply_view(reply),
+                    }
+                )
+        else:
+            action_id = (request.form.get("action_id") or "").strip()
+            if not action_id:
+                raise ServiceError("Choose a menu option first.", 400)
+            action_title = (
+                request.form.get("action_title") or "Menu option"
+            ).strip()[:100]
+            state["messages"].append(
+                {"role": "customer", "text": action_title, "reply": None}
+            )
+            menu_context = menu_simulator_service.make_context(
+                settings,
+                tenant["id"],
+                g.admin_id,
+                document,
+                message_id=f"sim-{uuid.uuid4().hex}",
+                include_identity=True,
+            )
+            reply = menu_service.handle_action(menu_context, action_id)
+            if reply is None:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": (
+                            "That menu option is no longer available. Reply MENU to "
+                            "start again."
+                        ),
+                        "reply": None,
+                    }
+                )
+            else:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": reply.text,
+                        "reply": menu_simulator_service.reply_view(reply),
+                    }
+                )
+
+        state["messages"] = state["messages"][-20:]
+        states[key] = state
+        session[MENU_SIMULATOR_SESSION] = states
+        return _render_menu_simulator(tenant["id"], state=state)
+    except ServiceError as error:
+        return _render_menu_simulator(tenant_id, error=error.message), error.status
 
 
 def register_routes(app: Flask) -> None:

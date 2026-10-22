@@ -11,9 +11,17 @@ from unittest import mock
 from db.run_migrations import apply_migrations, is_local_target, main
 
 try:
-    from .saas_test_support import SaasDatabaseTestCase, test_database_url
+    from .saas_test_support import (
+        SaasDatabaseTestCase,
+        require_test_database_url,
+        test_database_url,
+    )
 except ImportError:
-    from saas_test_support import SaasDatabaseTestCase, test_database_url  # type: ignore[no-redef]
+    from saas_test_support import (  # type: ignore[no-redef]
+        SaasDatabaseTestCase,
+        require_test_database_url,
+        test_database_url,
+    )
 
 
 class ResetSafetyTests(unittest.TestCase):
@@ -137,7 +145,9 @@ class MigrationChecksumTests(SaasDatabaseTestCase):
         with tempfile.TemporaryDirectory() as directory:
             migration = Path(directory) / "0001_extensions_and_helpers.sql"
             migration.write_text("select 1; -- changed", encoding="utf-8")
-            conn = psycopg.connect(test_database_url())
+            # Fail closed immediately before the connection: no ambient DSN can be used.
+            url = require_test_database_url()
+            conn = psycopg.connect(url)
             try:
                 with self.assertRaisesRegex(SystemExit, "modified after it was applied"):
                     apply_migrations(conn, Path(directory))
