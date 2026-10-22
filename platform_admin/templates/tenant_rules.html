@@ -283,6 +283,85 @@ and a failed save leaves the stored configuration exactly as it was.</p>
 </section>
 
 
+<section class="card config-section" id="config-menu">
+  <h3>H. WhatsApp customer menu <span class="eyebrow">Menu Builder</span></h3>
+  {% if errors.get('menu') %}<p class="flash error">{{ errors.menu }}</p>{% endif %}
+  {% set menu_options = fields.menu_options or [] %}
+  {% call section_form('menu', 'Save WhatsApp menu', tenant.id, version) %}
+    <input type="hidden" name="present_menu_enabled" value="1">
+    <label class="check">
+      <input type="checkbox" name="menu_enabled" value="1"
+        {{ 'checked' if fields.menu_enabled else '' }}>
+      Enable WhatsApp Menu
+    </label>
+    <p class="muted">When enabled, only the options below are shown, in position order.
+    Disabled options remain saved but are neither displayed nor executable.</p>
+    <label>Welcome message
+      <input name="menu_welcome_message" maxlength="300"
+             value="{{ fields.menu_welcome_message or '' }}">
+      <span class="muted">Shown above the numbered option list. Leave blank to use the
+      backward-compatible default.</span>
+    </label>
+    <label>Language
+      <input name="menu_language" maxlength="16"
+             value="{{ fields.menu_language or 'en' }}" placeholder="en">
+      <span class="muted">Language tag such as en or en-KE; content is not translated
+      automatically.</span>
+    </label>
+
+    <input type="hidden" name="present_menu_options" value="1">
+    <table class="menu-builder-table">
+      <thead><tr><th>ID</th><th>Label</th><th>Action</th><th>On</th><th>Position</th><th></th></tr></thead>
+      <tbody>
+      {% for index in range(10) %}
+        {% set option = menu_options[index] if index < menu_options|length else none %}
+        <tr data-menu-option>
+          <td><input name="option_id_{{ index }}" maxlength="32"
+                     value="{{ option.id if option else '' }}"
+                     placeholder="auto from label"></td>
+          <td><input name="option_label_{{ index }}" maxlength="24"
+                     value="{{ option.label if option else '' }}" placeholder="Browse Products"></td>
+          <td>
+            <select name="option_action_{{ index }}">
+              <option value="" {% if not option or not option.action %}selected{% endif %}>Choose action</option>
+              {% for action in menu_actions %}
+              <option value="{{ action }}" {% if option and option.action == action %}selected{% endif %}>{{ action | replace('_', ' ') | title }}</option>
+              {% endfor %}
+            </select>
+          </td>
+          <td class="menu-builder-enabled"><input type="checkbox" name="option_enabled_{{ index }}" value="1"
+            {% if option and option.enabled %}checked{% endif %}></td>
+          <td><input type="number" min="1" max="10" name="option_position_{{ index }}"
+                     value="{{ option.position if option else '' }}"></td>
+          <td><button type="button" class="secondary" data-menu-clear>Clear</button></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="section-actions">
+      <button type="button" class="secondary" data-menu-add>Add option</button>
+      <button type="submit">Save WhatsApp menu</button>
+    </div>
+    <p class="muted">At most 10 options. Labels are limited to 24 characters by the
+    WhatsApp row-title constraint. Positions must be unique and positive. Leave the ID
+    blank to generate a lowercase ID from the label (for example,
+    <code>Talk to Staff</code> becomes <code>talk_to_staff</code>).</p>
+  {% endcall %}
+
+  <div class="menu-builder-preview" id="menu-builder-preview" aria-live="polite">
+    <span class="eyebrow">Preview before saving</span>
+    <strong>{{ fields.menu_welcome_message or 'Main menu:' }}</strong>
+    <ol>
+      {% for option in menu_options if option.enabled %}
+      <li><strong>{{ option.label }}</strong> <span class="muted">{{ option.action }}</span></li>
+      {% else %}
+      <li class="muted">No enabled options will be shown.</li>
+      {% endfor %}
+    </ol>
+  </div>
+</section>
+
+
 <h4>Saved FAQs</h4>
 <p class="muted">Each FAQ is saved on its own, so editing one never rewrites the others.</p>
 {% if errors.get('faq') %}<p class="flash error">{{ errors.faq }}</p>{% endif %}
@@ -351,5 +430,6 @@ from the stored settings on every page load, so it always shows what the bot wou
 </details>
 
 <script src="{{ url_for('static', filename='tenant_rules.js') }}" defer></script>
+<script src="{{ url_for('static', filename='menu_builder.js') }}" defer></script>
 {% endblock %}
 

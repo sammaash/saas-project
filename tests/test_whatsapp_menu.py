@@ -261,6 +261,145 @@ class MainMenuTests(unittest.TestCase):
             self.assertIsNotNone(menu.parse_action(row["id"], now=1000).selection)
 
 
+class ConfiguredMenuTests(unittest.TestCase):
+    CUSTOM = {
+        "configuration": {
+            "menu": {
+                "enabled": True,
+                "welcome_message": "Karibu!",
+                "language": "sw",
+                "options": [
+                    {"id": "track", "label": "Track order", "action": "my_order",
+                     "enabled": True, "position": 1},
+                    {"id": "shop", "label": "Shop", "action": "browse_products",
+                     "enabled": True, "position": 2},
+                    {"id": "questions", "label": "Questions", "action": "faqs",
+                     "enabled": False, "position": 3},
+                ],
+            }
+        }
+    }
+
+    def test_missing_options_use_the_historical_defaults(self):
+        config = menu.menu_config({})
+        self.assertTrue(config.valid)
+        self.assertEqual(len(config.options), 6)
+        reply = menu.main_menu(now=1000)
+        self.assertEqual(
+            [row["title"] for row in reply.sections[0]["rows"]],
+            ["Browse Products", "Place an Order", "My Order",
+             "Delivery & Collection", "FAQs", "Talk to Staff"],
+        )
+
+    def test_generated_ids_are_lowercase_safe_and_unique(self):
+        self.assertEqual(
+            menu.normalize_menu_option_id("  Talk to Staff!! "),
+            "talk_to_staff",
+        )
+        self.assertEqual(
+            menu.menu_option_id_from_label("Café & News", position=6),
+            "cafe_news",
+        )
+        self.assertEqual(
+            menu.menu_option_id_from_label(
+                "Talk to Staff", position=6, existing={"talk_to_staff"}
+            ),
+            "talk_to_staff_2",
+        )
+        self.assertEqual(
+            menu.menu_option_id_from_label("!!!", position=6),
+            "option_6",
+        )
+
+    def test_existing_valid_ids_and_legacy_action_aliases_are_preserved(self):
+        document = {
+            "configuration": {
+                "menu": {
+                    "enabled": True,
+                    "options": [
+                        {"id": "talk-to-staff", "label": "Talk to Staff",
+                         "action": "staff", "enabled": True, "position": 6}
+                    ],
+                }
+            }
+        }
+        config = menu.menu_config(document)
+        self.assertTrue(config.valid)
+        self.assertEqual(config.options[0].id, "talk-to-staff")
+        self.assertEqual(config.options[0].action, "handover")
+        self.assertEqual(menu.ACTION_STEPS[config.options[0].action], "staff")
+
+    def test_configured_labels_order_welcome_and_disabled_options(self):
+        config = menu.menu_config(self.CUSTOM)
+        self.assertTrue(config.valid)
+        self.assertEqual(config.welcome_message, "Karibu!")
+        self.assertEqual([option.id for option in config.options],
+                         ["track", "shop", "questions"])
+        reply = menu.main_menu(self.CUSTOM, now=1000)
+        self.assertEqual([row["title"] for row in reply.sections[0]["rows"]],
+                         ["Track order", "Shop"])
+        self.assertIn("Karibu!", reply.text)
+        parsed = menu.parse_action(reply.sections[0]["rows"][1]["id"], now=1000)
+        self.assertEqual((parsed.selection.step, parsed.selection.arg),
+                         ("option", "shop"))
+
+    def test_tap_and_exact_label_route_through_the_configured_action(self):
+        ctx = _ctx(FakeAdmin(catalogue=CATALOGUE), document=self.CUSTOM)
+        action_id = menu.make_option_action("shop", now=1000)
+        with _admin_patch(FakeAdmin(catalogue=CATALOGUE)):
+            reply = menu.handle_action(ctx, action_id, now=1000)
+            by_label = menu.handle_text(ctx, "Shop", now=1000)
+        self.assertEqual(reply.kind, "list")
+        self.assertEqual(by_label.kind, "list")
+        self.assertTrue(menu.is_menu_command("Track order", self.CUSTOM))
+
+    def test_disabled_and_unknown_options_are_not_executable(self):
+        ctx = _ctx(FakeAdmin(), document=self.CUSTOM)
+        disabled = menu.make_option_action("questions", now=1000)
+        self.assertIn("no longer available", menu.handle_action(
+            ctx, disabled, now=1000
+        ).text)
+        unknown = menu.make_option_action("deleted", now=1000)
+        self.assertIn("no longer available", menu.handle_action(
+            ctx, unknown, now=1000
+        ).text)
+        disabled_text = menu.handle_text(ctx, "Questions", now=1000)
+        self.assertIsNone(disabled_text)
+
+    def test_invalid_or_unknown_action_configuration_fails_closed(self):
+        for options in (
+            [{"id": "x", "label": "X", "action": "run_code", "enabled": True,
+              "position": 1}],
+            [{"id": "x", "label": "X", "action": "browse_products", "enabled": True,
+              "position": 1},
+             {"id": "x", "label": "Y", "action": "faqs", "enabled": True,
+              "position": 2}],
+        ):
+            document = {"configuration": {"menu": {"enabled": True, "options": options}}}
+            with self.subTest(options=options):
+                self.assertFalse(menu.menu_config(document).valid)
+                reply = menu.main_menu(document, now=1000)
+                self.assertEqual(reply.kind, "text")
+                self.assertIn("invalid", reply.text.lower())
+                self.assertIn("invalid", menu.handle_text(
+                    _ctx(FakeAdmin(), document=document), "X", now=1000
+                ).text.lower())
+
+    def test_empty_and_disabled_lists_render_no_rows(self):
+        for menu_document in (
+            {"enabled": True, "options": []},
+            {"enabled": True, "options": [
+                {"id": "x", "label": "X", "action": "faqs", "enabled": False,
+                 "position": 1}
+            ]},
+        ):
+            document = {"configuration": {"menu": menu_document}}
+            with self.subTest(menu=menu_document):
+                reply = menu.main_menu(document, now=1000)
+                self.assertEqual(reply.kind, "text")
+                self.assertIn("no menu options", reply.text.lower())
+
+
 class CatalogueTests(unittest.TestCase):
     def test_browse_with_an_empty_catalogue_offers_staff(self):
         admin = FakeAdmin(catalogue=[])
@@ -800,6 +939,25 @@ class WebhookMenuRouteTests(unittest.TestCase):
         self.load.assert_not_called()
         self.engine.assert_called_once()
         self.send_list.assert_not_called()
+
+    def test_configured_label_is_a_menu_command_after_the_settings_load(self):
+        self.load.return_value = {
+            "configuration": {
+                "menu": {
+                    "enabled": True,
+                    "options": [
+                        {"id": "shop", "label": "Shop", "action": "browse_products",
+                         "enabled": True, "position": 1}
+                    ],
+                }
+            }
+        }
+        response = self._post(self._text_payload("Shop"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json.get("menu"))
+        self.load.assert_called_once()
+        self.send_list.assert_called_once()
+        self.engine.assert_not_called()
 
     def test_button_tap_routes_to_browse(self):
         action_id = menu.make_action("browse")

@@ -491,6 +491,7 @@ def bot_config_preview(stored: dict[str, Any]) -> dict[str, Any]:
             "hours_and_greeting": stored.get("business_hours") or {},
             "business_rules": rules,
             "config": configuration.get("config") or {"provider": "meta_cloud_api"},
+            "menu": configuration.get("menu") or {},
             "knowledge_base": {
                 **(configuration.get("knowledge_base") or {}),
                 "rag_priority": list(RAG_PRIORITY),

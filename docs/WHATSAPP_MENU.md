@@ -11,15 +11,41 @@ The menu is **disabled by default**. It is enabled per tenant by the existing
 ```json
 {
   "menu": {
-    "enabled": true
+    "enabled": true,
+    "welcome_message": "Main menu:",
+    "language": "en",
+    "options": [
+      {"id": "browse_products", "label": "Browse Products",
+       "action": "browse_products", "enabled": true, "position": 1},
+      {"id": "place_order", "label": "Place an Order",
+       "action": "place_order", "enabled": true, "position": 2},
+      {"id": "my_order", "label": "My Order",
+       "action": "my_order", "enabled": true, "position": 3},
+      {"id": "delivery_collection", "label": "Delivery & Collection",
+       "action": "delivery_collection", "enabled": true, "position": 4},
+      {"id": "faqs", "label": "FAQs",
+       "action": "faqs", "enabled": true, "position": 5},
+      {"id": "handover", "label": "Talk to Staff",
+       "action": "handover", "enabled": true, "position": 6}
+    ]
   }
 }
 ```
 
+`options` is optional for backward compatibility: a tenant with only
+`{"menu":{"enabled":true}}` gets the six historical options above. An explicitly empty
+`options` list means the menu has no rows until the operator adds some.
+
 `configuration` is the documented catch-all for settings that are read as a whole
-(`db/migrations/0006_tenant_settings.sql`), so no migration is required. Write it with
-the existing settings path (`TenantAdmin.update_settings(configuration=...)`), but never
-hand-build a partial document: that replaces the whole JSONB value and can erase
+(`db/migrations/0006_tenant_settings.sql`), so no migration is required. The tenant's
+**Rules / AI** page (`/tenants/<tenant-id>/rules`) exposes this as the
+**H. WhatsApp customer menu** section with an **Enable WhatsApp Menu** checkbox and the
+**Menu Builder**. The section uses the normal platform-admin authorization, tenant-scoped
+RLS, CSRF, version, and audit path.
+
+The API/helper path remains available for provisioning and migration tooling. Write it
+with the existing settings path (`TenantAdmin.update_settings(configuration=...)`), but
+never hand-build a partial document: that replaces the whole JSONB value and can erase
 `knowledge_base`. Use the merge-safe helper:
 
 ```python
@@ -30,26 +56,62 @@ menu.set_enabled(settings, tenant_id, enabled=True)
 
 No Railway variable or environment variable turns the menu on.
 
+## Menu Builder
+
+The Rules / AI page renders the stored options as editable rows. Each row has:
+
+- **id**: stable lowercase identifier (`a-z`, `0-9`, `-`, `_`, at most 32 characters). Tap
+  actions carry this id, so renaming a label does not invalidate an in-flight button.
+  Existing valid ids are preserved exactly. A new row may leave the id blank; the server
+  derives a unique id from the label (`Talk to Staff` becomes `talk_to_staff`) and adds a
+  numeric suffix if needed.
+- **label**: the WhatsApp row title, at most 24 characters.
+- **action**: one of the fixed action types `browse_products`, `place_order`, `my_order`,
+  `delivery_collection`, `faqs`, `handover`. Configuration is data, never executable code.
+- **on**: whether the row is displayed and executable.
+- **position**: a unique positive number from 1 to 10; rows are rendered in this order.
+
+The form also edits the welcome message (at most 300 characters) and language tag. The
+builder validates the whole submitted list before writing: blank labels, duplicate ids,
+duplicate positions, unknown actions, overlong labels, and out-of-range positions are
+rejected without changing stored configuration. At most ten options are accepted, matching
+the native WhatsApp list limit. The browser-side preview is only a convenience; the server
+renders the same preview from stored values and is authoritative.
+
+Saving the menu section uses the existing `deep_merge` path and writes only
+`configuration.menu` keys. This preserves sibling configuration, custom menu keys, and
+all other sections. The menu simulator resets its conversation snapshot when the saved menu
+signature changes, so a builder save is visible on the next simulator load without a
+process restart.
+
 ## Commands and flows
 
 | Entry | Behaviour |
 |---|---|
-| `menu` (case/whitespace insensitive) | Sends the six-option main menu as a native list |
-| `Browse Products` | Categories → product detail with configured prices/availability. Products without a category appear under **Other products**. Lists over ten entries get a **More** row |
-| `Place an Order` | Instructions only; the existing conversational order tools remain authoritative |
-| `My Order` | Asks for `order <number>`; looks the order up by tenant **and** sender `wa_id` |
-| `Delivery & Collection` | Shows configured `business_rules.delivery_fee` and `business_hours`; otherwise offers staff |
-| `FAQs` | Lists `configuration.knowledge_base.faqs` (paginated with **More questions**); a tap shows the stored answer |
-| `Talk to Staff` | Records and notifies through the existing handover store |
+| `menu` (case/whitespace insensitive) | Sends the configured main menu as a native list; with no saved options it shows the six historical defaults |
+| `browse_products` action | Categories → product detail with configured prices/availability. Products without a category appear under **Other products**. Lists over ten entries get a **More** row |
+| `place_order` action | Instructions only; the existing conversational order tools remain authoritative |
+| `my_order` action | Asks for `order <number>`; looks the order up by tenant **and** sender `wa_id` |
+| `delivery_collection` action | Shows configured `business_rules.delivery_fee` and `business_hours`; otherwise offers staff |
+| `faqs` action | Lists `configuration.knowledge_base.faqs` (paginated with **More questions**); a tap shows the stored answer |
+| `handover` action | Records and notifies through the existing handover store |
 
-Exact option names are accepted as a text fallback (for example `browse products`).
-Bare numbers are deliberately **not** commands: "1" remains ordinary conversation.
+Labels are tenant-defined. Exact labels are accepted as a text fallback (for example a
+configured `Browse Products`), and taps always use the stable option id. Legacy aliases
+such as `browse products` and `order <number>` still work for compatibility. Bare numbers
+are deliberately **not** commands: "1" remains ordinary conversation.
+
+Disabled options are neither shown in the main menu nor executed by a tap or text command.
+If a saved option is malformed or uses an unknown action, the menu fails closed with a safe
+message rather than running an unexpected path.
 
 ## State and security
 
 - Every tap carries its own context: `m1.<step>.<arg>.<expiry>` (30-minute window).
-  Nothing is persisted per conversation, so the menu works without migration 0035 and
-  cannot leak state between conversations.
+  Configured menu rows use `m1.option.<option-id>.<expiry>` and resolve the **current**
+  saved option before executing it, so a disabled or deleted option is rejected. Nothing is
+  persisted per conversation, so the menu works without migration 0035 and cannot leak
+  state between conversations.
 - Category and FAQ ids also carry a short digest of the item they were built from, so a
   catalogue or FAQ edit makes an old tap detectably stale instead of silently selecting a
   different item.
@@ -94,6 +156,11 @@ the 0034 baseline; do not apply 0035 as part of enabling the menu.
 
 - `0035` is not required, but without it menu replies have no inbound correlation.
 - No order creation, payment processing or WhatsApp Flows are added.
+- `language` is stored metadata only; menu copy is not translated automatically. Operators
+  must write the welcome message and labels in the desired language.
+- The webhook uses a deliberately cheap upper-case hint before loading settings for a custom
+  free-text label. A lowercase custom label still works through its interactive tap, but
+  should be given an initial capital if it must also be accepted as typed text.
 - The menu does not enable itself for a channel that has no active tenant configuration.
 - `conversations.menu_state*` (migration 0035) is intentionally unused: the stateless ids
   make it unnecessary for phase 1.
@@ -101,11 +168,18 @@ the 0034 baseline; do not apply 0035 as part of enabling the menu.
 
 ## Tests
 
-`tests/test_whatsapp_menu.py` covers command handling, payload limits, tap parsing,
-stale/expired ids, empty and populated catalogues, uncategorised products, pagination,
-missing prices, order privacy, handover success/failure, definite vs ambiguous send
-failures, outbound persistence, and the disabled-by-default behaviour. All database access
-is faked; no test sends a real WhatsApp message.
+`tests/test_whatsapp_menu.py` covers command handling, configured labels, disabled and
+unknown options, malformed configuration, payload limits, tap parsing, stale/expired ids,
+empty and populated catalogues, uncategorised products, pagination, missing prices, order
+privacy, handover success/failure, definite vs ambiguous send failures, outbound
+persistence, and the disabled-by-default behaviour. All database access is faked; no test
+sends a real WhatsApp message.
+
+`tests/test_tenant_config_partial_updates.py` covers the Menu Builder: rendering defaults,
+saving a custom welcome/language/order/labels, disabling a row, rejecting duplicate ids,
+blank labels, unknown actions and invalid positions, tenant isolation, and simulator
+refresh after a save. `tests/test_menu_simulator.py` covers the simulator's safe reply view
+and configured menu handling.
 
 `tests/test_menu_db.py` adds database-backed order-privacy and staff-assistance tests. The
 database suites require an explicit `SAAS_TEST_DATABASE_URL` naming a disposable local

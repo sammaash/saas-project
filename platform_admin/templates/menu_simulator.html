@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}WhatsApp Menu Simulator &middot; Platform Admin{% endblock %}
+{% block content %}
+{% from "_macros.html" import csrf_field %}
+<div id="menu-simulator-app">
+  <div class="playground-title">
+    <div>
+      <span class="demo-label">LOCAL SIMULATION &middot; NO WHATSAPP SENDS</span>
+      <h1>WhatsApp Menu Simulator</h1>
+      <p class="muted">Preview the real customer menu using this tenant's saved settings,
+      catalogue, FAQs, delivery information and orders. No provider call or message is made.</p>
+    </div>
+    {% if tenant %}
+    <form method="post" action="{{ url_for('admin.menu_simulator') }}">
+      {{ csrf_field() }}
+      <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+      <button type="submit" name="action" value="reset" class="danger-outline">Reset conversation</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <nav class="tabs playground-tabs" aria-label="Simulator mode">
+    <a href="{{ url_for('admin.bot_playground', tenant_id=selected_tenant_id) }}">AI Playground</a>
+    <a href="{{ url_for('admin.menu_simulator', tenant_id=selected_tenant_id) }}" class="active">WhatsApp Menu Simulator</a>
+  </nav>
+
+  <form method="get" action="{{ url_for('admin.menu_simulator') }}" class="tenant-picker">
+    <label>Simulating tenant
+      <select name="tenant_id">
+        {% for entry in tenants %}
+        <option value="{{ entry.id }}" {% if selected_tenant_id and entry.id|string == selected_tenant_id|string %}selected{% endif %}>{{ entry.name }} ({{ entry.slug }})</option>
+        {% else %}
+        <option value="">No tenants available</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Load tenant</button>
+  </form>
+
+  {% if error %}<p class="flash error" role="alert">{{ error }}</p>{% endif %}
+
+  {% if not tenant %}
+  <div class="empty-state">
+    <h2>Select a tenant</h2>
+    <p>Choose an authorized tenant to preview its customer menu.</p>
+  </div>
+  {% elif not menu_enabled %}
+  <section class="card narrow">
+    <span class="demo-label">CURRENT CONFIGURATION</span>
+    <h2>WhatsApp menu is disabled</h2>
+    <p>The saved <code>configuration.menu.enabled</code> value is not <code>true</code>.
+    The live webhook would fall through to the ordinary AI path. The simulator does not
+    call the AI and does not send a WhatsApp message.</p>
+    <p><a class="button-link" href="{{ url_for('admin.tenant_rules', tenant_id=tenant.id) }}#config-menu">Open Rules / AI to enable the menu</a></p>
+  </section>
+  {% else %}
+  <div class="playground-shell">
+    <section class="phone-frame" aria-label="Simulated WhatsApp menu conversation">
+      <header class="wa-header">
+        <div class="business-avatar" aria-hidden="true">{{ tenant.name[:1] | upper }}</div>
+        <div>
+          <strong>{{ tenant.name }}</strong>
+          <span>customer menu &middot; local simulation</span>
+        </div>
+        <span class="demo-chip">NOT LIVE</span>
+      </header>
+
+      <div id="menu-simulator-messages" class="chat-wallpaper" aria-live="polite">
+        {% for message in state.messages %}
+        <div class="bubble {{ 'customer-bubble' if message.role == 'customer' else 'business-bubble' }}">
+          <p>{{ message.text }}</p>
+          <span class="message-meta">{% if message.role == 'customer' %}You &middot; simulated{% else %}Menu &middot; simulated{% endif %}</span>
+        </div>
+        {% if message.reply %}
+        <div class="menu-simulator-reply">
+          {% if message.reply.header %}<strong>{{ message.reply.header }}</strong>{% endif %}
+          {% if message.reply.kind == 'list' %}
+            {% for section in message.reply.sections %}
+              <div class="menu-simulator-section-title">{{ section.title }}</div>
+              {% for row in section.rows %}
+              <form method="post" action="{{ url_for('admin.menu_simulator') }}" class="menu-simulator-option">
+                {{ csrf_field() }}
+                <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+                <input type="hidden" name="action" value="action">
+                <input type="hidden" name="action_id" value="{{ row.id }}">
+                <input type="hidden" name="action_title" value="{{ row.title }}">
+                <button type="submit"><strong>{{ row.title }}</strong>{% if row.description %}<span>{{ row.description }}</span>{% endif %}</button>
+              </form>
+              {% endfor %}
+            {% endfor %}
+          {% elif message.reply.kind == 'buttons' %}
+            {% for button in message.reply.buttons %}
+            <form method="post" action="{{ url_for('admin.menu_simulator') }}" class="menu-simulator-option">
+              {{ csrf_field() }}
+              <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+              <input type="hidden" name="action" value="action">
+              <input type="hidden" name="action_id" value="{{ button.id }}">
+              <input type="hidden" name="action_title" value="{{ button.title }}">
+              <button type="submit">{{ button.title }}</button>
+            </form>
+            {% endfor %}
+          {% endif %}
+          {% if message.reply.footer %}<span class="menu-simulator-footer">{{ message.reply.footer }}</span>{% endif %}
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+
+      <form method="post" action="{{ url_for('admin.menu_simulator') }}" class="message-composer">
+        {{ csrf_field() }}
+        <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+        <input type="hidden" name="action" value="text">
+        <label class="sr-only" for="menu-simulator-text">Customer message</label>
+        <textarea id="menu-simulator-text" name="customer_message" rows="1" maxlength="2000" required placeholder="Type MENU or an option name"></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <aside class="simulator-panel">
+      <span class="eyebrow">Simulation controls</span>
+      <h2>Actual saved configuration</h2>
+      <p><strong>Menu:</strong> {{ 'Enabled' if menu_enabled else 'Disabled' }}</p>
+      <p><strong>Tenant:</strong> {{ tenant.name }} ({{ tenant.slug }})</p>
+      <p class="muted">Interactive list and button replies below come from the same menu service
+      used by the live webhook. Click an option or type a command; the simulator synthesizes the
+      customer action without an inbound WhatsApp request.</p>
+      <p class="warning-note">Local simulation only. No WhatsApp send, provider delivery receipt,
+      payment, checkout, or real customer conversation is created.</p>
+      <p><a href="{{ url_for('admin.tenant_rules', tenant_id=tenant.id) }}#config-menu">Edit menu setting in Rules / AI</a></p>
+      <form method="post" action="{{ url_for('admin.menu_simulator') }}">
+        {{ csrf_field() }}
+        <input type="hidden" name="tenant_id" value="{{ tenant.id }}">
+        <button type="submit" name="action" value="reset" class="secondary">Reset conversation</button>
+      </form>
+      <details class="configuration-details">
+        <summary>How this simulation works</summary>
+        <p>The menu service reads the tenant's saved <code>configuration.menu.enabled</code>
+        value. When enabled, it generates the same native list and button reply shapes used
+        by the live channel. Staff handover requests are written only to this local database
+        and outbound WhatsApp delivery is forced off.</p>
+      </details>
+    </aside>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

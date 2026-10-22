@@ -33,6 +33,7 @@ from ..services import channels as channel_service
 from ..services import customers as customer_service
 from ..services import handover as handover_service
 from ..services import menu as menu_service
+from ..services import menu_simulator as menu_simulator_service
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -496,11 +497,17 @@ def whatsapp_webhook():
             type(error).__name__,
         )
 
-    # Explicit menu commands only: "menu", "order <number>" or an exact option name.
-    # Ordinary chat never reads settings and never leaves the existing AI path.
-    if menu_service.is_menu_command(event["text"]):
+    # Explicit menu commands: "menu", "order <number>", a legacy option name, or a
+    # possibly configured row label. Lowercase ordinary chat stays on the AI path
+    # without a settings read; the authoritative label check happens after load.
+    if (
+        menu_service.is_menu_command(event["text"])
+        or menu_service.could_be_configured_label(event["text"])
+    ):
         document = menu_service.load_document(settings, tenant_id)
-        if menu_service.is_enabled(document):
+        if menu_service.is_enabled(document) and menu_service.is_menu_command(
+            event["text"], document
+        ):
             menu_ctx = menu_service.MenuContext(
                 settings=settings,
                 tenant_id=tenant_id,
@@ -1302,6 +1309,19 @@ def _render_rules(
     fields = bot_config_service.field_values(stored)
     if submitted:
         fields = {**fields, **{key: value for key, value in submitted.items() if key in fields}}
+        if submitted.get("present_menu_options"):
+            submitted_options = []
+            for index in range(menu_service.MAX_MENU_OPTIONS):
+                option = {
+                    "id": submitted.get(f"option_id_{index}", ""),
+                    "label": submitted.get(f"option_label_{index}", ""),
+                    "action": submitted.get(f"option_action_{index}", ""),
+                    "enabled": submitted.get(f"option_enabled_{index}") == "1",
+                    "position": submitted.get(f"option_position_{index}", ""),
+                }
+                if any(option[key] for key in ("id", "label", "action")):
+                    submitted_options.append(option)
+            fields["menu_options"] = submitted_options
     products = catalogue_service.list_catalogue(settings, tenant["id"])
     categories = sorted({p["category"] for p in products if p.get("category")})
     return render_template(
@@ -1313,6 +1333,7 @@ def _render_rules(
         fields=fields,
         categories=categories,
         constants=tenant_service,
+        menu_actions=menu_service.MENU_ACTIONS,
         version=bot_config_service.version_of(stored),
         errors=errors or {},
         preview=tenant_service.bot_config_preview(stored),
@@ -1811,6 +1832,222 @@ def bot_playground_api():
 @admin_required
 def tenant_bot_playground(tenant_id):
     return _render_playground(tenant_id, form_message="")
+
+
+# ------------------------------------------------------- WhatsApp menu simulator
+MENU_SIMULATOR_SESSION = "menu_simulator_states"
+
+
+def _menu_simulator_states() -> dict:
+    states = session.get(MENU_SIMULATOR_SESSION)
+    return states if isinstance(states, dict) else {}
+
+
+def _menu_simulator_key(tenant_id: str) -> str:
+    return f"{g.admin_id}:{tenant_id}"
+
+
+def _menu_simulator_signature(document: dict) -> str:
+    """A stable signature so a saved builder change refreshes the simulator."""
+    return repr(menu_service.menu_config(document))
+
+
+def _new_menu_simulator_state(settings, tenant_id: str) -> tuple[bool, dict]:
+    enabled, document = menu_simulator_service.status(settings, tenant_id)
+    signature = _menu_simulator_signature(document)
+    if not enabled:
+        return False, {
+            "enabled": False,
+            "signature": signature,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "text": menu_simulator_service.disabled_message(tenant_id),
+                    "reply": None,
+                }
+            ],
+        }
+    reply = menu_service.main_menu(document)
+    return True, {
+        "enabled": True,
+        "signature": signature,
+        "messages": [
+            {
+                "role": "assistant",
+                "text": reply.text,
+                "reply": menu_simulator_service.reply_view(reply),
+            }
+        ],
+    }
+
+
+def _render_menu_simulator(
+    tenant_id: str | None,
+    *,
+    state: dict | None = None,
+    error: str | None = None,
+):
+    settings = context().settings
+    tenants = tenant_service.list_tenants(settings, g.admin_id)
+    selected_id = _preferred_tenant_id(
+        tenant_id,
+        request.args.get("tenant_slug") or request.form.get("tenant_slug"),
+        tenants=tenants,
+    )
+    if selected_id is None:
+        return render_template(
+            "menu_simulator.html",
+            tenants=[],
+            tenant=None,
+            selected_tenant_id=None,
+            menu_enabled=False,
+            state={"messages": []},
+            error=error,
+        )
+    tenant = next((entry for entry in tenants if str(entry["id"]) == str(selected_id)), None)
+    if tenant is None:
+        tenant = tenant_service.get_tenant(settings, g.admin_id, selected_id)
+    if tenant is None:
+        return render_template(
+            "menu_simulator.html",
+            tenants=tenants,
+            tenant=None,
+            selected_tenant_id=None,
+            menu_enabled=False,
+            state={"messages": []},
+            error=error,
+        )
+    enabled, document = menu_simulator_service.status(settings, tenant["id"])
+    signature = _menu_simulator_signature(document)
+    if state is not None and (
+        bool(state.get("enabled")) != enabled or state.get("signature") != signature
+    ):
+        state = None
+    if state is None:
+        states = _menu_simulator_states()
+        key = _menu_simulator_key(str(tenant["id"]))
+        state = states.get(key)
+        if (
+            not state
+            or bool(state.get("enabled")) != enabled
+            or state.get("signature") != signature
+        ):
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+            states[key] = state
+            session[MENU_SIMULATOR_SESSION] = states
+    return render_template(
+        "menu_simulator.html",
+        tenants=tenants,
+        tenant=tenant,
+        selected_tenant_id=str(selected_id),
+        menu_enabled=enabled,
+        state=state,
+        error=error,
+    )
+
+
+@admin_bp.route("/playground/menu", methods=["GET", "POST"])
+@admin_required
+def menu_simulator():
+    if request.method == "GET":
+        return _render_menu_simulator(request.args.get("tenant_id"))
+
+    tenant_id = request.form.get("tenant_id", "")
+    try:
+        tenant = _tenant(tenant_id)
+        settings = context().settings
+        enabled, document = menu_simulator_service.status(settings, tenant["id"])
+        if not enabled:
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+            return _render_menu_simulator(tenant["id"], state=state)
+
+        states = _menu_simulator_states()
+        key = _menu_simulator_key(str(tenant["id"]))
+        state = states.get(key)
+        if not state or not state.get("enabled"):
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+
+        action = request.form.get("action") or "text"
+        if action == "reset":
+            _, state = _new_menu_simulator_state(settings, tenant["id"])
+        elif action == "text":
+            text = (request.form.get("customer_message") or "").strip()[:2000]
+            if not text:
+                raise ServiceError("Type a customer message first.")
+            state["messages"].append({"role": "customer", "text": text, "reply": None})
+            menu_context = menu_simulator_service.make_context(
+                settings,
+                tenant["id"],
+                g.admin_id,
+                document,
+                message_id=f"sim-{uuid.uuid4().hex}",
+                include_identity=True,
+            )
+            reply = menu_service.handle_text(menu_context, text)
+            if reply is None:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": (
+                            "That isn't a menu command. Reply MENU or choose one of "
+                            "the options shown above."
+                        ),
+                        "reply": None,
+                    }
+                )
+            else:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": reply.text,
+                        "reply": menu_simulator_service.reply_view(reply),
+                    }
+                )
+        else:
+            action_id = (request.form.get("action_id") or "").strip()
+            if not action_id:
+                raise ServiceError("Choose a menu option first.", 400)
+            action_title = (
+                request.form.get("action_title") or "Menu option"
+            ).strip()[:100]
+            state["messages"].append(
+                {"role": "customer", "text": action_title, "reply": None}
+            )
+            menu_context = menu_simulator_service.make_context(
+                settings,
+                tenant["id"],
+                g.admin_id,
+                document,
+                message_id=f"sim-{uuid.uuid4().hex}",
+                include_identity=True,
+            )
+            reply = menu_service.handle_action(menu_context, action_id)
+            if reply is None:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": (
+                            "That menu option is no longer available. Reply MENU to "
+                            "start again."
+                        ),
+                        "reply": None,
+                    }
+                )
+            else:
+                state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "text": reply.text,
+                        "reply": menu_simulator_service.reply_view(reply),
+                    }
+                )
+
+        state["messages"] = state["messages"][-20:]
+        states[key] = state
+        session[MENU_SIMULATOR_SESSION] = states
+        return _render_menu_simulator(tenant["id"], state=state)
+    except ServiceError as error:
+        return _render_menu_simulator(tenant_id, error=error.message), error.status
 
 
 def register_routes(app: Flask) -> None:

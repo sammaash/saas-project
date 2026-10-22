@@ -23,6 +23,7 @@ from platform_admin.auth import AuthError, Authenticator, Identity
 from platform_admin.config import Settings
 from platform_admin.services import audit as audit_service
 from platform_admin.services import bot_config
+from platform_admin.services import menu as menu_service
 from saas.bot import TenantBotContextLoader
 from saas_test_support import (
     PLATFORM_ADMIN_USER_ID,
@@ -300,8 +301,8 @@ class LoadSavedConfigurationTests(ConfigurationManagerTestCase):
         self.assertEqual(payload["stored"]["business_rules"]["delivery"], "Countrywide")
         self.assertEqual(
             [item["name"] for item in payload["sections"]],
-            ["identity", "persona", "hours", "rules", "logic", "api", "knowledge", "faq",
-             "document"],
+            ["identity", "persona", "hours", "rules", "logic", "api", "menu", "knowledge",
+             "faq", "document"],
         )
 
     def test_an_unconfigured_client_shows_not_set_instead_of_invented_defaults(self):
@@ -973,6 +974,329 @@ class AcceptanceCriterionTests(ConfigurationManagerTestCase):
         )
         self.assertEqual(after["timezone"], before["timezone"])
         self.assertEqual(after["currency"], before["currency"])
+
+
+class MenuControlTests(ConfigurationManagerTestCase):
+    """The dashboard menu toggle uses the existing section-save contract."""
+
+    @staticmethod
+    def _menu_control(html: str) -> str:
+        match = re.search(r'<input[^>]*name="menu_enabled"[^>]*>', html)
+        if match is None:
+            raise AssertionError("menu_enabled control not found")
+        return match.group(0)
+
+    def test_menu_is_disabled_by_default_and_control_is_visible(self):
+        html = self.page(f"/tenants/{self.tenant_id}/rules")
+        self.assertIn("H. WhatsApp customer menu", html)
+        self.assertIn("Enable WhatsApp Menu", html)
+        self.assertNotIn("checked", self._menu_control(html))
+        payload = self.client.get(f"/tenants/{self.tenant_id}/rules/config").get_json()
+        self.assertFalse(payload["fields"]["menu_enabled"])
+        self.assertFalse(menu_service.is_enabled(self.stored(self.tenant_id)))
+
+    def test_enabling_and_disabling_persist_without_overwriting_other_settings(self):
+        documents = copy.deepcopy(SAVED_CONFIGURATION)
+        documents["configuration"]["menu"] = {"enabled": False, "custom": "keep-me"}
+        documents["configuration"]["config"]["whatsapp_access_token"] = "local-secret"
+        tenant_id = self.create_client("Menu Control", documents=documents)
+        before = self.stored(tenant_id)
+
+        response = self.post(
+            f"/tenants/{tenant_id}/rules/menu",
+            {"present_menu_enabled": "1", "menu_enabled": "1"},
+        )
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        after = self.stored(tenant_id)
+        self.assertTrue(after["configuration"]["menu"]["enabled"])
+        self.assertEqual(after["configuration"]["menu"]["custom"], "keep-me")
+        self.assertEqual(
+            after["configuration"]["config"]["whatsapp_access_token"], "local-secret"
+        )
+        self.assertTrue(menu_service.is_enabled(after))
+        self.assertEqual(
+            self.client.get(f"/tenants/{tenant_id}/rules/config").get_json()["fields"][
+                "menu_enabled"
+            ],
+            True,
+        )
+        self.assertIn("checked", self._menu_control(self.page(f"/tenants/{tenant_id}/rules")))
+
+        before_config = copy.deepcopy(before["configuration"])
+        after_config = copy.deepcopy(after["configuration"])
+        before_config["menu"]["enabled"] = True
+        self.assertEqual(after_config, before_config)
+        for column in ("business_rules", "bot_persona", "business_hours"):
+            self.assertEqual(after[column], before[column], column)
+
+        response = self.post(
+            f"/tenants/{tenant_id}/rules/menu", {"present_menu_enabled": "1"}
+        )
+        self.assertEqual(response.status_code, 302)
+        disabled = self.stored(tenant_id)
+        self.assertFalse(disabled["configuration"]["menu"]["enabled"])
+        self.assertEqual(disabled["configuration"]["menu"]["custom"], "keep-me")
+        self.assertFalse(menu_service.is_enabled(disabled))
+        self.assertNotIn("checked", self._menu_control(self.page(f"/tenants/{tenant_id}/rules")))
+
+    def test_invalid_boolean_is_rejected_without_writing(self):
+        before = self.stored(self.tenant_id)
+        response = self.post(
+            f"/tenants/{self.tenant_id}/rules/menu",
+            {"present_menu_enabled": "1", "menu_enabled": "maybe"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("must be true or false", response.get_data(as_text=True))
+        self.assertEqual(self.stored(self.tenant_id), before)
+
+    def test_menu_change_is_scoped_to_the_selected_tenant(self):
+        other = self.create_client("Menu Other Tenant", documents=EMPTY_CONFIGURATION)
+        before_other = self.stored(other)
+        response = self.section("menu", present_menu_enabled="1", menu_enabled="1")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(menu_service.is_enabled(self.stored(self.tenant_id)))
+        self.assertEqual(self.stored(other), before_other)
+        self.assertFalse(menu_service.is_enabled(self.stored(other)))
+
+    def test_signed_out_user_cannot_change_the_menu(self):
+        client = self.app.test_client()
+        client.get("/login")  # issue a CSRF token without authenticating
+        before = self.stored(self.tenant_id)
+        response = client.post(
+            f"/tenants/{self.tenant_id}/rules/menu",
+            data={
+                "csrf_token": self.token(client),
+                "present_menu_enabled": "1",
+                "menu_enabled": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.stored(self.tenant_id), before)
+        self.assertFalse(menu_service.is_enabled(self.stored(self.tenant_id)))
+
+
+class MenuBuilderTests(ConfigurationManagerTestCase):
+    """The Rules / AI menu builder writes validated tenant-local menu JSON."""
+
+    @staticmethod
+    def _menu_form(options):
+        data = {
+            "present_menu_enabled": "1",
+            "menu_enabled": "1",
+            "present_menu_options": "1",
+        }
+        for index, option in enumerate(options):
+            data[f"option_id_{index}"] = option.get("id", "")
+            data[f"option_label_{index}"] = option.get("label", "")
+            data[f"option_action_{index}"] = option.get("action", "")
+            if option.get("enabled", True):
+                data[f"option_enabled_{index}"] = "1"
+            data[f"option_position_{index}"] = str(option.get("position", index + 1))
+        return data
+
+    @staticmethod
+    def _default_options():
+        return [
+            {
+                "id": option.id,
+                "label": option.label,
+                "action": option.action,
+                "enabled": option.enabled,
+                "position": option.position,
+            }
+            for option in menu_service.default_menu_options()
+        ]
+
+    def test_builder_renders_default_options_and_preview(self):
+        html = self.page(f"/tenants/{self.tenant_id}/rules")
+        self.assertIn("Menu Builder", html)
+        self.assertIn("Preview before saving", html)
+        self.assertIn("Browse Products", html)
+        payload = self.client.get(f"/tenants/{self.tenant_id}/rules/config").get_json()
+        self.assertEqual(len(payload["fields"]["menu_options"]), 6)
+        self.assertTrue(payload["fields"]["menu_options"][0]["enabled"])
+        self.assertFalse(menu_service.is_enabled(self.stored(self.tenant_id)))
+
+    def test_builder_saves_custom_welcome_reordered_renamed_and_disabled_options(self):
+        data = {
+            "present_menu_enabled": "1",
+            "menu_enabled": "1",
+            "present_menu_options": "1",
+            "menu_welcome_message": "Karibu!",
+            "menu_language": "sw",
+            "option_id_0": "browse_products",
+            "option_label_0": "Shop",
+            "option_action_0": "browse_products",
+            "option_enabled_0": "1",
+            "option_position_0": "2",
+            "option_id_1": "my_order",
+            "option_label_1": "Track order",
+            "option_action_1": "my_order",
+            "option_enabled_1": "1",
+            "option_position_1": "1",
+            "option_id_2": "faqs",
+            "option_label_2": "Questions",
+            "option_action_2": "faqs",
+            "option_position_2": "3",
+        }
+        response = self.section("menu", **data)
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        stored = self.stored(self.tenant_id)
+        config = menu_service.menu_config(stored)
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.welcome_message, "Karibu!")
+        self.assertEqual(config.language, "sw")
+        self.assertEqual([option.label for option in config.options],
+                         ["Track order", "Shop", "Questions"])
+        self.assertFalse(config.options[2].enabled)
+        main = menu_service.main_menu(stored, now=1000)
+        self.assertEqual([row["title"] for row in main.sections[0]["rows"]],
+                         ["Track order", "Shop"])
+        self.assertTrue(all(row["id"].startswith("m1.option.")
+                            for row in main.sections[0]["rows"]))
+        self.assertIn("Karibu!", main.text)
+
+    def test_builder_rejects_duplicate_ids_labels_actions_and_positions(self):
+        before = self.stored(self.tenant_id)
+        base = {
+            "present_menu_enabled": "1",
+            "menu_enabled": "1",
+            "present_menu_options": "1",
+            "option_label_0": "Shop",
+            "option_action_0": "browse_products",
+            "option_enabled_0": "1",
+            "option_position_0": "1",
+        }
+        cases = (
+            ({"option_id_0": "shop", "option_id_1": "shop",
+              "option_label_1": "Other", "option_action_1": "faqs",
+              "option_position_1": "2"}, "Duplicate menu option id"),
+            ({"option_id_0": "shop", "option_label_0": "",
+              "option_action_0": "browse_products",
+              "option_position_0": "1"}, "label is required"),
+            ({"option_id_0": "shop", "option_action_0": "run_code",
+              "option_label_0": "Shop", "option_position_0": "1"}, "unsupported action"),
+            ({"option_id_0": "shop", "option_action_0": "browse_products",
+              "option_label_0": "Shop", "option_position_0": "0"}, "position must be"),
+            ({"option_id_0": "shop", "option_action_0": "browse_products",
+              "option_label_0": "Shop", "option_position_0": "11"}, "position must be"),
+        )
+        for values, message in cases:
+            data = {**base, **values}
+            with self.subTest(message=message):
+                response = self.section("menu", **data)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(message, response.get_data(as_text=True))
+                self.assertEqual(self.stored(self.tenant_id), before)
+
+    def test_default_option_six_has_a_stable_valid_id_and_staff_action(self):
+        options = menu_service.default_menu_options()
+        self.assertEqual(len(options), 6)
+        for option in options:
+            self.assertRegex(option.id, menu_service.MENU_OPTION_ID_RE)
+        sixth = options[5]
+        self.assertEqual(sixth.id, "handover")
+        self.assertEqual(sixth.label, "Talk to Staff")
+        self.assertEqual(sixth.action, "handover")
+        self.assertEqual(menu_service.ACTION_STEPS[sixth.action], "staff")
+
+    def test_blank_option_six_row_with_stale_action_is_ignored(self):
+        data = self._menu_form(self._default_options()[:5])
+        # Old builder forms/cleared rows submitted the first action even when the
+        # visible ID and label were blank. That must not make Option 6 invalid.
+        data["option_action_5"] = "browse_products"
+        response = self.section("menu", **data)
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        config = menu_service.menu_config(self.stored(self.tenant_id))
+        self.assertEqual([option.id for option in config.options],
+                         [option["id"] for option in self._default_options()[:5]])
+
+    def test_new_option_six_derives_talk_to_staff_id_from_its_label(self):
+        options = self._default_options()[:5]
+        options.append({
+            "id": "",
+            "label": "Talk to Staff",
+            "action": "handover",
+            "enabled": True,
+            "position": 6,
+        })
+        response = self.section("menu", **self._menu_form(options))
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        config = menu_service.menu_config(self.stored(self.tenant_id))
+        self.assertEqual(len(config.options), 6)
+        self.assertEqual([option.id for option in config.options[:5]],
+                         [option["id"] for option in self._default_options()[:5]])
+        sixth = config.options[5]
+        self.assertEqual(sixth.id, "talk_to_staff")
+        self.assertEqual(sixth.label, "Talk to Staff")
+        self.assertEqual(sixth.action, "handover")
+
+    def test_new_options_get_unique_normalized_ids_from_labels(self):
+        options = [
+            {"id": "", "label": "Café & News!!", "action": "browse_products",
+             "enabled": True, "position": 1},
+            {"id": "", "label": "Café & News!!", "action": "faqs",
+             "enabled": True, "position": 2},
+        ]
+        response = self.section("menu", **self._menu_form(options))
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        config = menu_service.menu_config(self.stored(self.tenant_id))
+        self.assertEqual([option.id for option in config.options],
+                         ["cafe_news", "cafe_news_2"])
+        for option in config.options:
+            self.assertRegex(option.id, menu_service.MENU_OPTION_ID_RE)
+
+    def test_builder_rejects_explicit_invalid_option_ids(self):
+        before = self.stored(self.tenant_id)
+        for invalid_id in ("Talk to Staff", "talk/staff", "talk.staff", "_talk"):
+            data = self._menu_form([{
+                "id": invalid_id,
+                "label": "Talk to Staff",
+                "action": "handover",
+                "enabled": True,
+                "position": 1,
+            }])
+            with self.subTest(invalid_id=invalid_id):
+                response = self.section("menu", **data)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    "id must be lowercase letters, digits",
+                    response.get_data(as_text=True),
+                )
+                self.assertEqual(self.stored(self.tenant_id), before)
+
+    def test_builder_change_is_visible_in_simulator_without_restart(self):
+        self.assertEqual(self.section("menu", **{
+            "present_menu_enabled": "1",
+            "menu_enabled": "1",
+            "present_menu_options": "1",
+            "menu_welcome_message": "Choose:",
+            "option_id_0": "browse_products",
+            "option_label_0": "First label",
+            "option_action_0": "browse_products",
+            "option_enabled_0": "1",
+            "option_position_0": "1",
+        }).status_code, 302)
+        page = self.client.get(
+            f"/playground/menu?tenant_id={self.tenant_id}"
+        ).get_data(as_text=True)
+        self.assertIn("First label", page)
+        self.assertEqual(self.section("menu", **{
+            "present_menu_enabled": "1",
+            "menu_enabled": "1",
+            "present_menu_options": "1",
+            "menu_welcome_message": "Choose:",
+            "option_id_0": "browse_products",
+            "option_label_0": "Second label",
+            "option_action_0": "browse_products",
+            "option_enabled_0": "1",
+            "option_position_0": "1",
+        }).status_code, 302)
+        refreshed = self.client.get(
+            f"/playground/menu?tenant_id={self.tenant_id}"
+        ).get_data(as_text=True)
+        self.assertIn("Second label", refreshed)
+        self.assertNotIn("First label", refreshed)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ from saas.bot import redact_sensitive_values
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
-from . import audit, validation as v
+from . import audit, menu as menu_service, validation as v
 from .config_merge import (
     UNSET,
     ItemRemoval,
@@ -344,6 +344,122 @@ def _api_patch(form: SubmittedForm) -> dict[str, Any]:
     return _column("configuration", _nested("config", patch))
 
 
+def _menu_patch(form: SubmittedForm) -> dict[str, Any]:
+    """H. WhatsApp customer menu -> validated ``configuration.menu`` fields.
+
+    The enabled checkbox has a presence marker. Option rows use indexed names so an
+    unchecked enabled box is still an explicit disabled option, and a blank row is
+    omitted. A form that does not submit option rows leaves the saved options untouched,
+    which preserves the old enabled-only form and any custom menu keys.
+    """
+    patch: dict[str, Any] = {}
+    if form.submitted("menu_enabled"):
+        raw = form.value("menu_enabled")
+        value = str(raw).strip().lower() if raw is not None else ""
+        if value in ("1", "true"):
+            patch["enabled"] = True
+        elif value in ("0", "false", ""):
+            patch["enabled"] = False
+        else:
+            raise v.ServiceError("Enable WhatsApp Menu must be true or false.")
+
+    if form.submitted("menu_welcome_message"):
+        welcome = v.text(
+            form.value("menu_welcome_message"),
+            "Menu welcome message",
+            max_length=menu_service.MAX_MENU_WELCOME,
+            required=False,
+        )
+        patch["welcome_message"] = UNSET if welcome is None else welcome
+
+    if form.submitted("menu_language"):
+        language = v.text(
+            form.value("menu_language"), "Menu language", max_length=16, required=False
+        )
+        if language is None:
+            patch["language"] = UNSET
+        elif not menu_service.MENU_LANGUAGE_RE.fullmatch(language):
+            raise v.ServiceError("Menu language must be a language tag such as en or en-KE.")
+        else:
+            patch["language"] = language
+
+    if form.submitted("present_menu_options"):
+        options: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_positions: set[int] = set()
+        for index in range(menu_service.MAX_MENU_OPTIONS):
+            option_id = str(form.value(f"option_id_{index}") or "").strip()
+            label = str(form.value(f"option_label_{index}") or "").strip()
+            action = str(form.value(f"option_action_{index}") or "").strip()
+            position_raw = str(form.value(f"option_position_{index}") or "").strip()
+            # Empty builder rows still submit their action select. Only an id or label
+            # means the operator actually filled the row.
+            if not option_id and not label:
+                continue
+            if not label:
+                raise v.ServiceError(f"Option {index + 1}: label is required.")
+            if len(label) > menu_service.MAX_MENU_LABEL:
+                raise v.ServiceError(
+                    f"Option {index + 1}: label must be at most "
+                    f"{menu_service.MAX_MENU_LABEL} characters."
+                )
+            if not action:
+                raise v.ServiceError(f"Option {index + 1}: action is required.")
+            if action not in menu_service.MENU_ACTIONS:
+                raise v.ServiceError(
+                    f"Option {index + 1}: unsupported action type."
+                )
+            try:
+                position = int(position_raw) if position_raw else index + 1
+            except ValueError as error:
+                raise v.ServiceError(
+                    f"Option {index + 1}: position must be a positive integer."
+                ) from error
+            if position < 1 or position > menu_service.MAX_MENU_OPTIONS:
+                raise v.ServiceError(
+                    f"Option {index + 1}: position must be between 1 and "
+                    f"{menu_service.MAX_MENU_OPTIONS}."
+                )
+            if option_id:
+                if not menu_service.MENU_OPTION_ID_RE.fullmatch(option_id):
+                    raise v.ServiceError(
+                        f"Option {index + 1}: id must be lowercase letters, digits, "
+                        "'-' or '_'."
+                    )
+            else:
+                # A new row may omit the ID. Derive it from the display label so the
+                # label remains human-facing and the stable id is always valid.
+                option_id = menu_service.menu_option_id_from_label(
+                    label, position=position, existing=seen_ids
+                )
+            if option_id in seen_ids:
+                raise v.ServiceError(f"Duplicate menu option id: {option_id}.")
+            if position in seen_positions:
+                raise v.ServiceError(f"Duplicate menu option position: {position}.")
+            seen_ids.add(option_id)
+            seen_positions.add(position)
+            enabled = str(form.value(f"option_enabled_{index}") or "").lower() in (
+                "1",
+                "true",
+            )
+            options.append(
+                {
+                    "id": option_id,
+                    "label": label,
+                    "action": action,
+                    "enabled": enabled,
+                    "position": position,
+                }
+            )
+        if len(options) > menu_service.MAX_MENU_OPTIONS:
+            raise v.ServiceError(
+                f"A menu can contain at most {menu_service.MAX_MENU_OPTIONS} options."
+            )
+        patch["options"] = options
+
+    return _column("configuration", _nested("menu", patch))
+
+
 def _knowledge_patch(form: SubmittedForm) -> dict[str, Any]:
     """G. Knowledge base -> ``configuration.knowledge_base``."""
     patch: dict[str, Any] = {}
@@ -418,6 +534,13 @@ SECTIONS: tuple[SectionSpec, ...] = (
     ),
     SectionSpec("logic", "WhatsApp logic", ("business_rules",), _logic_patch),
     SectionSpec("api", "API configuration", ("configuration",), _api_patch),
+    SectionSpec(
+        "menu",
+        "WhatsApp customer menu",
+        ("configuration",),
+        _menu_patch,
+        markers=("menu_enabled", "present_menu_options"),
+    ),
     SectionSpec(
         "knowledge",
         "Knowledge base",
@@ -506,6 +629,7 @@ def field_values(stored: Mapping[str, Any]) -> dict[str, Any]:
     configuration = stored.get("configuration") or {}
     identity = configuration.get("identity") or {}
     api = configuration.get("config") or {}
+    menu = menu_service.menu_config(stored)
     knowledge = configuration.get("knowledge_base") or {}
     scrape = knowledge.get("scrape_options") or {}
     persona = stored.get("bot_persona") or {}
@@ -545,6 +669,19 @@ def field_values(stored: Mapping[str, Any]) -> dict[str, Any]:
         "followup_template_name": api.get("followup_template_name"),
         "human_handover_number": api.get("human_handover_number"),
         "auto_close_ticket_after": api.get("auto_close_ticket_after"),
+        "menu_enabled": menu.enabled,
+        "menu_welcome_message": menu.welcome_message,
+        "menu_language": menu.language,
+        "menu_options": [
+            {
+                "id": option.id,
+                "label": option.label,
+                "action": option.action,
+                "enabled": option.enabled,
+                "position": option.position,
+            }
+            for option in menu.options
+        ],
         "website_link": knowledge.get("website_link"),
         "include_subpages": bool(scrape.get("include_subpages")),
         "max_pages": scrape.get("max_pages"),

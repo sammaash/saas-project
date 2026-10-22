@@ -25,6 +25,7 @@ import hashlib
 import copy
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -44,6 +45,7 @@ MAX_LIST_ROWS = 10
 STEPS = frozenset(
     {
         "main",
+        "option",
         "browse",
         "cat",
         "prod",
@@ -106,6 +108,82 @@ AVAILABILITY_LABELS = {
     "MADE_TO_ORDER": "made to order",
     "OUT_OF_STOCK": "out of stock",
 }
+
+#: Stable action types understood by the configurable menu. These map to the existing
+#: menu implementations; configuration never contains executable code.
+MENU_ACTIONS: tuple[str, ...] = (
+    "browse_products",
+    "place_order",
+    "my_order",
+    "delivery_collection",
+    "faqs",
+    "handover",
+)
+ACTION_STEPS: dict[str, str] = {
+    "browse_products": "browse",
+    "place_order": "order",
+    "my_order": "my_order",
+    "delivery_collection": "delivery",
+    "faqs": "faqs",
+    "handover": "staff",
+}
+#: Older/provisioning documents may use the internal step name as the action.
+ACTION_ALIASES: dict[str, str] = {
+    "browse": "browse_products",
+    "order": "place_order",
+    "delivery": "delivery_collection",
+    "staff": "handover",
+}
+OPTION_DESCRIPTIONS: dict[str, str] = {
+    "browse_products": "See what we have",
+    "place_order": "How to order",
+    "my_order": "Check your order",
+    "delivery_collection": "Fees and hours",
+    "faqs": "Common questions",
+    "handover": "Reach a person",
+}
+DEFAULT_WELCOME_MESSAGE = "Main menu:"
+DEFAULT_LANGUAGE = "en"
+MAX_MENU_OPTIONS = 10
+MAX_MENU_LABEL = 24
+MAX_MENU_WELCOME = 300
+MENU_OPTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+MENU_LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z]{2,8})?$")
+
+#: The six historical options, in their historical order. This is both the compatibility
+#: default and the initial state exposed by the dashboard builder.
+DEFAULT_MENU_OPTIONS: tuple[dict[str, Any], ...] = (
+    {"id": "browse_products", "label": "Browse Products",
+     "action": "browse_products", "enabled": True, "position": 1},
+    {"id": "place_order", "label": "Place an Order",
+     "action": "place_order", "enabled": True, "position": 2},
+    {"id": "my_order", "label": "My Order",
+     "action": "my_order", "enabled": True, "position": 3},
+    {"id": "delivery_collection", "label": "Delivery & Collection",
+     "action": "delivery_collection", "enabled": True, "position": 4},
+    {"id": "faqs", "label": "FAQs",
+     "action": "faqs", "enabled": True, "position": 5},
+    {"id": "handover", "label": "Talk to Staff",
+     "action": "handover", "enabled": True, "position": 6},
+)
+
+
+@dataclass(frozen=True)
+class MenuOption:
+    id: str
+    label: str
+    action: str
+    enabled: bool
+    position: int
+
+
+@dataclass(frozen=True)
+class MenuConfig:
+    enabled: bool
+    welcome_message: str
+    language: str
+    options: tuple[MenuOption, ...]
+    valid: bool = True
 
 
 @dataclass(frozen=True)
@@ -213,6 +291,159 @@ def set_enabled(settings: Settings, tenant_id: str, enabled: bool = True) -> dic
         merged = with_menu_enabled(document, enabled)
         admin.update_settings(configuration=merged["configuration"])
     return merged
+
+
+def normalize_menu_option_id(value: str) -> str:
+    """Normalize a label-derived id to the persisted lowercase id alphabet.
+
+    Explicit ids from stored documents are never passed through this helper: existing
+    valid ids must remain byte-for-byte stable so outstanding taps keep working.
+    """
+    ascii_value = (
+        unicodedata.normalize("NFKD", str(value or ""))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    normalized = re.sub(r"[^a-z0-9]+", "_", ascii_value)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized[:32].rstrip("_")
+
+
+def menu_option_id_from_label(
+    label: str, *, position: int, existing: set[str] | None = None
+) -> str:
+    """Build a unique, lowercase stable id when an operator leaves the id blank."""
+    base = normalize_menu_option_id(label) or f"option_{max(1, int(position))}"
+    base = base[:32].rstrip("_") or f"option_{max(1, int(position))}"
+    used = existing or set()
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        suffix_text = f"_{suffix}"
+        stem = base[: 32 - len(suffix_text)].rstrip("_")
+        candidate = f"{stem or 'option'}{suffix_text}"
+        suffix += 1
+    return candidate
+
+
+def default_menu_options() -> tuple[MenuOption, ...]:
+    """The historical six options used when a tenant has no options list."""
+    return tuple(
+        MenuOption(
+            id=entry["id"],
+            label=entry["label"],
+            action=entry["action"],
+            enabled=entry["enabled"],
+            position=entry["position"],
+        )
+        for entry in DEFAULT_MENU_OPTIONS
+    )
+
+
+def _parse_option(raw: Any, *, default_position: int) -> MenuOption | None:
+    """Parse one persisted option defensively; invalid options are never executed."""
+    if not isinstance(raw, dict):
+        return None
+    option_id = str(raw.get("id") or raw.get("key") or "").strip()
+    label = str(raw.get("label") or raw.get("title") or "").strip()
+    action = str(raw.get("action") or raw.get("action_type") or "").strip()
+    action = ACTION_ALIASES.get(action, action)
+    raw_position = raw.get("position", raw.get("order", default_position))
+    try:
+        position = int(raw_position)
+    except (TypeError, ValueError):
+        return None
+    raw_enabled = raw.get("enabled", True)
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    else:
+        enabled = str(raw_enabled).strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    if (
+        not MENU_OPTION_ID_RE.fullmatch(option_id)
+        or not label
+        or len(label) > MAX_MENU_LABEL
+        or action not in MENU_ACTIONS
+        or position < 1
+        or position > MAX_MENU_OPTIONS
+    ):
+        return None
+    return MenuOption(
+        id=option_id,
+        label=label,
+        action=action,
+        enabled=enabled,
+        position=position,
+    )
+
+
+def menu_config(document: dict[str, Any] | None) -> MenuConfig:
+    """Return a validated, backward-compatible view of ``configuration.menu``.
+
+    Missing ``options`` means the historical six-option menu. An explicitly empty list
+    means no options. Malformed options are retained only as an invalid configuration so
+    runtime callers can return a safe error instead of executing an unknown action.
+    """
+    document = document if isinstance(document, dict) else {}
+    configuration = document.get("configuration")
+    configuration = configuration if isinstance(configuration, dict) else {}
+    raw_menu = configuration.get("menu")
+    raw_menu = raw_menu if isinstance(raw_menu, dict) else {}
+    enabled = raw_menu.get("enabled") is True
+
+    welcome = raw_menu.get("welcome_message", raw_menu.get("welcome"))
+    welcome = (
+        welcome.strip()
+        if isinstance(welcome, str) and welcome.strip()
+        else DEFAULT_WELCOME_MESSAGE
+    )[:MAX_MENU_WELCOME]
+    language = raw_menu.get("language")
+    language = (
+        language.strip()
+        if isinstance(language, str) and language.strip()
+        else DEFAULT_LANGUAGE
+    )[:16]
+
+    if not isinstance(raw_menu, dict) or "options" not in raw_menu:
+        return MenuConfig(enabled, welcome, language, default_menu_options())
+
+    raw_options = raw_menu.get("options")
+    if not isinstance(raw_options, list):
+        return MenuConfig(enabled, welcome, language, (), valid=False)
+
+    options: list[MenuOption] = []
+    seen_ids: set[str] = set()
+    seen_positions: set[int] = set()
+    valid = len(raw_options) <= MAX_MENU_OPTIONS
+    for index, raw in enumerate(raw_options):
+        option = _parse_option(raw, default_position=index + 1)
+        if option is None or option.id in seen_ids or option.position in seen_positions:
+            valid = False
+            continue
+        seen_ids.add(option.id)
+        seen_positions.add(option.position)
+        options.append(option)
+    options.sort(key=lambda option: option.position)
+    return MenuConfig(enabled, welcome, language, tuple(options), valid=valid)
+
+
+def action_enabled(config: MenuConfig, step: str) -> bool:
+    """True when at least one enabled configured option maps to an internal step."""
+    return any(
+        option.enabled and ACTION_STEPS.get(option.action) == step
+        for option in config.options
+    )
+
+
+def make_option_action(option_id: str, *, now: float | None = None) -> str:
+    """A stable action id for a configured option, independent of its label."""
+    return make_action("option", option_id, now=now)
 
 
 def load_document(settings: Settings, tenant_id: str) -> dict[str, Any]:
@@ -343,31 +574,40 @@ def _list(
     )
 
 
-def main_menu(*, now: float | None = None) -> MenuReply:
-    rows = [
-        {"id": make_action(step, None, now=now), "title": title, "description": description}
-        for step, title, description in (
-            ("browse", "Browse Products", "See what we have"),
-            ("order", "Place an Order", "How to order"),
-            ("my_order", "My Order", "Check your order"),
-            ("delivery", "Delivery & Collection", "Fees and hours"),
-            ("faqs", "FAQs", "Common questions"),
-            ("staff", "Talk to Staff", "Reach a person"),
+def main_menu(
+    document: dict[str, Any] | None = None, *, now: float | None = None
+) -> MenuReply:
+    """Build the configured main menu, or the historical default when none is saved."""
+    config = menu_config(document)
+    if not config.valid:
+        return _text(
+            "The saved menu configuration is invalid. Please ask the team to update it."
         )
+    options = [option for option in config.options if option.enabled]
+    if not options:
+        return _text(
+            f"{config.welcome_message}\n\nNo menu options are currently available."
+        )
+    rows = [
+        {
+            "id": make_option_action(option.id, now=now),
+            "title": option.label,
+            "description": OPTION_DESCRIPTIONS.get(option.action, "Choose this option"),
+        }
+        for option in options
     ]
-    text = (
-        "Main menu:\n"
-        "1. Browse Products\n"
-        "2. Place an Order\n"
-        "3. My Order\n"
-        "4. Delivery & Collection\n"
-        "5. FAQs\n"
-        "6. Talk to Staff\n\n"
-        "Reply with an option name (for example: Browse Products), or reply MENU for "
-        "this list."
+    lines = [config.welcome_message]
+    for position, option in enumerate(options, start=1):
+        lines.append(f"{position}. {option.label}")
+    lines.extend(
+        [
+            "",
+            f"Reply with an option name (for example: {options[0].label}), or reply "
+            "MENU for this list.",
+        ]
     )
     return _list(
-        text,
+        "\n".join(lines),
         [{"title": "Menu", "rows": rows}],
         header="Main menu",
         body="Choose an option below.",
@@ -388,27 +628,69 @@ def _bottom_buttons(*, include_browse: bool = False, include_faqs: bool = False)
     return buttons[:3]
 
 
+def _configured_option(config: MenuConfig, text: str) -> MenuOption | None:
+    normalized = text.strip().casefold()
+    return next(
+        (
+            option
+            for option in config.options
+            if option.enabled and option.label.casefold() == normalized
+        ),
+        None,
+    )
+
+
 def handle_text(
     ctx: MenuContext, text: str, *, now: float | None = None
 ) -> MenuReply | None:
-    """Route an exact command/option name. Returns None for ordinary conversation."""
+    """Route an exact command, configured label, or legacy alias."""
     value = (text or "").strip()
-    lowered = value.lower()
+    lowered = value.casefold()
+    config = menu_config(ctx.document)
     if lowered == "menu":
-        return main_menu(now=now)
+        return main_menu(ctx.document, now=now)
+    if not config.valid:
+        return _text("The saved menu configuration is invalid. Please ask us for help.")
+    configured = _configured_option(config, value)
+    if configured is not None:
+        return _render_step(ctx, Selection(ACTION_STEPS[configured.action], None), now=now)
     match = ORDER_COMMAND_RE.fullmatch(value)
     if match:
+        if not action_enabled(config, "my_order"):
+            return _text("My Order is disabled in the current menu configuration.")
         return _order_status(ctx, match.group(1), now=now)
     step = OPTION_ALIASES.get(lowered)
     if step is None:
         return None
+    if not action_enabled(config, step):
+        return _text("That menu option is disabled in the current menu configuration.")
     return _render_step(ctx, Selection(step, None), now=now)
 
 
-def is_menu_command(text: str) -> bool:
+def could_be_configured_label(text: str) -> bool:
+    """A deliberately cheap hint for the webhook before it reads tenant settings.
+
+    Configured labels are constrained to WhatsApp row-title length. Requiring an
+    upper-case first character keeps ordinary lowercase chat (and the old
+    "no settings read for chat" contract) on the AI path; the authoritative check
+    is still ``is_menu_command(text, document)`` after the settings are loaded.
+    """
+    value = (text or "").strip()
+    return (
+        0 < len(value) <= MAX_MENU_LABEL
+        and "\n" not in value
+        and value[:1].isupper()
+    )
+
+
+def is_menu_command(text: str, document: dict[str, Any] | None = None) -> bool:
     """Cheap pre-filter so ordinary chat never triggers a settings read."""
     value = (text or "").strip()
-    lowered = value.lower()
+    lowered = value.casefold()
+    if document is not None:
+        config = menu_config(document)
+        if config.valid and _configured_option(config, value) is not None:
+            return True
     return (
         lowered == "menu"
         or bool(ORDER_COMMAND_RE.fullmatch(value))
@@ -428,10 +710,28 @@ def handle_action(
     return _render_step(ctx, parsed.selection, now=now)
 
 
+def _render_option(
+    ctx: MenuContext, option_id: str | None, *, now: float | None
+) -> MenuReply:
+    """Resolve a stable configured option id, never a display label."""
+    config = menu_config(ctx.document)
+    option = next(
+        (entry for entry in config.options if entry.id == option_id),
+        None,
+    )
+    if not config.valid or option is None or not option.enabled:
+        return _text(
+            "That menu option is no longer available. Reply MENU to start again."
+        )
+    return _render_step(ctx, Selection(ACTION_STEPS[option.action], None), now=now)
+
+
 def _render_step(ctx: MenuContext, selection: Selection, *, now: float | None) -> MenuReply | None:
     step = selection.step
     if step == "main":
-        return main_menu(now=now)
+        return main_menu(ctx.document, now=now)
+    if step == "option":
+        return _render_option(ctx, selection.arg, now=now)
     if step == "browse":
         return _browse(ctx, now=now)
     if step == "cat":
