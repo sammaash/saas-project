@@ -16,6 +16,11 @@ re-validated against the current tenant's data before use.
 The menu is disabled unless ``tenant_settings.configuration.menu.enabled`` is ``true``.
 ``configuration`` is the documented catch-all JSONB for new settings (0006), so enabling it
 needs no schema change.
+
+``Request a Quotation`` is advertised only when the tenant has *also* set
+``configuration.quotations.enabled`` to ``true`` (section H of the rules tab). A tenant
+without that opt-in gets the six other options, because the quotation handler would only
+have to refuse the request.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from saas import quotations as quotation_service
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
@@ -49,6 +55,7 @@ STEPS = frozenset(
         "prod",
         "order",
         "my_order",
+        "quote",
         "delivery",
         "faqs",
         "faq",
@@ -79,6 +86,13 @@ OPTION_ALIASES: dict[str, str] = {
     "my order": "my_order",
     "my orders": "my_order",
     "check my order": "my_order",
+    "request a quotation": "quote",
+    "request quotation": "quote",
+    "request a quote": "quote",
+    "get a quotation": "quote",
+    "get a quote": "quote",
+    "quotation": "quote",
+    "quote": "quote",
     "delivery": "delivery",
     "collection": "delivery",
     "delivery & collection": "delivery",
@@ -175,6 +189,15 @@ def is_enabled(document: dict[str, Any] | None) -> bool:
         return False
     menu = configuration.get("menu")
     return isinstance(menu, dict) and menu.get("enabled") is True
+
+
+def quotations_offered(ctx: MenuContext) -> bool:
+    """True when this tenant has enabled customer quotations.
+
+    Read from the same settings document the menu gate uses, so the option is only
+    advertised when the handler behind it could actually issue a quotation.
+    """
+    return quotation_service.quotations_enabled((ctx.document or {}).get("configuration"))
 
 
 def with_menu_enabled(
@@ -343,28 +366,46 @@ def _list(
     )
 
 
-def main_menu(*, now: float | None = None) -> MenuReply:
+#: The main menu, in the order a customer sees it. The quotation option is not part of
+#: this tuple because it is offered only to tenants that have enabled it.
+MAIN_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
+    ("browse", "Browse Products", "See what we have"),
+    ("order", "Place an Order", "How to order"),
+    ("my_order", "My Order", "Check your order"),
+    ("delivery", "Delivery & Collection", "Fees and hours"),
+    ("faqs", "FAQs", "Common questions"),
+    ("staff", "Talk to Staff", "Reach a person"),
+)
+
+QUOTATION_MENU_OPTION = ("quote", "Request a Quotation", "Get a written price")
+
+#: The quotation row sits after "My Order", so enabling it never moves the options a
+#: customer already knows.
+QUOTATION_MENU_POSITION = 3
+
+
+def main_menu(*, now: float | None = None, quotations_enabled: bool = False) -> MenuReply:
+    """The main menu, listing only the options this tenant can actually complete.
+
+    ``quotations_enabled`` is the tenant's saved ``configuration.quotations.enabled``
+    opt-in. A tenant that has not enabled quotations gets no quotation row: offering an
+    option whose handler could only refuse it wastes a customer's tap.
+    """
+    options = list(MAIN_MENU_OPTIONS)
+    if quotations_enabled:
+        options.insert(QUOTATION_MENU_POSITION, QUOTATION_MENU_OPTION)
     rows = [
         {"id": make_action(step, None, now=now), "title": title, "description": description}
-        for step, title, description in (
-            ("browse", "Browse Products", "See what we have"),
-            ("order", "Place an Order", "How to order"),
-            ("my_order", "My Order", "Check your order"),
-            ("delivery", "Delivery & Collection", "Fees and hours"),
-            ("faqs", "FAQs", "Common questions"),
-            ("staff", "Talk to Staff", "Reach a person"),
-        )
+        for step, title, description in options
     ]
+    numbered = "\n".join(
+        f"{index}. {title}" for index, (_, title, _) in enumerate(options, start=1)
+    )
     text = (
         "Main menu:\n"
-        "1. Browse Products\n"
-        "2. Place an Order\n"
-        "3. My Order\n"
-        "4. Delivery & Collection\n"
-        "5. FAQs\n"
-        "6. Talk to Staff\n\n"
-        "Reply with an option name (for example: Browse Products), or reply MENU for "
-        "this list."
+        f"{numbered}\n\n"
+        f"Reply with an option name (for example: {options[0][1]}), or reply MENU "
+        "for this list."
     )
     return _list(
         text,
@@ -395,7 +436,7 @@ def handle_text(
     value = (text or "").strip()
     lowered = value.lower()
     if lowered == "menu":
-        return main_menu(now=now)
+        return main_menu(now=now, quotations_enabled=quotations_offered(ctx))
     match = ORDER_COMMAND_RE.fullmatch(value)
     if match:
         return _order_status(ctx, match.group(1), now=now)
@@ -431,7 +472,7 @@ def handle_action(
 def _render_step(ctx: MenuContext, selection: Selection, *, now: float | None) -> MenuReply | None:
     step = selection.step
     if step == "main":
-        return main_menu(now=now)
+        return main_menu(now=now, quotations_enabled=quotations_offered(ctx))
     if step == "browse":
         return _browse(ctx, now=now)
     if step == "cat":
@@ -442,6 +483,8 @@ def _render_step(ctx: MenuContext, selection: Selection, *, now: float | None) -
         return _place_order(now=now)
     if step == "my_order":
         return _my_order(now=now)
+    if step == "quote":
+        return _request_quote(ctx)
     if step == "delivery":
         return _delivery(ctx)
     if step == "faqs":
@@ -825,6 +868,65 @@ def _my_order(*, now: float | None = None) -> MenuReply:
             {"id": make_action("main", now=now), "title": "Main menu"},
         ],
         header="My Order",
+    )
+
+
+def _request_quote(ctx: MenuContext) -> MenuReply:
+    """Start a customer quotation request, or explain why it is unavailable.
+
+    The gate is re-read from the tenant's configured settings, and a request is
+    only opened when outbound sending works: a quotation that cannot be delivered
+    is not a quotation the customer can use.
+    """
+    configuration = (ctx.document or {}).get("configuration")
+    if not quotation_service.quotations_enabled(configuration):
+        return _buttons(
+            "Automatic quotations aren't available for this business yet. Our team "
+            "can prepare a written quotation for you instead.",
+            [
+                {"id": make_action("staff"), "title": "Talk to staff"},
+                {"id": make_action("main"), "title": "Main menu"},
+            ],
+            header="Request a Quotation",
+        )
+    if not getattr(ctx.settings, "whatsapp_send_enabled", False):
+        return _buttons(
+            "Quotations can't be issued right now. Our team can help you instead.",
+            [
+                {"id": make_action("staff"), "title": "Talk to staff"},
+                {"id": make_action("main"), "title": "Main menu"},
+            ],
+            header="Request a Quotation",
+        )
+    if not ctx.conversation or not ctx.wa_id:
+        return _text(
+            "I can't start a quotation for this chat right now. Please reply STAFF and "
+            "our team will help."
+        )
+    try:
+        quotation_service.start_brief(
+            ctx.settings, ctx.tenant_id, str(ctx.conversation["id"]), ctx.wa_id
+        )
+    except Exception:  # noqa: BLE001 - a storage failure must not look like success
+        logger.exception("Quotation brief start failed for tenant %s", ctx.tenant_id)
+        return _text(
+            "I couldn't start a quotation just now. Please reply STAFF and our team "
+            "will help."
+        )
+    text = (
+        "Sure — tell me what you'd like a quotation for. Include the item, the size "
+        "or option, and how many. For example: 2 vanilla cakes, 2kg each.\n\n"
+        "You can also just describe it in your own words; I'll ask if anything is "
+        "missing. The price comes from our saved catalogue."
+    )
+    return _buttons(
+        text,
+        [
+            {"id": make_action("browse"), "title": "Browse products"},
+            {"id": make_action("staff"), "title": "Talk to staff"},
+            {"id": make_action("main"), "title": "Main menu"},
+        ],
+        header="Request a Quotation",
     )
 
 

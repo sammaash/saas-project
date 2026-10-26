@@ -319,6 +319,29 @@ and a failed save leaves the stored configuration exactly as it was.</p>
 <p class="muted">No documents registered yet.</p>
 {% endfor %}
 
+<section class="card config-section" id="config-quotations">
+  <h3>H. WhatsApp quotations</h3>
+  {% if errors.get('quotations') %}<p class="flash error">{{ errors.quotations }}</p>{% endif %}
+  {% call section_form('quotations', 'Save quotation settings', tenant.id, version) %}
+    <input type="hidden" name="present_quotations_enabled" value="1">
+    <label class="check">
+      <input type="checkbox" name="quotations_enabled" value="1"
+        {{ 'checked' if fields.quotations_enabled else '' }}>
+      Enable WhatsApp quotations
+    </label>
+    <p class="muted">Disabled by default, and saved as
+    <code>configuration.quotations.enabled</code> = <strong>{{ 'true' if fields.quotations_enabled
+    else 'false' }}</strong>. When enabled, the AI may issue formal, catalogue-priced quotations for
+    exact catalogue items and send the PDF on WhatsApp. Custom, unlisted or ambiguous items still
+    go to staff, and the service must also have WhatsApp sending enabled
+    (<code>WHATSAPP_SEND_ENABLED=1</code>) before a quotation can be delivered.</p>
+    <p class="muted">Turn this on only after migrations <code>0036</code> and <code>0037</code>
+    have been applied to this tenant's database: the customer menu stops advertising the option
+    while it is off, but an issued quotation request needs the quotation tables from
+    <code>0037</code>.</p>
+  {% endcall %}
+</section>
+
 <h2>New client onboarding</h2>
 <form method="post" action="{{ url_for('admin.tenant_rules', tenant_id=tenant.id) }}"
       id="save-all-sections">

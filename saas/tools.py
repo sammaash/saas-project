@@ -26,6 +26,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from . import handover as _handover
+from . import quotations as _quotations
 from .tenant_admin import tenant_admin
 
 logger = logging.getLogger("saas.tools")
@@ -88,6 +89,15 @@ class ToolContext:
     database_url: str | None = None
     safe_test_mode: bool = False
     context_turns: tuple[dict[str, str], ...] = ()
+    #: Conversation the turn belongs to. Quotation briefs are stored per conversation
+    #: so a follow-up message updates the same request.
+    conversation_id: str | None = None
+    #: Verified customer display name, when the customer profile has one.
+    customer_name: str | None = None
+    #: Server-resolved feature gates. Defaults are closed: a caller that forgets to
+    #: resolve them cannot create a quotation.
+    quotations_enabled: bool = False
+    send_enabled: bool = False
 
     def require_staff(self) -> None:
         if not self.is_staff:
@@ -806,6 +816,158 @@ class GetPaymentStatusTool:
         )
 
 
+# ---------------------------------------------------------------------------
+# Quotation tools (WhatsApp)
+# ---------------------------------------------------------------------------
+QUOTATION_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "product_name": {"type": "string", "maxLength": 200},
+        "weight_kg": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "quantity": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "variant": {"type": "string", "maxLength": 100},
+        "notes": {"type": "string", "maxLength": 500},
+    },
+    "additionalProperties": False,
+}
+
+
+def _quotation_gate(context: ToolContext) -> ToolResult | None:
+    """Fail closed when quotations or outbound sending are not enabled."""
+    if context.safe_test_mode:
+        return ToolResult(
+            ok=False,
+            error=(
+                "Test mode: a quotation would be created here, but nothing was written "
+                "and no message was sent."
+            ),
+        )
+    if not context.send_enabled:
+        return ToolResult(
+            ok=False,
+            error=(
+                "A quotation cannot be delivered in this environment, so none was "
+                "created. Offer to have the team help instead."
+            ),
+        )
+    if not context.quotations_enabled:
+        return ToolResult(
+            ok=False,
+            error=(
+                "This business has not enabled automatic quotations. Offer to have the "
+                "team prepare one instead."
+            ),
+        )
+    return None
+
+
+def _quotation_payload(quotation: dict[str, Any]) -> dict[str, Any]:
+    """A JSON-safe view built only from persisted quotation fields."""
+
+    def money(value: Any) -> str | None:
+        if value is None:
+            return None
+        try:
+            return f"{Decimal(str(value)):.2f}"
+        except (InvalidOperation, TypeError, ValueError):
+            return str(value)
+
+    return {
+        "id": str(quotation.get("id")),
+        "quotation_number": quotation.get("quotation_number"),
+        "currency": quotation.get("currency"),
+        "subtotal": money(quotation.get("subtotal")),
+        "tax_amount": money(quotation.get("tax_amount")),
+        "total": money(quotation.get("total")),
+        "tax_treatment": quotation.get("tax_treatment"),
+        "issue_date": str(quotation.get("issue_date")),
+        "expiry_date": str(quotation.get("expiry_date")),
+        "status": quotation.get("status"),
+        "source": quotation.get("source"),
+        "duplicate": bool(quotation.get("duplicate")),
+        "summary": _quotations.format_customer_summary(quotation),
+        "lines": [
+            {
+                "sku": line.get("sku"),
+                "description": line.get("description"),
+                "availability": line.get("availability"),
+                "quantity": line.get("quantity"),
+                "unit_price": money(line.get("unit_price")),
+                "subtotal": money(line.get("subtotal")),
+            }
+            for line in quotation.get("lines") or []
+        ],
+    }
+
+
+class UpdateQuotationBriefTool:
+    """Collect the details of a quotation request across turns.
+
+    The brief is the durable context: a later message ("two of them", "make it
+    2kg") merges into the same request. The tool returns the server-computed list
+    of missing details, so the model asks one question at a time instead of
+    guessing or re-asking for what it already knows.
+    """
+
+    name = "update_quotation_brief"
+    description = (
+        "Record what the customer wants a quotation for. Use it whenever the "
+        "customer asks for a price/quote or corrects an earlier detail. The result "
+        "lists the details that are still missing; ask only for those."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "minItems": 1, "items": QUOTATION_ITEM_SCHEMA},
+            "notes": {"type": "string", "maxLength": 1000},
+            "replace": {"type": "boolean"},
+        },
+        "additionalProperties": False,
+    }
+
+    def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        gate = _quotation_gate(context)
+        if gate is not None:
+            return gate
+        if not context.conversation_id:
+            return ToolResult(ok=False, error="No conversation is available.")
+        if not context.customer_key:
+            return ToolResult(ok=False, error="No customer identity is available.")
+        patch: dict[str, Any] = {}
+        if "items" in arguments:
+            patch["items"] = arguments["items"]
+        if "notes" in arguments:
+            patch["notes"] = arguments["notes"]
+        if arguments.get("replace") is True:
+            patch["replace"] = True
+        if not patch:
+            return ToolResult(ok=False, error="No quotation details were supplied.")
+        tenant_id = _resolve_tenant_id(context)
+        try:
+            row = _quotations.update_brief(
+                context.database_url,
+                tenant_id,
+                context.conversation_id,
+                context.customer_key,
+                patch,
+            )
+        except _quotations.QuotationError as error:
+            return ToolResult(ok=False, error=str(error))
+        except Exception:  # noqa: BLE001 - the model must be able to explain a failure
+            logger.exception("update_quotation_brief failed for tenant %s", tenant_id)
+            return ToolResult(ok=False, error="Could not save the quotation details.")
+        evaluation = row["evaluation"]
+        return ToolResult(
+            ok=True,
+            data={
+                "status": row["status"],
+                "missing_fields": row["missing_fields"],
+                "next_question": evaluation.get("message"),
+                "needs_staff": evaluation["needs_staff"],
+                "request": row["brief"],
+            },
+        )
+
 def default_tool_registry() -> ToolRegistry:
     """A registry with every built-in tool, ready to wire into an engine."""
     registry = ToolRegistry()
@@ -818,6 +980,9 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(ConfirmOrderTool())
     registry.register(GetOrderStatusTool())
     registry.register(GetPaymentStatusTool())
+    registry.register(UpdateQuotationBriefTool())
+    registry.register(RequestQuoteTool())
+    registry.register(RequestQuotationPdfTool())
     return registry
 
 
@@ -841,6 +1006,9 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
         if json_start >= len(text) or text[json_start] != "{":
             search_from = idx + len(_TOOL_CALL_PREFIX)
             continue
+
+
+
         extracted = _extract_balanced_json(text, json_start)
         if extracted is None:
             search_from = json_start + 1
@@ -897,7 +1065,9 @@ def execute_tool_calls(
                 "tool": name,
                 "ok": result.ok,
             }
-            if result.ok and result.data is not None:
+            # Structured data is kept for failed calls too: the quotation tools report
+            # reason/needs_staff on refusal, and the host turns that into a handover.
+            if result.data is not None:
                 entry["data"] = result.data
             if not result.ok and result.error:
                 entry["error"] = result.error
@@ -913,3 +1083,134 @@ def execute_tool_calls(
                 }
             )
     return results
+
+
+class RequestQuotationPdfTool:
+    """Resolve the customer's newest quotation so the host can send its PDF."""
+
+    name = "request_quotation_pdf"
+    description = (
+        "Use when the customer asks for a PDF/document copy of a quotation they "
+        "already received. The platform sends the file; never claim to attach it "
+        "without calling this tool."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        gate = _quotation_gate(context)
+        if gate is not None:
+            return gate
+        if not context.customer_key:
+            return ToolResult(ok=False, error="No customer identity is available.")
+        tenant_id = _resolve_tenant_id(context)
+        try:
+            quotation = _quotations.latest_quotation_for_customer(
+                context.database_url, tenant_id, context.customer_key
+            )
+        except _quotations.QuotationError as error:
+            return ToolResult(ok=False, error=str(error))
+        except Exception:  # noqa: BLE001
+            logger.exception("request_quotation_pdf failed for tenant %s", tenant_id)
+            return ToolResult(ok=False, error="The quotation could not be loaded.")
+        if quotation is None:
+            return ToolResult(
+                ok=True,
+                data={
+                    "quotation": None,
+                    "message": "No quotation has been issued to this customer yet.",
+                },
+            )
+        return ToolResult(ok=True, data={"quotation": _quotation_payload(quotation)})
+
+
+
+class RequestQuoteTool:
+    """Issue a formal, catalogue-priced quotation for the conversation's brief."""
+
+    name = "request_quote"
+    description = (
+        "Create a formal quotation from the collected request. Prices come from the "
+        "saved catalogue only. Never quote an unlisted, custom or ambiguous item; "
+        "the tool reports needs_staff for those and the team prices it instead."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "minItems": 1, "items": QUOTATION_ITEM_SCHEMA},
+            "use_brief": {"type": "boolean"},
+            "customer_name": {"type": "string", "maxLength": 200},
+            "terms": {"type": "string", "maxLength": 4000},
+        },
+        "additionalProperties": False,
+    }
+
+    def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        gate = _quotation_gate(context)
+        if gate is not None:
+            return gate
+        if not context.conversation_id:
+            return ToolResult(ok=False, error="No conversation is available.")
+        if not context.customer_key:
+            return ToolResult(ok=False, error="No customer identity is available.")
+        if not context.message_id:
+            return ToolResult(
+                ok=False,
+                error="A quotation needs the originating message for idempotency.",
+            )
+        tenant_id = _resolve_tenant_id(context)
+
+        items = arguments.get("items")
+        if items is not None:
+            if not isinstance(items, list) or not items:
+                return ToolResult(ok=False, error="Provide at least one item.")
+            try:
+                _quotations.update_brief(
+                    context.database_url,
+                    tenant_id,
+                    context.conversation_id,
+                    context.customer_key,
+                    {"items": items, "replace": True},
+                )
+            except _quotations.QuotationError as error:
+                return ToolResult(ok=False, error=str(error))
+        elif not arguments.get("use_brief"):
+            # Neither explicit items nor an explicit brief finalisation: the model is
+            # guessing. Refuse instead of pricing something the customer did not ask for.
+            return ToolResult(
+                ok=False,
+                error="Collect the requested items first, then pass use_brief=true.",
+            )
+
+        name = (
+            str(arguments.get("customer_name") or "").strip()
+            or context.customer_name
+            or context.customer_key
+        )
+        try:
+            quotation = _quotations.create_quotation_from_brief(
+                context.database_url,
+                tenant_id,
+                conversation_id=context.conversation_id,
+                customer_wa_id=context.customer_key,
+                customer_name=name,
+                message_id=context.message_id,
+                terms=arguments.get("terms"),
+            )
+        except _quotations.QuotationNeedsStaff as error:
+            return ToolResult(
+                ok=False,
+                data={"needs_staff": True, "reason": error.reason, "request": str(error)},
+                error=str(error),
+            )
+        except _quotations.QuotationConflictError as error:
+            return ToolResult(ok=False, error=str(error))
+        except _quotations.QuotationError as error:
+            return ToolResult(ok=False, error=str(error))
+        except Exception:  # noqa: BLE001 - never leak a price claim on failure
+            logger.exception("request_quote failed for tenant %s", tenant_id)
+            return ToolResult(ok=False, error="The quotation could not be created.")
+        return ToolResult(ok=True, data={"quotation": _quotation_payload(quotation)})

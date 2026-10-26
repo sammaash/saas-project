@@ -100,6 +100,7 @@ whose version no longer matches is refused with `409` and the stored configurati
 | `logic` | `/rules/logic` | `business_rules` (photo / not found / price asked / visibility / spam) |
 | `api` | `/rules/api` | `configuration.config` |
 | `knowledge` | `/rules/knowledge` | `configuration.knowledge_base` (website, scrape options, FAQ list, documents, extra info) |
+| `quotations` | `/rules/quotations` | `configuration.quotations.enabled` (opt-in; `present_quotations_enabled` marks the section, so an unchecked box writes `false` and no marker leaves the flag alone) |
 | `faq` | `/rules/faq` | one FAQ, by `faq_index` |
 | `document` | `/rules/document` | one document, by `document_name` |
 
@@ -156,6 +157,12 @@ configuration unchanged; a failed audit write rolling the change back; FAQ and d
 single-item edits; website/extra-info changes preserving documents and FAQs; catalogue
 untouched; credentials never rendered and never destroyed; tenant isolation and CSRF; stale
 version rejected; the bot runtime seeing the change; the original onboarding path still working.
+
+The quotation opt-in has its own group in the same file: default off (no key written), form and
+API agreeing after an enable, a save that writes only its own key, an unchecked box writing
+`false` while preserving the rest of the document, other sections leaving the flag alone, an
+unknown value rejected with `400` and no write, a signed-out or non-administrator POST refused,
+and the customer menu gaining the option only for the opted-in tenant.
 
 ## 10. Deployment
 

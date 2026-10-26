@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import time
 import unittest
 import uuid
 
@@ -23,6 +24,7 @@ from platform_admin.auth import AuthError, Authenticator, Identity
 from platform_admin.config import Settings
 from platform_admin.services import audit as audit_service
 from platform_admin.services import bot_config
+from platform_admin.services import menu
 from saas.bot import TenantBotContextLoader
 from saas_test_support import (
     PLATFORM_ADMIN_USER_ID,
@@ -300,8 +302,8 @@ class LoadSavedConfigurationTests(ConfigurationManagerTestCase):
         self.assertEqual(payload["stored"]["business_rules"]["delivery"], "Countrywide")
         self.assertEqual(
             [item["name"] for item in payload["sections"]],
-            ["identity", "persona", "hours", "rules", "logic", "api", "knowledge", "faq",
-             "document"],
+            ["identity", "persona", "hours", "rules", "logic", "api", "knowledge",
+             "quotations", "faq", "document"],
         )
 
     def test_an_unconfigured_client_shows_not_set_instead_of_invented_defaults(self):
@@ -647,6 +649,170 @@ class KnowledgeBaseTests(ConfigurationManagerTestCase):
             ["Headlights", "Bulbs"],
         )
 
+
+
+class QuotationOptInTests(ConfigurationManagerTestCase):
+    """Requirement 2: quotations are a tenant-scoped opt-in, off until an admin sets it."""
+
+    def quotations(self, tenant_id: str | None = None) -> dict | None:
+        configuration = self.stored(tenant_id or self.tenant_id)["configuration"]
+        return configuration.get("quotations")
+
+    def quotations_enabled(self, tenant_id: str | None = None) -> bool | None:
+        return (self.quotations(tenant_id) or {}).get("enabled")
+
+    def enable(self, tenant_id: str | None = None):
+        """Submit section H exactly as the browser does for a checked box."""
+        return self.post(
+            f"/tenants/{tenant_id or self.tenant_id}/rules/quotations",
+            {"present_quotations_enabled": "1", "quotations_enabled": "1"},
+        )
+
+    @staticmethod
+    def checkbox_is_checked(html: str, name: str) -> bool:
+        return re.search(rf'name="{name}"[^>]*\bchecked\b', html) is not None
+
+    # -- defaults ------------------------------------------------------------
+    def test_quotations_are_disabled_by_default(self):
+        self.assertIsNone(self.quotations())
+        payload = self.client.get(f"/tenants/{self.tenant_id}/rules/config").get_json()
+        self.assertFalse(payload["fields"]["quotations_enabled"])
+        html = self.page(f"/tenants/{self.tenant_id}/rules")
+        self.assertIn('name="present_quotations_enabled"', html)
+        self.assertFalse(self.checkbox_is_checked(html, "quotations_enabled"))
+
+    def test_the_form_and_the_read_api_agree_with_the_saved_value(self):
+        self.assertEqual(self.enable().status_code, 302)
+        self.assertTrue(
+            self.client.get(f"/tenants/{self.tenant_id}/rules/config")
+            .get_json()["fields"]["quotations_enabled"]
+        )
+        self.assertTrue(
+            self.checkbox_is_checked(
+                self.page(f"/tenants/{self.tenant_id}/rules"), "quotations_enabled"
+            )
+        )
+
+    # -- partial updates -----------------------------------------------------
+    def test_enabling_quotations_writes_only_the_opt_in(self):
+        before = self.stored(self.tenant_id)
+        self.assertEqual(self.enable().status_code, 302)
+        after = self.stored(self.tenant_id)
+        self.assertIs(self.quotations_enabled(), True)
+        for key in ("identity", "config", "knowledge_base"):
+            self.assertEqual(
+                after["configuration"][key], before["configuration"][key], key
+            )
+        for column in ("bot_persona", "business_hours", "business_rules", "timezone",
+                       "currency"):
+            self.assertEqual(after[column], before[column], column)
+
+    def test_disabling_is_an_explicit_false_not_an_omitted_key(self):
+        self.assertEqual(self.enable().status_code, 302)
+        # An unchecked box posts only its presence marker: that is "disabled", not "unset".
+        self.assertEqual(
+            self.section("quotations", present_quotations_enabled="1").status_code, 302
+        )
+        self.assertIs(self.quotations_enabled(), False)
+        self.assertEqual(
+            self.stored(self.tenant_id)["configuration"]["knowledge_base"]["documents"],
+            ["warranty.pdf", "returns.docx"],
+        )
+
+    def test_saving_another_section_leaves_the_opt_in_alone(self):
+        self.assertEqual(self.enable().status_code, 302)
+        self.assertEqual(self.section("persona", tone="Formal").status_code, 302)
+        self.assertIs(self.quotations_enabled(), True)
+
+    def test_a_quotations_save_leaves_the_stored_documents_alone(self):
+        before = self.stored(self.tenant_id)
+        self.assertEqual(self.enable().status_code, 302)
+        after = self.stored(self.tenant_id)
+        self.assertEqual(after["bot_persona"], before["bot_persona"])
+        self.assertEqual(after["business_hours"], before["business_hours"])
+        self.assertEqual(after["business_rules"], before["business_rules"])
+
+    def test_an_unknown_flag_value_is_refused_without_writing(self):
+        before = self.stored(self.tenant_id)
+        response = self.section(
+            "quotations", present_quotations_enabled="1", quotations_enabled="maybe"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("must be true or false", response.get_data(as_text=True))
+        self.assertEqual(self.stored(self.tenant_id), before)
+
+    # -- authorization -------------------------------------------------------
+    def test_a_signed_out_visitor_cannot_enable_quotations(self):
+        client = self.app.test_client()
+        client.get("/login")  # a CSRF token, no signed-in identity
+        before = self.stored(self.tenant_id)
+        response = client.post(
+            f"/tenants/{self.tenant_id}/rules/quotations",
+            data={"csrf_token": self.token(client), "present_quotations_enabled": "1",
+                  "quotations_enabled": "1"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.stored(self.tenant_id), before)
+
+    def test_a_signed_in_session_without_admin_rights_is_refused(self):
+        """``admin_required`` re-reads ``platform_admins``, so a session alone is not enough."""
+        client = self.app.test_client()
+        client.get("/login")
+        with client.session_transaction() as session:
+            session["user_id"] = str(uuid.uuid4())
+            session["email"] = "stranger@example.com"
+            session["exp"] = time.time() + 600
+        before = self.stored(self.tenant_id)
+        response = client.post(
+            f"/tenants/{self.tenant_id}/rules/quotations",
+            data={"csrf_token": self.token(client), "present_quotations_enabled": "1",
+                  "quotations_enabled": "1"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.stored(self.tenant_id), before)
+        self.assertIsNone(self.quotations())
+
+    def test_a_write_without_a_csrf_token_is_refused(self):
+        before = self.stored(self.tenant_id)
+        response = self.client.post(
+            f"/tenants/{self.tenant_id}/rules/quotations",
+            data={"present_quotations_enabled": "1", "quotations_enabled": "1"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.stored(self.tenant_id), before)
+
+    def test_enabling_one_tenant_never_enables_another(self):
+        other = self.create_client("Quotation Other Client")
+        before_other = self.stored(other)
+        self.assertEqual(self.enable().status_code, 302)
+        self.assertIs(self.quotations_enabled(), True)
+        self.assertEqual(self.stored(other), before_other)
+        self.assertIsNone(self.quotations(other))
+
+    def test_an_unknown_tenant_cannot_be_enabled(self):
+        response = self.post(
+            f"/tenants/{uuid.uuid4()}/rules/quotations",
+            {"present_quotations_enabled": "1", "quotations_enabled": "1"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # -- runtime effect ------------------------------------------------------
+    def test_the_customer_menu_follows_the_saved_opt_in(self):
+        loader = TenantBotContextLoader(app_backend_test_url())
+
+        def offered() -> bool:
+            context = menu.MenuContext(
+                settings=_settings(),
+                tenant_id=self.tenant_id,
+                wa_id=None,
+                document=loader.load(self.tenant_id).settings,
+            )
+            reply = menu.handle_text(context, "menu")
+            return "Request a Quotation" in [row["title"] for row in reply.sections[0]["rows"]]
+
+        self.assertFalse(offered())
+        self.assertEqual(self.enable().status_code, 302)
+        self.assertTrue(offered())
 
 
 class SecretHandlingTests(ConfigurationManagerTestCase):

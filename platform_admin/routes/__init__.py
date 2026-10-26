@@ -40,6 +40,7 @@ from ..services import tenants as tenant_service
 from ..services import whatsapp as whatsapp_service
 from ..services.validation import ServiceError
 from saas.bot import BotResponseEngine, ConversationTurn, TenantBotContextLoader
+from saas import quotations as saas_quotations
 
 auth_bp = Blueprint("auth", __name__)
 admin_bp = Blueprint("admin", __name__)
@@ -302,6 +303,171 @@ def _finalize_menu_event(
     )
 
 
+QUOTATION_FAILED_TEXT = (
+    "I'm sorry — I couldn't create the quotation just now. Nothing was charged and no "
+    "order was placed. Please try again, or reply STAFF and our team will help."
+)
+QUOTATION_PDF_FAILED_TEXT = (
+    "I couldn't send the quotation PDF just now. Please try again shortly, or reply "
+    "STAFF and our team will send it to you."
+)
+
+
+def _deliver_quotation_pdf(
+    settings,
+    *,
+    tenant_id: str,
+    channel: dict,
+    channel_id: str | None,
+    conversation: dict | None,
+    customer_key: str,
+    quotation: dict,
+    inbound_message_id: str,
+    caption: str | None = None,
+) -> dict:
+    """Send a persisted quotation as a WhatsApp document.
+
+    The delivery row is claimed **before** anything is uploaded or sent. A replay
+    therefore finds the existing row: a ``sent`` or ``uncertain`` attempt is never
+    repeated, and only a definite ``failed`` attempt is retried.
+    """
+    quotation_id = str(quotation.get("id"))
+    try:
+        claim = saas_quotations.begin_delivery(
+            settings,
+            tenant_id,
+            quotation_id=quotation_id,
+            conversation_id=str(conversation["id"]) if conversation else None,
+            channel_id=channel_id,
+            customer_wa_id=customer_key,
+            idempotency_key=saas_quotations.delivery_key(
+                quotation_id, inbound_message_id
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - never fail the webhook on bookkeeping
+        logger.error(
+            "Quotation delivery claim failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+        return {"outcome": "unavailable"}
+    if not claim.get("should_send"):
+        return {"outcome": "already", "status": claim.get("status")}
+
+    delivery_id = str(claim["row"]["id"])
+    filename = f"{quotation.get('quotation_number') or 'quotation'}.pdf"
+    try:
+        # Built from the persisted quotation and its saved line snapshots only.
+        pdf = quotation_service.quotation_pdf(quotation)
+    except Exception as error:  # noqa: BLE001
+        logger.error(
+            "Quotation PDF rendering failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="failed",
+            error_code="pdf_render_failed",
+            error_message=f"PDF rendering failed ({type(error).__name__})",
+        )
+        return {"outcome": "failed", "error": "pdf_render_failed"}
+
+    media_id = None
+    try:
+        media_id = whatsapp_service.upload_media(
+            settings,
+            phone_number_id=channel["phone_number_id"],
+            tenant_id=tenant_id,
+            credentials_ref=channel.get("credentials_ref"),
+            filename=filename,
+            mime_type="application/pdf",
+            content=pdf,
+        )
+        wamid = whatsapp_service.send_document(
+            settings,
+            phone_number_id=channel["phone_number_id"],
+            tenant_id=tenant_id,
+            credentials_ref=channel.get("credentials_ref"),
+            recipient=customer_key,
+            media_id=media_id,
+            filename=filename,
+            caption=caption,
+        )
+    except whatsapp_service.WhatsAppSendError as error:
+        status = "uncertain" if error.ambiguous else "failed"
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status=status,
+            media_id=media_id,
+            error_code=error.provider_code
+            or ("ambiguous_send" if error.ambiguous else "document_rejected"),
+            error_message=(error.provider_message or type(error).__name__)[:500],
+        )
+        logger.warning(
+            "Quotation document send %s tenant=%s code=%s",
+            status,
+            tenant_id,
+            error.provider_code or error.http_status,
+        )
+        return {"outcome": status}
+    except Exception as error:  # noqa: BLE001 - the outcome is unknown; never resend
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="uncertain",
+            media_id=media_id,
+            error_code="document_send_exception",
+            error_message=type(error).__name__,
+        )
+        logger.exception("Quotation document send failed tenant=%s", tenant_id)
+        return {"outcome": "uncertain"}
+
+    try:
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="sent",
+            media_id=media_id,
+            provider_message_id=wamid,
+        )
+    except Exception as error:  # noqa: BLE001 - the document already reached Meta
+        logger.error(
+            "Quotation delivery persistence failed tenant=%s wamid=%s error=%s",
+            tenant_id,
+            wamid,
+            type(error).__name__,
+        )
+    if conversation:
+        try:
+            customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                str(conversation["id"]),
+                direction="outbound",
+                sender_type="assistant",
+                provider_message_id=wamid,
+                message_type="document",
+                body_text=filename,
+                payload={"document": {"filename": filename, "media_id": media_id}},
+                delivery_status="sent",
+            )
+        except Exception as error:  # noqa: BLE001 - the document already reached Meta
+            logger.error(
+                "Quotation document history failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+    return {"outcome": "sent", "wamid": wamid, "media_id": media_id}
+
+
 @whatsapp_bp.get("/webhooks/whatsapp")
 def whatsapp_verify():
     settings = context().settings
@@ -553,6 +719,69 @@ def whatsapp_webhook():
                 _finalize_menu_event(settings, tenant_id, event["message_id"], result)
                 return jsonify(ok=True, menu=True, delivery=result.outcome)
 
+    # An explicit request for the PDF of an existing quotation. This is handled
+    # deterministically (and only when the tenant has opted in and sending works), so
+    # the document is built from the persisted quotation rather than model output.
+    if saas_quotations.is_pdf_request(event["text"]):
+        try:
+            document = menu_service.load_document(settings, tenant_id)
+            quotations_enabled = saas_quotations.quotations_enabled(
+                (document or {}).get("configuration")
+            )
+        except Exception as error:  # noqa: BLE001 - fall through to the AI path
+            logger.error(
+                "Quotation settings read failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            quotations_enabled = False
+        if quotations_enabled and settings.whatsapp_send_enabled:
+            try:
+                quotation = saas_quotations.latest_quotation_for_customer(
+                    settings, tenant_id, customer_key
+                )
+            except Exception as error:  # noqa: BLE001 - never fail on a lookup
+                logger.error(
+                    "Quotation lookup failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+                quotation = None
+            if quotation is not None:
+                delivery = _deliver_quotation_pdf(
+                    settings,
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    channel_id=channel_id,
+                    conversation=conversation,
+                    customer_key=customer_key,
+                    quotation=quotation,
+                    inbound_message_id=event["message_id"],
+                )
+                if delivery["outcome"] in {"sent", "already"}:
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "processed",
+                        response_message_id=delivery.get("wamid"),
+                    )
+                else:
+                    whatsapp_service.update_event(
+                        settings,
+                        tenant_id,
+                        event["message_id"],
+                        "failed",
+                        "quotation_document_uncertain"
+                        if delivery["outcome"] == "uncertain"
+                        else "quotation_document_failed",
+                    )
+                return jsonify(
+                    ok=True,
+                    quotation_pdf=True,
+                    delivery=delivery["outcome"],
+                )
+
     try:
         history = whatsapp_service.conversation_history(
             settings, tenant_id, customer_key
@@ -565,6 +794,19 @@ def whatsapp_webhook():
         provider = context().bot_provider
         if provider is None:
             raise ServiceError("The AI provider is not configured.", 503)
+        brief = None
+        if conversation:
+            try:
+                brief = saas_quotations.load_brief(
+                    settings, tenant_id, str(conversation["id"])
+                )
+            except Exception as error:  # noqa: BLE001 - quotations may be unbuilt here
+                logger.info(
+                    "Quotation brief unavailable tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+                brief = None
         response = BotResponseEngine(
             TenantBotContextLoader(settings.app_database_url), provider
         ).respond(
@@ -575,6 +817,10 @@ def whatsapp_webhook():
             safe_test_mode=False,
             customer_key=customer_key,
             message_id=event["message_id"],
+            conversation_id=str(conversation["id"]) if conversation else None,
+            customer_name=(customer or {}).get("name"),
+            send_enabled=settings.whatsapp_send_enabled,
+            brief=brief,
         )
         # A turn that needs a human handover is answered with wording the platform owns,
         # chosen from whether the staff notification actually succeeded. Handover trouble
@@ -598,7 +844,22 @@ def whatsapp_webhook():
                 "Handover handling failed tenant=%s error=%s", tenant_id, type(error).__name__
             )
             handover_reply = handover_service.safe_reply(response)
-        reply_text = handover_reply or response.text
+        # Only a real payload or an explicit True flag may replace the model's own text;
+        # anything else (an unexpected object on a mocked response) falls through.
+        if handover_reply:
+            reply_text = handover_reply
+        elif isinstance(response.quotation, dict):
+            # Platform-owned wording built from the persisted row, never the model's.
+            try:
+                reply_text = saas_quotations.format_customer_summary(response.quotation)
+            except Exception:  # noqa: BLE001
+                reply_text = saas_quotations.fallback_customer_summary(
+                    response.quotation
+                )
+        elif response.quotation_failed is True:
+            reply_text = QUOTATION_FAILED_TEXT
+        else:
+            reply_text = response.text
 
         # Record the intent to reply BEFORE sending. The partial unique index on
         # (tenant_id, channel_id, reply_to_provider_message_id) is what makes a second
@@ -729,6 +990,26 @@ def whatsapp_webhook():
             except Exception as error:  # noqa: BLE001 - non-fatal
                 logger.error(
                     "Outbound message persistence failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
+        # The customer asked for a quotation PDF during the AI turn (tool-driven path).
+        # It is sent after the text reply, and the delivery ledger prevents a replay.
+        if isinstance(response.quotation_pdf, dict):
+            try:
+                _deliver_quotation_pdf(
+                    settings,
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    channel_id=channel_id,
+                    conversation=conversation,
+                    customer_key=customer_key,
+                    quotation=response.quotation_pdf,
+                    inbound_message_id=event["message_id"],
+                )
+            except Exception as error:  # noqa: BLE001 - the text reply already went out
+                logger.error(
+                    "Quotation document delivery failed tenant=%s error=%s",
                     tenant_id,
                     type(error).__name__,
                 )

@@ -528,8 +528,11 @@ class DefaultRegistryTests(unittest.TestCase):
             "get_order_draft",
             "get_order_status",
             "get_payment_status",
+            "request_quotation_pdf",
+            "request_quote",
             "request_staff_handover",
             "update_order_draft",
+            "update_quotation_brief",
         ]
         for name in expected:
             self.assertIn(name, names)
