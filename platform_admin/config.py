@@ -257,7 +257,8 @@ def verify_database_roles(settings: Settings) -> None:
 
 # Schema the application database must already provide. Each entry is a table and the
 # columns this code selects from it; a table with no columns listed is required to exist.
-# Keep in step with the migrations that introduce them (0017, 0026, 0028, 0032, 0033, 0034).
+# Keep in step with the migrations that introduce them
+# (0017, 0026, 0028, 0032, 0033, 0034, 0037).
 # Note: this contract can only name tables and columns. Objects a migration creates beside
 # them -- indexes, triggers, policies -- are covered by the structural tests instead.
 REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -265,6 +266,8 @@ REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.product_variants", ("sku", "availability", "stock_quantity", "reorder_level")),
     ("public.quotations", ()),
     ("public.quotation_lines", ()),
+    ("public.quotation_briefs", ()),
+    ("public.quotation_deliveries", ()),
     ("public.catalogue_import_batches", ()),
     ("public.whatsapp_webhook_events", ()),
     ("public.whatsapp_conversations", ()),

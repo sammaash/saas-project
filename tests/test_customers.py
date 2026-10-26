@@ -135,6 +135,14 @@ class RequiredSchemaContractTests(unittest.TestCase):
         """0034 creates the table in one atomic script, so no partial columns are possible."""
         self.assertEqual(dict(REQUIRED_SCHEMA)["public.handover_requests"], ())
 
+    def test_the_quotation_tables_from_migration_0037_are_required(self):
+        """0037 adds the tables the customer quotation workflow writes to."""
+        required = dict(REQUIRED_SCHEMA)
+        for table in ("public.quotation_briefs", "public.quotation_deliveries"):
+            with self.subTest(table=table):
+                self.assertIn(table, required)
+                self.assertEqual(required[table], ())
+
 
 class WebhookCustomerPersistenceTests(unittest.TestCase):
     """The webhook resolves/creates customer + conversation and persists messages."""

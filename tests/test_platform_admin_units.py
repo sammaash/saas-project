@@ -395,6 +395,30 @@ class RequiredSchemaTests(unittest.TestCase):
         self.assertIn("public.handover_requests (table)", str(raised.exception))
         self.assertTrue(connection.closed)
 
+    def test_the_contract_covers_the_quotation_tables_from_migration_0037(self):
+        required = dict(REQUIRED_SCHEMA)
+        self.assertIn("public.quotation_briefs", required)
+        self.assertIn("public.quotation_deliveries", required)
+
+    def test_the_quotation_tables_are_required_by_existence_only(self):
+        """0037 creates each table in one atomic script, so no partial columns exist."""
+        required = dict(REQUIRED_SCHEMA)
+        self.assertEqual(required["public.quotation_briefs"], ())
+        self.assertEqual(required["public.quotation_deliveries"], ())
+
+    def test_startup_fails_closed_when_a_quotation_table_is_missing(self):
+        for table in ("public.quotation_briefs", "public.quotation_deliveries"):
+            with self.subTest(table=table):
+                tables = _complete_schema()
+                del tables[table]
+                connection = _StubConnection(tables)
+                settings = Settings.from_env(dict(GOOD_ENV))
+                with patch("saas.db.connect", return_value=connection):
+                    with self.assertRaises(ConfigError) as raised:
+                        verify_database_schema(settings)
+                self.assertIn(f"{table} (table)", str(raised.exception))
+                self.assertTrue(connection.closed)
+
     def test_startup_succeeds_when_the_handover_table_exists(self):
         settings = Settings.from_env(dict(GOOD_ENV))
         with patch("saas.db.connect", return_value=_StubConnection(_complete_schema())):
