@@ -109,6 +109,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "catalogue_import_batches": 0,
             "quotations": 0,
             "quotation_lines": 0,
+            "quotation_briefs": 0,
+            "quotation_deliveries": 0,
         }
         with self.user(TENANT_ONE_OWNER_USER_ID) as cursor:
             cursor.execute("select name, slug from public.tenants")
@@ -136,6 +138,8 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             "catalogue_import_batches": 0,
             "quotations": 0,
             "quotation_lines": 0,
+            "quotation_briefs": 0,
+            "quotation_deliveries": 0,
         }
         with self.user(TENANT_TWO_OWNER_USER_ID) as cursor:
             cursor.execute("select name from public.tenants")

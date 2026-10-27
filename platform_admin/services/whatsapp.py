@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 import urllib.error
 import urllib.request
 from typing import Any
@@ -472,32 +473,11 @@ def build_list_payload(
     return payload
 
 
-def _post_message(
-    settings: Settings,
-    *,
-    phone_number_id: str,
-    tenant_id: str,
-    credentials_ref: str | None,
-    payload: dict[str, Any],
-) -> str:
-    """POST one message payload to Meta and return the wamid.
-
-    All outbound shapes (text, reply buttons, list) share this path so the gate, the
-    credential lookup and the provider-error translation cannot drift apart.
-    """
-    if not settings.whatsapp_send_enabled:
-        raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
-    token = access_token(settings, tenant_id, credentials_ref)
-    outbound = urllib.request.Request(
-        f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
-        f"{phone_number_id}/messages",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+def _open_json(request: urllib.request.Request) -> dict[str, Any]:
+    """Perform one provider request, translating failures into WhatsAppSendError."""
     try:
-        with urllib.request.urlopen(outbound, timeout=10) as response:  # noqa: S310
-            response_body = json.loads(response.read().decode())
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return json.loads(response.read().decode())
     except urllib.error.HTTPError as error:
         code, provider_message = _http_error_details(error)
         raise WhatsAppSendError(
@@ -529,6 +509,32 @@ def _post_message(
         raise WhatsAppSendError(
             "WhatsApp message delivery failed.", 502, ambiguous=True
         ) from error
+
+
+def _post_message(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    payload: dict[str, Any],
+) -> str:
+    """POST one message payload to Meta and return the wamid.
+
+    All outbound shapes (text, reply buttons, list, document) share this path so the
+    gate, the credential lookup and the provider-error translation cannot drift apart.
+    """
+    if not settings.whatsapp_send_enabled:
+        raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
+    token = access_token(settings, tenant_id, credentials_ref)
+    outbound = urllib.request.Request(
+        f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
+        f"{phone_number_id}/messages",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    response_body = _open_json(outbound)
     messages = response_body.get("messages") if isinstance(response_body, dict) else None
     message_id = messages[0].get("id") if isinstance(messages, list) and messages else None
     if not isinstance(message_id, str):
@@ -536,6 +542,7 @@ def _post_message(
             "WhatsApp returned an invalid message response.", 502, ambiguous=True
         )
     return message_id
+
 
 
 def send_text(
@@ -632,4 +639,122 @@ def send_list(
             header=header,
             footer=footer,
         ),
+    )
+
+
+def safe_document_filename(value: Any, *, default: str = "quotation.pdf") -> str:
+    """A provider-safe filename: no paths, no control characters, bounded length."""
+    name = os.path.basename(str(value or "").replace("\\", "/"))
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name[:100] or default
+
+
+def _multipart(
+    fields: dict[str, str],
+    *,
+    file_field: str,
+    filename: str,
+    mime_type: str,
+    content: bytes,
+) -> tuple[bytes, str]:
+    boundary = f"----saaswhatsapp{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode()
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode()
+        + content
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_media(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    filename: str,
+    mime_type: str,
+    content: bytes,
+) -> str:
+    """Upload one document to Meta and return its media id.
+
+    The upload is idempotent from our side (a fresh media object each time) but the
+    *send* that follows is not, so callers must claim a delivery row before calling
+    this and never retry an ambiguous outcome.
+    """
+    if not settings.whatsapp_send_enabled:
+        raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
+    if not content:
+        raise ServiceError("The document is empty.", 400)
+    token = access_token(settings, tenant_id, credentials_ref)
+    body, content_type = _multipart(
+        {"messaging_product": "whatsapp", "type": mime_type},
+        file_field="file",
+        filename=safe_document_filename(filename),
+        mime_type=mime_type,
+        content=content,
+    )
+    request = urllib.request.Request(
+        f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
+        f"{phone_number_id}/media",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
+        method="POST",
+    )
+    response_body = _open_json(request)
+    media_id = response_body.get("id") if isinstance(response_body, dict) else None
+    if not isinstance(media_id, str) or not media_id:
+        raise WhatsAppSendError(
+            "WhatsApp returned an invalid media response.", 502, ambiguous=True
+        )
+    return media_id
+
+
+def send_document(
+    settings: Settings,
+    *,
+    phone_number_id: str,
+    tenant_id: str,
+    credentials_ref: str | None,
+    recipient: str,
+    media_id: str,
+    filename: str,
+    caption: str | None = None,
+) -> str:
+    """Send an uploaded document and return its wamid."""
+    if not isinstance(media_id, str) or not media_id.strip():
+        raise ServiceError("A document media id is required.", 400)
+    document: dict[str, Any] = {
+        "id": media_id.strip(),
+        "filename": safe_document_filename(filename),
+    }
+    if caption:
+        document["caption"] = str(caption)[:1024]
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "document",
+        "document": document,
+    }
+    return _post_message(
+        settings,
+        phone_number_id=phone_number_id,
+        tenant_id=tenant_id,
+        credentials_ref=credentials_ref,
+        payload=payload,
     )

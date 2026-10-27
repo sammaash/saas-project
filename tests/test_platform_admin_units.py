@@ -429,6 +429,30 @@ class RequiredSchemaTests(unittest.TestCase):
         self.assertIn("public.handover_requests (table)", str(raised.exception))
         self.assertTrue(connection.closed)
 
+    def test_the_contract_covers_the_quotation_tables_from_migration_0037(self):
+        required = dict(REQUIRED_SCHEMA)
+        self.assertIn("public.quotation_briefs", required)
+        self.assertIn("public.quotation_deliveries", required)
+
+    def test_the_quotation_tables_are_required_by_existence_only(self):
+        """0037 creates each table in one atomic script, so no partial columns exist."""
+        required = dict(REQUIRED_SCHEMA)
+        self.assertEqual(required["public.quotation_briefs"], ())
+        self.assertEqual(required["public.quotation_deliveries"], ())
+
+    def test_startup_fails_closed_when_a_quotation_table_is_missing(self):
+        for table in ("public.quotation_briefs", "public.quotation_deliveries"):
+            with self.subTest(table=table):
+                tables = _complete_schema()
+                del tables[table]
+                connection = _StubConnection(tables)
+                settings = Settings.from_env(dict(GOOD_ENV))
+                with patch("saas.db.connect", return_value=connection):
+                    with self.assertRaises(ConfigError) as raised:
+                        verify_database_schema(settings)
+                self.assertIn(f"{table} (table)", str(raised.exception))
+                self.assertTrue(connection.closed)
+
     def test_startup_succeeds_when_the_handover_table_exists(self):
         settings = Settings.from_env(dict(GOOD_ENV))
         with patch("saas.db.connect", return_value=_StubConnection(_complete_schema())):
@@ -477,6 +501,7 @@ class StagingEnvironmentGuardTests(unittest.TestCase):
 
     PRODUCTION_REF = "prodref0000000000000"
     STAGING_REF = "stagref0000000000000"
+    STAGING_DB_HOST = "aws-0-eu-central-1.pooler.supabase.com"
 
     @staticmethod
     def _pooled(role: str, ref: str) -> str:
@@ -495,6 +520,7 @@ class StagingEnvironmentGuardTests(unittest.TestCase):
             ),
             "SAAS_ENVIRONMENT": "staging",
             "SAAS_PRODUCTION_PROJECT_REF": self.PRODUCTION_REF,
+            "SAAS_STAGING_DB_HOST": self.STAGING_DB_HOST,
             "WHATSAPP_SEND_ENABLED": "0",
         }
         env.update(changes)
@@ -561,7 +587,10 @@ class StagingEnvironmentGuardTests(unittest.TestCase):
                     SAAS_DATABASE_URL=(
                         "postgresql://app_backend:pw@db."
                         f"{self.PRODUCTION_REF}.supabase.co:5432/postgres"
-                    )
+                    ),
+                    # Declare the host so this exercises the project-reference check, not
+                    # the host check.
+                    SAAS_STAGING_DB_HOST=f"db.{self.PRODUCTION_REF}.supabase.co",
                 )
             )
 
@@ -576,6 +605,185 @@ class StagingEnvironmentGuardTests(unittest.TestCase):
         with self.assertRaises(ConfigError) as raised:
             Settings.from_env(self.staging_env(SAAS_PRODUCTION_PROJECT_REF=None))
         self.assertIn("SAAS_PRODUCTION_PROJECT_REF", str(raised.exception))
+
+    # -- staging declares the expected database host ---------------------------
+    def test_staging_requires_the_expected_database_host(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(self.staging_env(SAAS_STAGING_DB_HOST=None))
+        self.assertIn("SAAS_STAGING_DB_HOST", str(raised.exception))
+
+    def test_staging_refuses_an_application_dsn_on_another_host(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=(
+                        "postgresql://app_backend:pw@other-db.railway.internal:5432/railway"
+                    )
+                )
+            )
+        self.assertIn("SAAS_DATABASE_URL", str(raised.exception))
+        self.assertIn("SAAS_STAGING_DB_HOST", str(raised.exception))
+
+    def test_staging_refuses_a_platform_dsn_on_another_host(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_PLATFORM_DATABASE_URL=(
+                        "postgresql://saas_platform_admin:pw@other-db.railway.internal:5432/railway"
+                    )
+                )
+            )
+        self.assertIn("SAAS_PLATFORM_DATABASE_URL", str(raised.exception))
+        self.assertIn("SAAS_STAGING_DB_HOST", str(raised.exception))
+
+    def test_staging_refuses_two_different_database_hosts(self):
+        """Both DSNs must equal the declared host, so two different hosts cannot pass."""
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=(
+                        "postgresql://app_backend:pw@first-db.railway.internal:5432/railway"
+                    ),
+                    SAAS_PLATFORM_DATABASE_URL=(
+                        "postgresql://saas_platform_admin:pw@second-db.railway.internal:5432/railway"
+                    ),
+                    SAAS_STAGING_DB_HOST="expected-db.railway.internal",
+                )
+            )
+        message = str(raised.exception)
+        self.assertIn("SAAS_DATABASE_URL", message)
+        self.assertIn("SAAS_STAGING_DB_HOST", message)
+
+    def test_staging_refuses_a_dsn_without_a_hostname(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(SAAS_DATABASE_URL="postgresql://app_backend:pw@/railway")
+            )
+        self.assertIn("hostname", str(raised.exception))
+
+    # -- staging refuses connection-target overrides inside the DSN ------------
+    # libpq honours connection parameters in the URI query string, so ?host=/?hostaddr= would
+    # redirect the connection while urlsplit(url).hostname still reports the declared host.
+    @staticmethod
+    def _pooled_with_query(query: str) -> str:
+        return (
+            "postgresql://app_backend:pw@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
+            f"?{query}"
+        )
+
+    def test_staging_refuses_a_host_override(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(SAAS_DATABASE_URL=self._pooled_with_query("host=other.internal"))
+            )
+        message = str(raised.exception)
+        self.assertIn("SAAS_DATABASE_URL", message)
+        self.assertIn("query parameters", message)
+
+    def test_staging_refuses_a_hostaddr_override(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=self._pooled_with_query("hostaddr=10.9.9.9")
+                )
+            )
+        self.assertIn("SAAS_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_both_overrides_together(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_PLATFORM_DATABASE_URL=self._pooled_with_query(
+                        "host=other.internal&hostaddr=10.9.9.9"
+                    )
+                )
+            )
+        self.assertIn("SAAS_PLATFORM_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_a_login_override(self):
+        """``?user=`` would otherwise let a privileged login past FORBIDDEN_DB_USERS."""
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(SAAS_DATABASE_URL=self._pooled_with_query("user=postgres"))
+            )
+        self.assertIn("SAAS_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_encoded_or_case_variant_parameter_names(self):
+        for query in ("HOST=other.internal", "%68ost=other.internal", "HostAddr=10.9.9.9"):
+            with self.subTest(query=query), self.assertRaises(ConfigError) as raised:
+                Settings.from_env(
+                    self.staging_env(SAAS_DATABASE_URL=self._pooled_with_query(query))
+                )
+            self.assertIn("SAAS_DATABASE_URL", str(raised.exception))
+
+    def test_staging_refuses_a_fragment(self):
+        with self.assertRaises(ConfigError) as raised:
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_DATABASE_URL=(
+                        "postgresql://app_backend:pw@aws-0-eu-central-1.pooler.supabase.com:5432"
+                        "/postgres#fragment"
+                    )
+                )
+            )
+        self.assertIn("fragment", str(raised.exception))
+
+    def test_staging_refuses_a_malformed_dsn(self):
+        """An unparseable DSN fails closed rather than falling through the checks."""
+        for dsn in ("postgresql://app_backend:pw@[::1/railway", "not-a-dsn", "://"):
+            with self.subTest(dsn=dsn), self.assertRaises(ConfigError):
+                Settings.from_env(self.staging_env(SAAS_DATABASE_URL=dsn))
+
+    def test_staging_accepts_a_plain_dsn_with_no_parameters(self):
+        settings = Settings.from_env(self.staging_env())
+        self.assertEqual(settings.environment, "staging")
+
+    def test_a_production_boot_is_unaffected_by_the_override_rule(self):
+        """The rule is staging-only: production keeps its existing behaviour."""
+        settings = Settings.from_env(
+            self.staging_env(
+                SAAS_ENVIRONMENT=None,
+                SAAS_PRODUCTION_PROJECT_REF=None,
+                SAAS_STAGING_DB_HOST=None,
+                SAAS_DATABASE_URL=self._pooled_with_query("sslmode=require"),
+            )
+        )
+        self.assertEqual(settings.environment, "production")
+
+    def test_staging_accepts_the_declared_host_case_insensitively(self):
+        settings = Settings.from_env(
+            self.staging_env(SAAS_STAGING_DB_HOST=self.STAGING_DB_HOST.upper())
+        )
+        self.assertEqual(settings.environment, "staging")
+
+    def test_staging_accepts_a_non_supabase_host(self):
+        """The Railway database has no project reference; the declared host is what proves it."""
+        settings = Settings.from_env(
+            self.staging_env(
+                SAAS_DATABASE_URL=(
+                    "postgresql://app_backend:pw@postgres.railway.internal:5432/railway"
+                ),
+                SAAS_PLATFORM_DATABASE_URL=(
+                    "postgresql://saas_platform_admin:pw@postgres.railway.internal:5432/railway"
+                ),
+                SAAS_STAGING_DB_HOST="postgres.railway.internal",
+            )
+        )
+        self.assertEqual(settings.environment, "staging")
+
+    def test_a_production_boot_does_not_require_the_expected_host(self):
+        settings = Settings.from_env(
+            self.staging_env(
+                SAAS_ENVIRONMENT=None,
+                SAAS_PRODUCTION_PROJECT_REF=None,
+                SAAS_STAGING_DB_HOST=None,
+                SAAS_DATABASE_URL="postgresql://app_backend:pw@first.example.com:5432/db",
+                SAAS_PLATFORM_DATABASE_URL=(
+                    "postgresql://saas_platform_admin:pw@second.example.com:5432/db"
+                ),
+            )
+        )
+        self.assertEqual(settings.environment, "production")
 
     # -- staging requires explicit WhatsApp and no owner credentials ----------
     def test_staging_requires_an_explicit_sending_setting(self):

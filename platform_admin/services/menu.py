@@ -16,6 +16,11 @@ re-validated against the current tenant's data before use.
 The menu is disabled unless ``tenant_settings.configuration.menu.enabled`` is ``true``.
 ``configuration`` is the documented catch-all JSONB for new settings (0006), so enabling it
 needs no schema change.
+
+``Request a Quotation`` is advertised only when the tenant has *also* set
+``configuration.quotations.enabled`` to ``true`` (section H of the rules tab). A tenant
+without that opt-in gets the six other options, because the quotation handler would only
+have to refuse the request.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from saas import quotations as quotation_service
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
@@ -51,6 +57,7 @@ STEPS = frozenset(
         "prod",
         "order",
         "my_order",
+        "quote",
         "delivery",
         "faqs",
         "faq",
@@ -81,6 +88,13 @@ OPTION_ALIASES: dict[str, str] = {
     "my order": "my_order",
     "my orders": "my_order",
     "check my order": "my_order",
+    "request a quotation": "quote",
+    "request quotation": "quote",
+    "request a quote": "quote",
+    "get a quotation": "quote",
+    "get a quote": "quote",
+    "quotation": "quote",
+    "quote": "quote",
     "delivery": "delivery",
     "collection": "delivery",
     "delivery & collection": "delivery",
@@ -253,6 +267,15 @@ def is_enabled(document: dict[str, Any] | None) -> bool:
         return False
     menu = configuration.get("menu")
     return isinstance(menu, dict) and menu.get("enabled") is True
+
+
+def quotations_offered(ctx: MenuContext) -> bool:
+    """True when this tenant has enabled customer quotations.
+
+    Read from the same settings document the menu gate uses, so the option is only
+    advertised when the handler behind it could actually issue a quotation.
+    """
+    return quotation_service.quotations_enabled((ctx.document or {}).get("configuration"))
 
 
 def with_menu_enabled(
@@ -574,10 +597,27 @@ def _list(
     )
 
 
+#: The quotation row, offered only to tenants that have enabled customer quotations. It is
+#: deliberately not part of ``configuration.menu``: "quote" is not a configurable action, so
+#: the menu builder can never store, disable or reorder it.
+QUOTATION_MENU_OPTION = ("quote", "Request a Quotation", "Get a written price")
+
+
 def main_menu(
-    document: dict[str, Any] | None = None, *, now: float | None = None
+    document: dict[str, Any] | None = None,
+    *,
+    now: float | None = None,
+    quotations_enabled: bool = False,
 ) -> MenuReply:
-    """Build the configured main menu, or the historical default when none is saved."""
+    """Build the configured main menu, or the historical default when none is saved.
+
+    ``quotations_enabled`` is the tenant's saved ``configuration.quotations.enabled``
+    opt-in. A tenant that has not enabled quotations is never shown the quotation row:
+    offering an option whose handler could only refuse it wastes a customer's tap. When
+    it is shown, the row goes after the configured "My Order" option (or at the end when
+    that option is absent), so enabling it never renumbers the options a customer
+    already knows.
+    """
     config = menu_config(document)
     if not config.valid:
         return _text(
@@ -588,21 +628,38 @@ def main_menu(
         return _text(
             f"{config.welcome_message}\n\nNo menu options are currently available."
         )
-    rows = [
-        {
-            "id": make_option_action(option.id, now=now),
-            "title": option.label,
-            "description": OPTION_DESCRIPTIONS.get(option.action, "Choose this option"),
-        }
+    entries: list[tuple[str, str, str]] = [
+        (
+            make_option_action(option.id, now=now),
+            option.label,
+            OPTION_DESCRIPTIONS.get(option.action, "Choose this option"),
+        )
         for option in options
     ]
+    if quotations_enabled:
+        step, label, description = QUOTATION_MENU_OPTION
+        entries.insert(
+            next(
+                (
+                    index + 1
+                    for index, option in enumerate(options)
+                    if option.action == "my_order"
+                ),
+                len(entries),
+            ),
+            (make_action(step, None, now=now), label, description),
+        )
+    rows = [
+        {"id": action_id, "title": title, "description": description}
+        for action_id, title, description in entries
+    ]
     lines = [config.welcome_message]
-    for position, option in enumerate(options, start=1):
-        lines.append(f"{position}. {option.label}")
+    for position, (_, title, _) in enumerate(entries, start=1):
+        lines.append(f"{position}. {title}")
     lines.extend(
         [
             "",
-            f"Reply with an option name (for example: {options[0].label}), or reply "
+            f"Reply with an option name (for example: {entries[0][1]}), or reply "
             "MENU for this list.",
         ]
     )
@@ -648,7 +705,9 @@ def handle_text(
     lowered = value.casefold()
     config = menu_config(ctx.document)
     if lowered == "menu":
-        return main_menu(ctx.document, now=now)
+        return main_menu(
+            ctx.document, now=now, quotations_enabled=quotations_offered(ctx)
+        )
     if not config.valid:
         return _text("The saved menu configuration is invalid. Please ask us for help.")
     configured = _configured_option(config, value)
@@ -662,6 +721,11 @@ def handle_text(
     step = OPTION_ALIASES.get(lowered)
     if step is None:
         return None
+    if step == "quote":
+        # The quotation row is not part of the saved configuration, so the configured-action
+        # check below can never see it. The tenant opt-in is the gate, and _request_quote
+        # re-reads it (and the sending switch) before doing anything.
+        return _render_step(ctx, Selection("quote", None), now=now)
     if not action_enabled(config, step):
         return _text("That menu option is disabled in the current menu configuration.")
     return _render_step(ctx, Selection(step, None), now=now)
@@ -729,7 +793,9 @@ def _render_option(
 def _render_step(ctx: MenuContext, selection: Selection, *, now: float | None) -> MenuReply | None:
     step = selection.step
     if step == "main":
-        return main_menu(ctx.document, now=now)
+        return main_menu(
+            ctx.document, now=now, quotations_enabled=quotations_offered(ctx)
+        )
     if step == "option":
         return _render_option(ctx, selection.arg, now=now)
     if step == "browse":
@@ -742,6 +808,8 @@ def _render_step(ctx: MenuContext, selection: Selection, *, now: float | None) -
         return _place_order(now=now)
     if step == "my_order":
         return _my_order(now=now)
+    if step == "quote":
+        return _request_quote(ctx)
     if step == "delivery":
         return _delivery(ctx)
     if step == "faqs":
@@ -1125,6 +1193,65 @@ def _my_order(*, now: float | None = None) -> MenuReply:
             {"id": make_action("main", now=now), "title": "Main menu"},
         ],
         header="My Order",
+    )
+
+
+def _request_quote(ctx: MenuContext) -> MenuReply:
+    """Start a customer quotation request, or explain why it is unavailable.
+
+    The gate is re-read from the tenant's configured settings, and a request is
+    only opened when outbound sending works: a quotation that cannot be delivered
+    is not a quotation the customer can use.
+    """
+    configuration = (ctx.document or {}).get("configuration")
+    if not quotation_service.quotations_enabled(configuration):
+        return _buttons(
+            "Automatic quotations aren't available for this business yet. Our team "
+            "can prepare a written quotation for you instead.",
+            [
+                {"id": make_action("staff"), "title": "Talk to staff"},
+                {"id": make_action("main"), "title": "Main menu"},
+            ],
+            header="Request a Quotation",
+        )
+    if not getattr(ctx.settings, "whatsapp_send_enabled", False):
+        return _buttons(
+            "Quotations can't be issued right now. Our team can help you instead.",
+            [
+                {"id": make_action("staff"), "title": "Talk to staff"},
+                {"id": make_action("main"), "title": "Main menu"},
+            ],
+            header="Request a Quotation",
+        )
+    if not ctx.conversation or not ctx.wa_id:
+        return _text(
+            "I can't start a quotation for this chat right now. Please reply STAFF and "
+            "our team will help."
+        )
+    try:
+        quotation_service.start_brief(
+            ctx.settings, ctx.tenant_id, str(ctx.conversation["id"]), ctx.wa_id
+        )
+    except Exception:  # noqa: BLE001 - a storage failure must not look like success
+        logger.exception("Quotation brief start failed for tenant %s", ctx.tenant_id)
+        return _text(
+            "I couldn't start a quotation just now. Please reply STAFF and our team "
+            "will help."
+        )
+    text = (
+        "Sure — tell me what you'd like a quotation for. Include the item, the size "
+        "or option, and how many. For example: 2 vanilla cakes, 2kg each.\n\n"
+        "You can also just describe it in your own words; I'll ask if anything is "
+        "missing. The price comes from our saved catalogue."
+    )
+    return _buttons(
+        text,
+        [
+            {"id": make_action("browse"), "title": "Browse products"},
+            {"id": make_action("staff"), "title": "Talk to staff"},
+            {"id": make_action("main"), "title": "Main menu"},
+        ],
+        header="Request a Quotation",
     )
 
 

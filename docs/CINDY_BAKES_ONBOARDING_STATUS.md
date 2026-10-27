@@ -677,6 +677,7 @@ The administrator UUID must be the verified Supabase Auth `sub` (an active row i
 | Order persisted from a WhatsApp conversation | **FAIL** — 11 inbound messages, 11 replies, but `orders` is 0; the bot converses and quotes but never creates an order record |
 | Railway deployment (branch confirmed, startup gate verified) | **PASS** for everything verifiable here; live service response not yet observed |
 | Production migration and live-number verification | **NOT ATTEMPTED** — requires explicit authorisation |
+| Customer menu + WhatsApp quotations (`0035`/`0036`/`0037`) | **PASS (automated, local only)** — see §13; not applied to staging |
 
 ### The one remaining dependency
 
@@ -701,3 +702,61 @@ configured in the development environment (Streamable HTTP + OAuth, no client se
 an operator tool for *inspecting* and *setting up* Meta assets; it makes no call into this
 platform and does not change any of the above. Items (1)–(3) can be read off from it once
 OAuth is completed.
+
+## 13. Addendum — customer menu and WhatsApp quotations (2026-10-26)
+
+Two features now sit on top of the same tenant configuration, both off by default and both
+tenant-scoped:
+
+| Feature | Schema | Opt-in |
+|---|---|---|
+| Customer menu (browse, order status, hours, FAQs, staff) | none required (`0035` optional) | `configuration.menu.enabled: true` |
+| Customer quotations + PDF delivery | `0036_whatsapp_quotations.sql` + `0037_quotation_briefs_and_deliveries.sql` | `configuration.quotations.enabled: true` (rules tab, section H) |
+
+### New schema objects in `0036` and `0037`
+
+* `public.quotations` gains `source` (`dashboard` | `whatsapp`), `customer_wa_id` and
+  `idempotency_key` (unique per tenant+source), and `created_by_user_id` becomes nullable
+  so a customer-initiated quotation has no staff author. All from `0036`, which creates no
+  table (variant A, checksum `9dd2c780deaecfad`).
+* `public.quotation_briefs` — one open request per `(tenant, conversation)`, with the
+  collected items and the fields still missing. RLS enabled and forced. From `0037`.
+* `public.quotation_deliveries` — one claim per `(quotation, inbound message)`, statuses
+  `pending` / `sent` / `failed` / `uncertain`, so a webhook replay never sends twice.
+  RLS enabled and forced. From `0037`.
+
+The repository now holds **37** migrations
+(`0037_quotation_briefs_and_deliveries.sql` newest, after `0036_whatsapp_quotations.sql`).
+The reconciliation of the two competing `0036` files is settled as Option A: `0036` is the
+committed variant A bytes and the two new tables arrive in `0037` — see
+`docs/MIGRATION_0036_RECONCILIATION.md`. The database described in §5 is still at `0033`;
+nothing in this section has been applied to it.
+
+### Local verification (disposable database, no remote access)
+
+Run against `saas_cindy_menu_local` (36 migrations applied, `0036` checksum
+`aa89f2d6be3a64a6` — the pre-reconciliation variant B, kept only as a disposable local
+database), with `SAAS_REQUIRE_TEST_DATABASE=1` and no application DSNs in the environment:
+
+| Suite | Result |
+|---|---|
+| `test_whatsapp_menu.py` | 65 tests, OK |
+| `test_whatsapp_quotations.py` | 33 tests, OK |
+| `test_tenant_config_partial_updates.py` | 75 tests, OK (includes the section-H toggle) |
+
+### Before this reaches the client
+
+1. Apply `0035`, `0036` and `0037` to staging, then re-run `--status` (expect 37 applied, no
+   checksum mismatches) — see `docs/STAGING_ENVIRONMENT.md` §5.3. `0037` must be applied
+   **before** the code, because `REQUIRED_SCHEMA` now names the two quotation tables.
+2. ~~Decide the `0036` history question~~ — **decided**: Option A, recorded in
+   `docs/MIGRATION_0036_RECONCILIATION.md`. `0036` is the committed variant A file and the two
+   new tables come from `0037`. Still outstanding: the read-only audit of the remote ledgers
+   described in §5 of that document.
+3. Leave both flags off for Cindy Bakes until the catalogue is loaded and a real quotation
+   has been issued to a number you control.
+4. Quotations are only advertised when outbound sending works, so `WHATSAPP_SEND_ENABLED`
+   must be `1` for the customer journey to complete.
+
+`docs/WHATSAPP_MENU.md` documents the customer-facing behaviour, the failure semantics and
+the known limitations of both features.

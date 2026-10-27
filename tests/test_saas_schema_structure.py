@@ -50,6 +50,8 @@ PLATFORM_TABLES = (
     "catalogue_import_batches",
     "quotations",
     "quotation_lines",
+    "quotation_briefs",
+    "quotation_deliveries",
     "whatsapp_webhook_events",
     "whatsapp_conversations",
 )
@@ -452,3 +454,152 @@ class ApplicationSchemaContractTests(SaasDatabaseTestCase):
             present,
             f"handover_requests is missing indexes: {sorted(present)}",
         )
+
+
+class QuotationSchemaFrom0037Tests(SaasDatabaseTestCase):
+    """Migration 0037 must deliver the tables the quotation workflow writes to.
+
+    0036 (variant A, immutable, checksum 9dd2c780deaecfad) only adds the origin columns
+    and creates no table, so the tables, their RLS configuration, policies, grants,
+    indexes and triggers all arrive in 0037. ``REQUIRED_SCHEMA`` names the tables;
+    everything beside them is asserted here.
+    """
+
+    TABLES = ("quotation_briefs", "quotation_deliveries")
+    POLICIES = {
+        "quotation_briefs": {
+            "quotation_briefs_backend_select",
+            "quotation_briefs_backend_all",
+        },
+        "quotation_deliveries": {
+            "quotation_deliveries_backend_select",
+            "quotation_deliveries_backend_all",
+        },
+    }
+    INDEXES = {
+        "quotation_briefs": {
+            "quotation_briefs_tenant_status_idx",
+            "quotation_briefs_conversation_unique",
+        },
+        "quotation_deliveries": {
+            "quotation_deliveries_tenant_quotation_idx",
+            "quotation_deliveries_provider_message_idx",
+        },
+    }
+
+    def test_the_ledger_records_variant_a_and_the_forward_migration(self):
+        """0036 must stay at the committed variant A bytes; 0037 is the forward step."""
+        import hashlib
+        from pathlib import Path
+
+        names = ("0036_whatsapp_quotations.sql", "0037_quotation_briefs_and_deliveries.sql")
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select version, checksum from public.saas_schema_migrations "
+                "where version = any(%s)",
+                (list(names),),
+            )
+            recorded = dict(cursor.fetchall())
+
+        migrations = Path(__file__).resolve().parent.parent / "db" / "migrations"
+        self.assertEqual(
+            recorded.get("0036_whatsapp_quotations.sql"),
+            "9dd2c780deaecfad",
+            "0036 must be the committed variant A file, not the untracked variant B",
+        )
+        for name in names:
+            with self.subTest(migration=name):
+                digest = hashlib.sha256(
+                    (migrations / name).read_text(encoding="utf-8").encode("utf-8")
+                ).hexdigest()[:16]
+                self.assertEqual(
+                    recorded.get(name), digest, f"{name} was modified after it was applied"
+                )
+
+    def test_both_tables_exist_with_rls_enabled_and_forced(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select c.relname, c.relrowsecurity, c.relforcerowsecurity "
+                "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relname = any(%s)",
+                (list(self.TABLES),),
+            )
+            rows = {name: (enabled, forced) for name, enabled, forced in cursor.fetchall()}
+
+        self.assertEqual(sorted(rows), sorted(self.TABLES), "migration 0037 is not applied")
+        for table, (enabled, forced) in rows.items():
+            with self.subTest(table=table):
+                self.assertTrue(enabled, f"{table} must have RLS enabled")
+                self.assertTrue(forced, f"{table} must have RLS forced")
+
+    def test_each_table_has_the_tenant_predicate_policies_for_app_backend(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select tablename, policyname, cmd, roles::text, qual, with_check "
+                "from pg_policies where schemaname = 'public' and tablename = any(%s)",
+                (list(self.TABLES),),
+            )
+            rows = cursor.fetchall()
+
+        by_table: dict[str, set[str]] = {}
+        for tablename, policyname, cmd, roles, qual, with_check in rows:
+            by_table.setdefault(tablename, set()).add(policyname)
+            with self.subTest(table=tablename, policy=policyname):
+                self.assertEqual(roles, "{app_backend}")
+                self.assertIn("current_tenant_id()", qual or "")
+                if cmd == "ALL":
+                    self.assertIn("current_tenant_id()", with_check or "")
+
+        self.assertEqual(by_table, self.POLICIES)
+
+    def test_app_backend_holds_the_four_dml_privileges_and_no_exposed_role_does(self):
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select table_name, grantee, privilege_type "
+                "from information_schema.role_table_grants "
+                "where table_schema = 'public' and table_name = any(%s)",
+                (list(self.TABLES),),
+            )
+            granted: dict[tuple[str, str], set[str]] = {}
+            for table_name, grantee, privilege in cursor.fetchall():
+                granted.setdefault((table_name, grantee), set()).add(privilege)
+
+        for table in self.TABLES:
+            with self.subTest(table=table):
+                self.assertEqual(
+                    granted.get((table, "app_backend")),
+                    {"SELECT", "INSERT", "UPDATE", "DELETE"},
+                )
+                for exposed in ("anon", "authenticated", "service_role"):
+                    self.assertNotIn(
+                        (table, exposed), granted, f"{exposed} must hold no grant on {table}"
+                    )
+
+    def test_the_indexes_and_update_triggers_exist(self):
+        """The indexes carry semantics the table contract cannot express."""
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select tablename, indexname from pg_indexes "
+                "where schemaname = 'public' and tablename = any(%s)",
+                (list(self.TABLES),),
+            )
+            indexes: dict[str, set[str]] = {}
+            for tablename, indexname in cursor.fetchall():
+                indexes.setdefault(tablename, set()).add(indexname)
+
+            cursor.execute(
+                "select c.relname, t.tgname from pg_trigger t "
+                "join pg_class c on c.oid = t.tgrelid "
+                "join pg_namespace n on n.oid = c.relnamespace "
+                "where n.nspname = 'public' and c.relname = any(%s) "
+                "and not t.tgisinternal",
+                (list(self.TABLES),),
+            )
+            triggers: dict[str, set[str]] = {}
+            for relname, tgname in cursor.fetchall():
+                triggers.setdefault(relname, set()).add(tgname)
+
+        for table in self.TABLES:
+            with self.subTest(table=table):
+                self.assertLessEqual(self.INDEXES[table], indexes.get(table, set()))
+                self.assertIn(f"{table}_set_updated_at", triggers.get(table, set()))

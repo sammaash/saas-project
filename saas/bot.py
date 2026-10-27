@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol, Sequence
 
 from .catalogue import CatalogueService
+from .quotations import brief_prompt_text, quotations_enabled
 from .tenant_admin import tenant_admin
 from . import tools as _tools
 
@@ -98,6 +99,15 @@ class BotResponse:
     #: True when a handover was attempted and recording it failed. The host must then
     #: apologise rather than let any claim of "I shared your request" reach the customer.
     handover_failed: bool = False
+    #: Set when a formal quotation was issued during this turn. The host sends a
+    #: deterministic summary built from the persisted row instead of model wording.
+    quotation: dict[str, Any] | None = None
+    #: True when a quotation was attempted and creating it failed. The host must send
+    #: truthful platform-owned wording, never a model-written success claim.
+    quotation_failed: bool = False
+    #: Set when the customer asked for a quotation PDF and one exists. The host sends
+    #: the document from the persisted quotation and its saved line snapshots.
+    quotation_pdf: dict[str, Any] | None = None
 
 
 class BotResponseProvider(Protocol):
@@ -465,7 +475,13 @@ class BotResponseEngine:
         return {key: item for key, item in value.items() if item not in (None, "", {}, [])}
 
     @staticmethod
-    def _system_prompt(context: TenantBotContext, *, safe_test_mode: bool) -> str:
+    def _system_prompt(
+        context: TenantBotContext,
+        *,
+        safe_test_mode: bool,
+        send_enabled: bool = False,
+        brief: dict[str, Any] | None = None,
+    ) -> str:
         safety = (
             "This is an admin playground. Return text only. Do not claim to send messages, "
             "place orders, reserve inventory, charge or request payment, call tools, or perform "
@@ -493,6 +509,29 @@ class BotResponseEngine:
                 "team could not be notified automatically."
             )
         )
+        quotation = (
+            ""
+            if (
+                safe_test_mode
+                or not send_enabled
+                or not quotations_enabled(context.settings.get("configuration"))
+            )
+            else (
+                "\n\nQUOTATION PROTOCOL\n"
+                "Customers may ask for a quotation at any time, whether they chose the "
+                "menu or asked spontaneously. Use update_quotation_brief to record what "
+                "they want (product, size/weight, quantity); ask only for the details the "
+                "tool reports as missing, one question at a time. Corrections ('make it "
+                "2kg', 'two of them') update the same request. When the tool reports that "
+                "nothing is missing, call request_quote with use_brief=true. Never state, "
+                "estimate or recalculate a price, subtotal, tax or total yourself: only the "
+                "numbers returned by request_quote may be shown. If request_quote reports "
+                "needs_staff, say a team member will prepare the quote instead of guessing. "
+                "If the customer asks for a PDF or document copy of a quotation they "
+                "already received, call request_quotation_pdf; the platform sends the file, "
+                "so never claim to attach it without that tool."
+            )
+        )
         tenant_data = BotResponseEngine._without_empty(
             {
                 "business_name": context.tenant.get("name"),
@@ -512,7 +551,8 @@ class BotResponseEngine:
             "available; describe MADE_TO_ORDER items clearly and do not invent a lead time. "
             "Follow the saved persona and business rules where they "
             "do not conflict with safety. "
-            f"{safety}{handover}\n\nTENANT DATA (JSON):\n"
+            f"{safety}{handover}{quotation}{brief_prompt_text(brief)}"
+            "\n\nTENANT DATA (JSON):\n"
             f"{json.dumps(tenant_data, ensure_ascii=True, sort_keys=True, default=str, separators=(',', ':'))}"
         )
 
@@ -527,6 +567,10 @@ class BotResponseEngine:
         context: TenantBotContext | None = None,
         customer_key: str | None = None,
         message_id: str | None = None,
+        conversation_id: str | None = None,
+        customer_name: str | None = None,
+        send_enabled: bool = False,
+        brief: dict[str, Any] | None = None,
     ) -> BotResponse:
         started = time.perf_counter()
         context_started = time.perf_counter()
@@ -537,7 +581,12 @@ class BotResponseEngine:
         context_ms = (time.perf_counter() - context_started) * 1_000
         processing_started = time.perf_counter()
         request = BotResponseRequest(
-            system_prompt=self._system_prompt(context, safe_test_mode=safe_test_mode),
+            system_prompt=self._system_prompt(
+                context,
+                safe_test_mode=safe_test_mode,
+                send_enabled=send_enabled,
+                brief=brief,
+            ),
             history=self._history(history),
             customer_message=customer_message,
             channel=channel,
@@ -557,6 +606,10 @@ class BotResponseEngine:
             message_id=message_id,
             database_url=getattr(self._context_loader, "database_url", None),
             safe_test_mode=safe_test_mode,
+            conversation_id=str(conversation_id) if conversation_id else None,
+            customer_name=str(customer_name) if customer_name else None,
+            quotations_enabled=quotations_enabled(context.settings.get("configuration")),
+            send_enabled=bool(send_enabled),
             # Only what a human needs to read a handover: the last few short turns.
             context_turns=tuple(
                 {"role": turn.role, "text": turn.text[:400]}
@@ -577,6 +630,9 @@ class BotResponseEngine:
         final_text = ""
         handover: dict[str, Any] | None = None
         handover_failed = False
+        quotation: dict[str, Any] | None = None
+        quotation_failed = False
+        quotation_pdf: dict[str, Any] | None = None
 
         provider_started = time.perf_counter()
         while tool_call_rounds <= _tools.MAX_TOOL_CALLS:
@@ -606,6 +662,49 @@ class BotResponseEngine:
                         handover_failed = False
                     elif not entry.get("ok"):
                         handover_failed = True
+                if entry.get("tool") == "request_quote":
+                    payload = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+                    if entry.get("ok") and isinstance(payload.get("quotation"), dict):
+                        quotation = payload["quotation"]
+                        quotation_failed = False
+                    elif payload.get("needs_staff"):
+                        # Deterministic staff review: the customer must never be told a
+                        # price the catalogue cannot support. Record the handover here
+                        # rather than relying on the model to call the tool.
+                        staff_results = _tools.execute_tool_calls(
+                            registry,
+                            tool_context,
+                            [
+                                (
+                                    "request_staff_handover",
+                                    {
+                                        "product": str(
+                                            payload.get("request")
+                                            or "quotation request"
+                                        )[:200],
+                                        "reason": str(
+                                            payload.get("reason") or "custom_order"
+                                        ),
+                                    },
+                                )
+                            ],
+                        )
+                        results.extend(staff_results)
+                        staff_entry = staff_results[0] if staff_results else {}
+                        if staff_entry.get("ok") and isinstance(
+                            staff_entry.get("data"), dict
+                        ):
+                            handover = staff_entry["data"]
+                            handover_failed = False
+                        else:
+                            handover_failed = True
+                        quotation_failed = True
+                    else:
+                        quotation_failed = True
+                if entry.get("tool") == "request_quotation_pdf" and entry.get("ok"):
+                    payload = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+                    if isinstance(payload.get("quotation"), dict):
+                        quotation_pdf = payload["quotation"]
 
             # Feed tool results back as structured assistant-visible context so the
             # model can compose a final answer from real data.
@@ -633,6 +732,9 @@ class BotResponseEngine:
             context=context,
             handover=handover,
             handover_failed=handover_failed,
+            quotation=quotation,
+            quotation_failed=quotation_failed,
+            quotation_pdf=quotation_pdf,
         )
         response_processing_ms = (time.perf_counter() - response_started) * 1_000
         logger.info(

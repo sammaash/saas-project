@@ -260,6 +260,32 @@ class MainMenuTests(unittest.TestCase):
             self.assertLessEqual(len(row["id"]), 256)
             self.assertIsNotNone(menu.parse_action(row["id"], now=1000).selection)
 
+    def test_the_quotation_row_appears_only_when_the_tenant_enabled_it(self):
+        disabled = menu.main_menu(now=1000)
+        enabled = menu.main_menu(now=1000, quotations_enabled=True)
+        self.assertNotIn("Request a Quotation", disabled.text)
+        self.assertNotIn(
+            "Request a Quotation", [row["title"] for row in disabled.sections[0]["rows"]]
+        )
+
+        rows = enabled.sections[0]["rows"]
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(
+            [row["title"] for row in rows][3], "Request a Quotation"
+        )
+        # Enabling the option never moves the options a customer already knows.
+        self.assertEqual(
+            [row["title"] for row in rows][:3],
+            ["Browse Products", "Place an Order", "My Order"],
+        )
+        self.assertIn("4. Request a Quotation", enabled.text)
+        self.assertEqual(menu.parse_action(rows[3]["id"], now=1000).selection.step, "quote")
+
+    def test_the_example_in_the_menu_text_is_always_an_offered_option(self):
+        reply = menu.main_menu(now=1000)
+        self.assertIn("for example: Browse Products", reply.text)
+        self.assertNotIn("Request a Quotation", reply.text)
+
 
 class ConfiguredMenuTests(unittest.TestCase):
     CUSTOM = {

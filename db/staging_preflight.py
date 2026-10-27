@@ -33,7 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:  # allow `python db/staging_preflight.py` from anywhere
     sys.path.insert(0, str(REPO_ROOT))
 
-from platform_admin.config import FORBIDDEN_DB_USERS, project_refs  # noqa: E402
+from platform_admin.config import (  # noqa: E402
+    FORBIDDEN_DB_USERS,
+    dsn_override_reason,
+    project_refs,
+)
 
 FAIL = "FAIL"
 WARN = "WARN"
@@ -71,6 +75,14 @@ def _role(dsn: str) -> str:
     except ValueError:
         return ""
     return username.split(".")[0].lower()
+
+
+def _host(dsn: str) -> str:
+    """The lower-cased hostname of a DSN, or ``""`` when it cannot be determined."""
+    try:
+        return (urlsplit(dsn).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def analyse(environ: dict[str, str]) -> list[Finding]:
@@ -144,6 +156,50 @@ def analyse(environ: dict[str, str]) -> list[Finding]:
             + ", ".join(sorted(set(referenced))),
         )
 
+    # The expected host is declared, not derived: a project reference cannot identify a
+    # non-Supabase host, so without this the checks above are vacuous for a Railway database.
+    # Findings name variables only -- the report never prints a host.
+    expected_host = (environ.get("SAAS_STAGING_DB_HOST") or "").strip().lower()
+    if not expected_host:
+        add(
+            FAIL,
+            "db-host",
+            "SAAS_STAGING_DB_HOST is not set, so the staging database host cannot be checked.",
+        )
+
+    hosts: list[str] = []
+    for name in EXPECTED_ROLES:
+        dsn = (environ.get(name) or "").strip()
+        if not dsn:
+            continue
+        # libpq honours connection parameters in the query string (?host=, ?hostaddr=, ?user=),
+        # so a DSN carrying one cannot be proven to point at the declared host or login.
+        reason = dsn_override_reason(dsn)
+        if reason:
+            add(
+                FAIL,
+                "dsn-overrides",
+                f"{name} is refused because {reason}; the declared host and login could not "
+                "be verified.",
+            )
+            continue
+        host = _host(dsn)
+        if not host:
+            add(FAIL, "db-host", f"{name} has no hostname, so it cannot be checked.")
+            continue
+        hosts.append(host)
+        if expected_host and host != expected_host:
+            add(
+                FAIL,
+                "db-host",
+                f"{name} does not use the host named by SAAS_STAGING_DB_HOST.",
+            )
+    if len(set(hosts)) > 1:
+        add(
+            FAIL,
+            "db-host",
+            "SAAS_DATABASE_URL and SAAS_PLATFORM_DATABASE_URL use different hosts.",
+        )
 
     sending = (environ.get("WHATSAPP_SEND_ENABLED") or "").strip()
     if not sending:

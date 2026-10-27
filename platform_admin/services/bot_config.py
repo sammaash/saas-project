@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from saas.bot import redact_sensitive_values
+from saas.quotations import quotations_enabled
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
@@ -118,6 +119,26 @@ def _integer_or_unset(value: Any, field: str, *, minimum: int, maximum: int | No
     if maximum is not None and number > maximum:
         raise v.ServiceError(f"{field} must be at most {maximum}.")
     return number
+
+
+#: What a checkbox or a JSON boolean may carry. ``request.form`` sends ``"1"`` for a
+#: checked box and nothing for an unchecked one, while the JSON patch API sends a real
+#: ``true``/``false``; both spellings are accepted and every other value is rejected
+#: rather than silently read as "off".
+_TRUE_FLAGS = frozenset({"1", "true", "on", "yes"})
+_FALSE_FLAGS = frozenset({"", "0", "false", "off", "no"})
+
+
+def _flag(value: Any, field: str) -> bool:
+    """A checkbox/JSON boolean. An absent value is ``False``; an unknown one is refused."""
+    if isinstance(value, bool):
+        return value
+    cleaned = str(value).strip().lower() if value is not None else ""
+    if cleaned in _TRUE_FLAGS:
+        return True
+    if cleaned in _FALSE_FLAGS:
+        return False
+    raise v.ServiceError(f"{field} must be true or false.")
 
 
 class SubmittedForm:
@@ -458,6 +479,18 @@ def _menu_patch(form: SubmittedForm) -> dict[str, Any]:
         patch["options"] = options
 
     return _column("configuration", _nested("menu", patch))
+def _quotations_patch(form: SubmittedForm) -> dict[str, Any]:
+    """I. WhatsApp quotations -> ``configuration.quotations.enabled``.
+
+    The opt-in is a boolean, so an unchecked box is a real value ("disabled") rather
+    than an omission: the template posts ``present_quotations_enabled`` next to the
+    checkbox for exactly that reason. A save that does not carry the section at all
+    leaves the stored value untouched, like every other partial update here.
+    """
+    if not form.submitted("quotations_enabled"):
+        return {}
+    enabled = _flag(form.value("quotations_enabled"), "Enable WhatsApp quotations")
+    return _column("configuration", _nested("quotations", {"enabled": enabled}))
 
 
 def _knowledge_patch(form: SubmittedForm) -> dict[str, Any]:
@@ -547,6 +580,13 @@ SECTIONS: tuple[SectionSpec, ...] = (
         ("configuration",),
         _knowledge_patch,
         markers=("include_subpages", "documents"),
+    ),
+    SectionSpec(
+        "quotations",
+        "WhatsApp quotations",
+        ("configuration",),
+        _quotations_patch,
+        markers=("quotations_enabled",),
     ),
     SectionSpec("faq", "One FAQ", ("configuration",), _faq_patch),
     SectionSpec("document", "One document", ("configuration",), _document_patch),
@@ -682,6 +722,7 @@ def field_values(stored: Mapping[str, Any]) -> dict[str, Any]:
             }
             for option in menu.options
         ],
+        "quotations_enabled": quotations_enabled(configuration),
         "website_link": knowledge.get("website_link"),
         "include_subpages": bool(scrape.get("include_subpages")),
         "max_pages": scrape.get("max_pages"),

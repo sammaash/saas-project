@@ -123,14 +123,44 @@ real customer. Tenant scope still comes from the authorized dashboard tenant, an
 still applies. Use a dedicated test tenant and clean up synthetic rows after testing;
 never enable remote mode casually against a customer-facing tenant.
 
+## Quotations: a second, independent opt-in
+
+`Request a Quotation` is offered only when the tenant has **also** enabled quotations:
+
+```json
+{
+  "quotations": {
+    "enabled": true
+  }
+}
+```
+
+The **WhatsApp quotations** section of the dashboard's rules tab writes exactly that key
+through the partial-save endpoint (`POST /tenants/<id>/rules/quotations`), so saving the
+checkbox never rewrites the other settings. The form and the JSON patch accept the usual
+checkbox spellings (`1` / `true` / `on` / `yes` and `0` / `false` / `off` / `no`) and store
+a real boolean; any other value is refused with `400` and nothing is written. Only a stored
+JSON `true` enables the feature, so a hand-edited `"yes"`, `1` or nested object counts as
+off rather than half-enabling it.
+
+The two flags are independent. A tenant that enables quotations but not the menu still
+gets quotations for spontaneous requests — the bot's tool protocol is gated on the
+quotation flag alone — it just never sees the menu option. A tenant that enables the menu
+but not quotations gets the six original options, because the quotation entry could only
+refuse the tap.
+
+No environment variable or Railway variable turns quotations on, and the toggle is
+tenant-scoped: enabling it for one tenant says nothing about any other tenant.
+
 ## Commands and flows
 
 | Entry | Behaviour |
 |---|---|
-| `menu` (case/whitespace insensitive) | Sends the configured main menu as a native list; with no saved options it shows the six historical defaults |
+| `menu` (case/whitespace insensitive) | Sends the configured main menu as a native list; with no saved options it shows the six historical defaults, and seven once quotations are enabled |
 | `browse_products` action | Categories → product detail with configured prices/availability. Products without a category appear under **Other products**. Lists over ten entries get a **More** row |
 | `place_order` action | Instructions only; the existing conversational order tools remain authoritative |
 | `my_order` action | Asks for `order <number>`; looks the order up by tenant **and** sender `wa_id` |
+| `quote` (not configurable) | Opens a quotation request for this conversation (item, size/option, quantity); priced only from the tenant catalogue. Offered only when the quotation opt-in above is on |
 | `delivery_collection` action | Shows configured `business_rules.delivery_fee` and `business_hours`; otherwise offers staff |
 | `faqs` action | Lists `configuration.knowledge_base.faqs` (paginated with **More questions**); a tap shows the stored answer |
 | `handover` action | Records and notifies through the existing handover store |
@@ -143,6 +173,34 @@ are deliberately **not** commands: "1" remains ordinary conversation.
 Disabled options are neither shown in the main menu nor executed by a tap or text command.
 If a saved option is malformed or uses an unknown action, the menu fails closed with a safe
 message rather than running an unexpected path.
+
+## Quotation requests
+
+`Request a Quotation`, or the text forms `quote` / `quotation` / `get a quote`, opens a
+*request* for the conversation: one open row in `public.quotation_briefs` per
+`(tenant, conversation)`, restarted only once the previous one is finished.
+
+- **Collection.** The bot asks for the item, the size or option and the quantity, and
+  merges corrections into the same request rather than opening a second one.
+- **Pricing.** Only the tenant's saved catalogue is used. A missing detail produces a
+  targeted question; an item outside the catalogue, or a request that cannot be priced
+  (a custom cake, a negotiated discount), is handed to staff with the details collected
+  so far instead of inventing a number.
+- **Issue.** The quotation is stored in `public.quotations` / `public.quotation_lines`
+  with `source = 'whatsapp'` and no `created_by_user_id`, keyed by the inbound message id,
+  so a webhook replay returns the same quotation instead of a second one. Its validity
+  comes from the tenant's `quotation_valid_days` (default 14).
+- **Document.** When the customer asks for the PDF ("send me the quotation PDF"), the
+  file is rendered from the persisted quotation and its saved line snapshots and sent as
+  a WhatsApp document. The attempt is claimed in `public.quotation_deliveries` **before**
+  anything is uploaded: `sent` and `uncertain` attempts are never repeated, and only a
+  definite `failed` attempt is retried on replay.
+- **Fail closed.** The quotation tools refuse when quotations are disabled, when outbound
+  sending is off, or in test mode. The customer is told staff will help instead of being
+  promised a document that cannot be delivered.
+
+Quotations need migrations `0036` (the WhatsApp columns on `quotations`) and `0037`
+(`quotation_briefs`, `quotation_deliveries`); the menu's own state does not.
 
 ## State and security
 
@@ -194,6 +252,9 @@ the 0034 baseline; do not apply 0035 as part of enabling the menu.
 ## Known limitations
 
 - `0035` is not required, but without it menu replies have no inbound correlation.
+- Quotations do need `0036` **and** `0037`; the opt-in checkbox saves fine without them, but
+  the request would then fail at the first write. Apply both migrations before enabling
+  quotations.
 - No order creation, payment processing or WhatsApp Flows are added.
 - `language` is stored metadata only; menu copy is not translated automatically. Operators
   must write the welcome message and labels in the desired language.
@@ -204,6 +265,8 @@ the 0034 baseline; do not apply 0035 as part of enabling the menu.
 - `conversations.menu_state*` (migration 0035) is intentionally unused: the stateless ids
   make it unnecessary for phase 1.
 - Pagination shows at most ten rows per page; there is no free-text page number.
+- Quotation PDFs are rendered per request and never stored: a resend re-renders the same
+  document from the saved snapshots, and a `uncertain` delivery is not resent on purpose.
 
 ## Tests
 
@@ -211,15 +274,23 @@ the 0034 baseline; do not apply 0035 as part of enabling the menu.
 unknown options, malformed configuration, payload limits, tap parsing, stale/expired ids,
 empty and populated catalogues, uncategorised products, pagination, missing prices, order
 privacy, handover success/failure, definite vs ambiguous send failures, outbound
-persistence, and the disabled-by-default behaviour. All database access is faked; no test
-sends a real WhatsApp message.
+persistence, the disabled-by-default behaviour, and the quotation row appearing only for
+opted-in tenants. All database access is faked; no test sends a real WhatsApp message.
+
+`tests/test_whatsapp_quotations.py` covers the quotation journey end to end at the service
+and tool layers against a real database: brief collection and corrections, server-side
+pricing, feature gates, PDF delivery, webhook replay, definite and ambiguous send failures,
+and tenant/customer isolation.
 
 `tests/test_tenant_config_partial_updates.py` covers the Menu Builder: rendering defaults,
 saving a custom welcome/language/order/labels, disabling a row, rejecting duplicate ids,
 blank labels, unknown actions and invalid positions, tenant isolation, and simulator
-refresh after a save. `tests/test_menu_simulator.py` covers the simulator's safe reply view,
-configured menu handling, the loopback default, the explicit remote-database opt-in,
-invalid flag values, synthetic identity, and forced send suppression.
+refresh after a save — plus the quotation toggle itself: default off, save and read
+agreement, opt-in-only writes, an unchecked box writing `false`, other sections leaving the
+flag alone, unknown values rejected, non-administrators refused, and cross-tenant isolation.
+`tests/test_menu_simulator.py` covers the simulator's safe reply view, configured menu
+handling, the loopback default, the explicit remote-database opt-in, invalid flag values,
+synthetic identity, and forced send suppression.
 
 `tests/test_menu_db.py` adds database-backed order-privacy and staff-assistance tests. The
 database suites require an explicit `SAAS_TEST_DATABASE_URL` naming a disposable local

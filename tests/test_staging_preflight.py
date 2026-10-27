@@ -20,13 +20,13 @@ from db import staging_preflight as preflight
 
 PRODUCTION_REF = "prodref0000000000000"
 STAGING_REF = "stagref0000000000000"
+#: The host both staging DSNs must use, declared explicitly in SAAS_STAGING_DB_HOST.
+STAGING_DB_HOST = "aws-0-eu-central-1.pooler.supabase.com"
 SECRET_PASSWORD = "super-secret-staging-password"
 
 
 def _pooled(role: str, ref: str, password: str = "pw") -> str:
-    return (
-        f"postgresql://{role}.{ref}:{password}@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
-    )
+    return f"postgresql://{role}.{ref}:{password}@{STAGING_DB_HOST}:5432/postgres"
 
 
 SAFE = {
@@ -36,6 +36,7 @@ SAFE = {
     "SAAS_PLATFORM_DATABASE_URL": _pooled(
         "saas_platform_admin", STAGING_REF, SECRET_PASSWORD
     ),
+    "SAAS_STAGING_DB_HOST": STAGING_DB_HOST,
     "SUPABASE_URL": f"https://{STAGING_REF}.supabase.co",
     "WHATSAPP_SEND_ENABLED": "0",
 }
@@ -115,9 +116,140 @@ class StagingPreflightTests(unittest.TestCase):
         findings = self.findings(
             SAAS_DATABASE_URL="postgresql://app_backend:pw@localhost:5432/postgres",
             SAAS_PLATFORM_DATABASE_URL="postgresql://saas_platform_admin:pw@localhost:5432/postgres",
+            SAAS_STAGING_DB_HOST="localhost",
         )
         self.assertIn("project", self.codes(findings, preflight.WARN))
         self.assertEqual(self.codes(findings, preflight.FAIL), [])
+
+    # -- the expected database host is declared, not derived -------------------
+    def test_a_missing_expected_host_is_refused(self):
+        findings = self.findings(SAAS_STAGING_DB_HOST=None)
+        self.assertIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_an_application_host_other_than_the_expected_host_is_refused(self):
+        findings = self.findings(
+            SAAS_DATABASE_URL="postgresql://app_backend:pw@other-db.internal:5432/railway"
+        )
+        self.assertIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_a_platform_host_other_than_the_expected_host_is_refused(self):
+        findings = self.findings(
+            SAAS_PLATFORM_DATABASE_URL=(
+                "postgresql://saas_platform_admin:pw@other-db.internal:5432/railway"
+            )
+        )
+        self.assertIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_two_different_database_hosts_are_refused(self):
+        findings = self.findings(
+            SAAS_PLATFORM_DATABASE_URL=(
+                "postgresql://saas_platform_admin:pw@other-db.internal:5432/railway"
+            ),
+            SAAS_STAGING_DB_HOST=STAGING_DB_HOST,
+        )
+        self.assertIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_a_dsn_without_a_hostname_is_refused(self):
+        findings = self.findings(SAAS_DATABASE_URL="postgresql://app_backend:pw@/railway")
+        self.assertIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_a_malformed_dsn_is_refused(self):
+        for dsn, code in (
+            ("postgresql://app_backend:pw@[::1/railway", "dsn-overrides"),
+            ("not-a-dsn", "db-host"),
+        ):
+            with self.subTest(dsn=dsn):
+                findings = self.findings(SAAS_DATABASE_URL=dsn)
+                self.assertIn(code, self.codes(findings, preflight.FAIL))
+
+    # -- connection-target overrides inside the DSN ----------------------------
+    # libpq honours connection parameters in the URI query string, so ?host=/?hostaddr= would
+    # redirect the connection while the hostname the DSN appears to name stays correct.
+    def test_a_host_override_is_refused_even_though_the_hostname_matches(self):
+        findings = self.findings(
+            SAAS_DATABASE_URL=_pooled("app_backend", STAGING_REF) + "?host=other-db.internal"
+        )
+        self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+        # The declared hostname still matches -- that is exactly why the override needs its own
+        # check rather than being folded into the host comparison.
+        self.assertNotIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_a_hostaddr_override_is_refused(self):
+        findings = self.findings(
+            SAAS_DATABASE_URL=_pooled("app_backend", STAGING_REF) + "?hostaddr=10.9.9.9"
+        )
+        self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+
+    def test_both_overrides_together_are_refused(self):
+        findings = self.findings(
+            SAAS_PLATFORM_DATABASE_URL=(
+                _pooled("saas_platform_admin", STAGING_REF)
+                + "?host=other-db.internal&hostaddr=10.9.9.9"
+            )
+        )
+        self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+
+    def test_a_login_override_is_refused(self):
+        findings = self.findings(
+            SAAS_DATABASE_URL=_pooled("app_backend", STAGING_REF) + "?user=postgres"
+        )
+        self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+
+    def test_encoded_or_case_variant_parameter_names_are_refused(self):
+        for query in ("HOST=other-db.internal", "%68ost=other-db.internal", "HostAddr=10.9.9.9"):
+            with self.subTest(query=query):
+                findings = self.findings(
+                    SAAS_DATABASE_URL=_pooled("app_backend", STAGING_REF) + f"?{query}"
+                )
+                self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+
+    def test_a_fragment_is_refused(self):
+        findings = self.findings(
+            SAAS_DATABASE_URL=_pooled("app_backend", STAGING_REF) + "#fragment"
+        )
+        self.assertIn("dsn-overrides", self.codes(findings, preflight.FAIL))
+
+    def test_a_plain_dsn_raises_no_override_finding(self):
+        self.assertNotIn(
+            "dsn-overrides", [finding.code for finding in preflight.analyse(SAFE)]
+        )
+
+    def test_the_override_finding_never_prints_the_value(self):
+        buffer = io.StringIO()
+        with patch.dict(
+            os.environ,
+            {
+                **SAFE,
+                "SAAS_DATABASE_URL": _pooled("app_backend", STAGING_REF)
+                + "?host=other-db.internal",
+            },
+            clear=True,
+        ), redirect_stdout(buffer):
+            self.assertEqual(preflight.main([]), 1)
+        output = buffer.getvalue()
+        self.assertIn("dsn-overrides", output)
+        self.assertNotIn("other-db.internal", output)
+        self.assertNotIn(SECRET_PASSWORD, output)
+
+    def test_the_expected_host_matches_case_insensitively(self):
+        findings = self.findings(SAAS_STAGING_DB_HOST=STAGING_DB_HOST.upper())
+        self.assertNotIn("db-host", self.codes(findings, preflight.FAIL))
+
+    def test_the_report_never_prints_the_expected_or_actual_host(self):
+        buffer = io.StringIO()
+        with patch.dict(
+            os.environ,
+            {
+                **SAFE,
+                "SAAS_DATABASE_URL": "postgresql://app_backend:pw@other-db.internal:5432/railway",
+            },
+            clear=True,
+        ), redirect_stdout(buffer):
+            self.assertEqual(preflight.main([]), 1)
+        output = buffer.getvalue()
+        self.assertIn("db-host", output)
+        self.assertNotIn(STAGING_DB_HOST, output)
+        self.assertNotIn("other-db.internal", output)
 
     def test_exit_code_is_zero_only_when_nothing_fails(self):
         for environ, expected in ((SAFE, 0), ({**SAFE, "WHATSAPP_SEND_ENABLED": ""}, 1)):
@@ -149,6 +281,7 @@ class StagingPreflightTests(unittest.TestCase):
             path.write_text(
                 "SAAS_ENVIRONMENT=staging\n"
                 f"SAAS_PRODUCTION_PROJECT_REF={PRODUCTION_REF}\n"
+                f"SAAS_STAGING_DB_HOST={STAGING_DB_HOST}\n"
                 f"SAAS_DATABASE_URL={_pooled('app_backend', PRODUCTION_REF)}\n"
                 f"SAAS_PLATFORM_DATABASE_URL={_pooled('saas_platform_admin', STAGING_REF)}\n"
                 f"SUPABASE_URL=https://{STAGING_REF}.supabase.co\n"
