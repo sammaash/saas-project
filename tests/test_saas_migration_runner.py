@@ -161,6 +161,34 @@ class MigrationChecksumTests(SaasDatabaseTestCase):
                 conn.close()
 
 
+class FreshDatabaseStatusTests(unittest.TestCase):
+    """--status is the first command on a new database, before any ledger exists."""
+
+    @staticmethod
+    def _connection_without_ledger():
+        cursor = mock.MagicMock()
+        cursor.fetchone.return_value = (None,)
+        connection = mock.MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        return connection
+
+    def test_status_reports_every_migration_as_pending(self):
+        connection = self._connection_without_ledger()
+        output = io.StringIO()
+        with mock.patch.object(
+            migration_runner,
+            "_applied",
+            side_effect=AssertionError("read the ledger before checking it exists"),
+        ), contextlib.redirect_stdout(output):
+            migration_runner.print_status(connection)
+        printed = output.getvalue()
+        self.assertIn("no migrations recorded yet", printed)
+        self.assertIn("not applied yet", printed)
+        self.assertIn("0036_whatsapp_quotations.sql", printed)
+        self.assertIn("0037_quotation_briefs_and_deliveries.sql", printed)
+        self.assertNotIn("CHECKSUM MISMATCHES", printed)
+
+
 # ---------------------------------------------------------------------------
 # Option A: the immutable committed 0036 (variant A) plus the forward 0037
 # ---------------------------------------------------------------------------

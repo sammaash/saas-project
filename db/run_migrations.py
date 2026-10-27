@@ -169,6 +169,18 @@ def _applied(conn) -> dict[str, str]:
         return {version: checksum for version, checksum in cursor.fetchall()}
 
 
+def _ledger_exists(conn) -> bool:
+    """True when the migration ledger exists.
+
+    A database that has never been migrated has no ledger table, and ``--status`` is the
+    first command an operator runs against it, so it must describe that state instead of
+    failing with ``UndefinedTable``.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute("select to_regclass('public.saas_schema_migrations')")
+        return cursor.fetchone()[0] is not None
+
+
 def apply_migrations(conn, directory: Path = MIGRATIONS_DIR) -> list[str]:
     """Apply every pending migration in file-name order. Safe to re-run."""
     _run_script(conn, LEDGER_SQL)
@@ -218,7 +230,7 @@ def apply_all(conn, directory: Path, label: str) -> None:
 
 def print_status(conn) -> None:
     """Show which migrations are applied and which are pending."""
-    applied = _applied(conn)
+    applied = _applied(conn) if _ledger_exists(conn) else {}
 
     if not applied:
         print("no migrations recorded yet")
