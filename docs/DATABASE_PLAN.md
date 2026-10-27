@@ -1217,6 +1217,22 @@ Pro is $25/month (≈ KSh 3,250) — a few tenants at typical SME SaaS pricing c
 
 **And if you want better than a 24-hour RPO:** point-in-time recovery is a paid add-on, requires at least a Small compute instance, and costs roughly $100/month for a 7-day window — materially more than Pro itself. Nobody should assume PITR is cheap; plan WAL/continuous archiving off-site instead, or accept the daily bound knowingly.
 
+### 7.3.1 Recovery risk acceptance — WhatsApp quotation release (operator decision)
+
+**Decision date:** 26 October 2026
+
+**Decision:** The operator elects to proceed with preparing and committing the WhatsApp quotation release while assuming, for planning purposes, that a restored database copy would be healthy.
+
+**Evidence available:** Daily physical backups were visible in the Supabase dashboard, including a backup dated 27 October 2026. No connection strings, credentials, or backup details are recorded in this document.
+
+**Not verified:** A separate restored project was not created and tested as part of this decision. Restore integrity, application connectivity, and recovery time have not been demonstrated.
+
+**Risk accepted:** A usable recovery point has not been independently verified through a restore drill. This entry records acceptance of that risk; it does not satisfy the documented backup-and-restore prerequisite associated with migration `0035` (see `docs/STAGING_MENU_RELEASE_PREP.md` §5.1).
+
+**Outstanding release gate:** Reassess the recovery requirement before production migration or deployment. Do not claim the documented backup-and-restore prerequisite has been satisfied.
+
+**Scope of this decision:** Documentation and Git commit only. It does not authorize production database access, migrations, pushing, merging, deployment, live configuration changes, or WhatsApp messages.
+
 ### 7.4 The remaining risks
 
 | # | Risk | Why it matters here | Mitigation |
