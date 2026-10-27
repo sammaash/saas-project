@@ -11,7 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 REQUIRED_ENV = (
     "PLATFORM_SECRET_KEY",
@@ -74,6 +74,44 @@ def _database_user(url: str) -> str | None:
         return urlsplit(url).username
     except ValueError:
         return None
+
+
+def _database_host(url: str) -> str | None:
+    """Lower-cased hostname of a DSN, or ``None`` when it cannot be determined."""
+    try:
+        return (urlsplit(url).hostname or "").lower() or None
+    except ValueError:
+        return None
+
+
+def dsn_override_reason(url: str) -> str | None:
+    """Why ``url`` is unusable for staging, or ``None`` when it is acceptable.
+
+    libpq accepts connection parameters in the URI query string, so ``?host=`` and
+    ``?hostaddr=`` silently redirect the connection to a different server and ``?user=``
+    overrides the login -- all while ``urlsplit(url).hostname`` keeps reporting the host the
+    DSN appears to name. A query string or fragment therefore makes the declared host and role
+    unverifiable, so staging refuses the whole class rather than trying to enumerate the
+    dangerous parameter names. Nothing in the staging contract needs either: the database is
+    reached over the private internal hostname with the default libpq settings.
+
+    Only parameter *names* appear in the reason, never a value, so a diagnostic can be shown
+    without echoing any part of the connection string.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "it cannot be parsed"
+    if parts.fragment:
+        return "it carries a URL fragment"
+    names: list[str] = []
+    for part in parts.query.split("&"):
+        name = unquote(part.split("=", 1)[0]).strip().lower()
+        if name and name not in names:
+            names.append(name)
+    if names:
+        return "it carries query parameters (" + ", ".join(sorted(names)) + ")"
+    return None
 
 
 def project_refs(url: str | None) -> set[str]:
@@ -140,6 +178,47 @@ def _staging_guard(environ: dict[str, str], app_url: str, platform_url: str) -> 
             raise ConfigError(
                 f"{name} resolves to the production Supabase project ({production_ref}). "
                 "Staging must use its own project."
+            )
+
+    # A Supabase project reference cannot identify a non-Supabase host, so the host itself is
+    # declared and matched. Without this the checks above are vacuous for a Railway database:
+    # they would pass for *any* host that carries no project reference.
+    expected_host = (environ.get("SAAS_STAGING_DB_HOST") or "").strip().lower()
+    if not expected_host:
+        raise ConfigError(
+            "SAAS_STAGING_DB_HOST is required when SAAS_ENVIRONMENT=staging. Name the "
+            "private hostname of the staging database so the boot can prove which database "
+            "it is about to use; a project reference cannot do that for a non-Supabase host."
+        )
+
+    # Comparing each DSN against the declared host also guarantees the two DSNs agree with
+    # each other, so no separate "same host" comparison is needed.
+    resolved: list[tuple[str, str]] = []
+    for name, url in (
+        ("SAAS_DATABASE_URL", app_url),
+        ("SAAS_PLATFORM_DATABASE_URL", platform_url),
+    ):
+        reason = dsn_override_reason(url)
+        if reason:
+            raise ConfigError(
+                f"{name} is refused for staging because {reason}. libpq would use those "
+                "parameters instead of the host and login this configuration declares, so the "
+                "staging database identity could not be verified. Remove the query string and "
+                "the fragment."
+            )
+        host = _database_host(url)
+        if not host:
+            raise ConfigError(
+                f"{name} must include a hostname when SAAS_ENVIRONMENT=staging, so it can "
+                "be checked against SAAS_STAGING_DB_HOST."
+            )
+        resolved.append((name, host))
+
+    for name, host in resolved:
+        if host != expected_host:
+            raise ConfigError(
+                f"{name} does not use the host named by SAAS_STAGING_DB_HOST. Staging must "
+                "point at its own database host."
             )
 
     if not (environ.get("WHATSAPP_SEND_ENABLED") or "").strip():
