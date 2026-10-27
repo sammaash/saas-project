@@ -13,7 +13,7 @@
   </section>
   <table>
     <tr><th>SKU</th><th>Item</th><th>Price</th><th>Availability</th><th>Quantity</th></tr>
-    {% for item in form_context.items %}
+    {% for item in form_context['items'] %}
     <tr>
       <td>{{ item.sku }}<input type="hidden" name="variant_id" value="{{ item.variant_id }}"></td>
       <td>{{ item.product_name }} - {{ item.variant_name }}</td>

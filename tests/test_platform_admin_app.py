@@ -597,6 +597,57 @@ class QuotationDashboardTests(DashboardTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Quotations", response.get_data(as_text=True))
 
+    def test_quotation_form_renders_the_active_catalogue(self):
+        response = self.client.get(f"/tenants/{self.tenant}/quotations/new")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("Create quotation", body)
+        self.assertIn("Quoted Item - Standard", body)
+        self.assertIn("KES 25.00", body)
+        self.assertIn('name="variant_id"', body)
+
+    def test_invalid_submission_re_renders_with_error_and_persists_nothing(self):
+        response = self.post(
+            f"/tenants/{self.tenant}/quotations/new",
+            {
+                "customer_name": "Invalid Customer",
+                "customer_contact": "customer@example.test",
+                "valid_days": "7",
+                "variant_id": ["00000000-0000-0000-0000-000000000000"],
+                "quantity": ["1"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("unavailable", body)
+        self.assertIn("Create quotation", body)
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select count(*) from public.quotations where tenant_id = %s",
+                (self.tenant,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_duplicate_variant_submission_is_rejected_without_persisting(self):
+        response = self.post(
+            f"/tenants/{self.tenant}/quotations/new",
+            {
+                "customer_name": "Duplicate Customer",
+                "customer_contact": "customer@example.test",
+                "valid_days": "7",
+                "variant_id": [self.variant_id, self.variant_id],
+                "quantity": ["1", "2"],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("may appear only once", response.get_data(as_text=True))
+        with self.superuser() as cursor:
+            cursor.execute(
+                "select count(*) from public.quotations where tenant_id = %s",
+                (self.tenant,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 0)
+
     def test_quotation_uses_server_prices_snapshots_values_and_downloads_pdf(self):
         response = self.post(
             f"/tenants/{self.tenant}/quotations/new",
