@@ -18,7 +18,7 @@ The menu is disabled unless ``tenant_settings.configuration.menu.enabled`` is ``
 needs no schema change.
 
 ``Request a Quotation`` is advertised only when the tenant has *also* set
-``configuration.quotations.enabled`` to ``true`` (section H of the rules tab). A tenant
+``configuration.quotations.enabled`` to ``true`` (section I of the rules tab). A tenant
 without that opt-in gets the six other options, because the quotation handler would only
 have to refuse the request.
 """

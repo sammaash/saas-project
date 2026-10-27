@@ -414,14 +414,14 @@ Boot log must show no `ConfigError`. `python db/staging_preflight.py` must print
 7. **Synthetic tenant** — create one through `/tenants/new` (no real business data, no seed).
 8. **Handover checks** — the tab renders, and `select count(*) from public.handover_requests`
    returns 0 without error.
-9. **Quotation checks with sending off** — `WHATSAPP_SEND_ENABLED=0` (the default). Section H of
+9. **Quotation checks with sending off** — `WHATSAPP_SEND_ENABLED=0` (the default). Section I of
    the selected tenant's rules tab saves with the box unchecked; the menu then shows six options
    and a typed `quote` is answered with "aren't available … our team can prepare a written
    quotation". Enabling the box shows seven options, and a quotation request is refused with the
    staff-handover message and **writes nothing**.
 10. **Controlled WhatsApp scenarios** — only after explicit approval, with a dedicated test number
     and sending temporarily enabled (table below). Afterwards restore
-    `WHATSAPP_SEND_ENABLED=0` and uncheck section H.
+    `WHATSAPP_SEND_ENABLED=0` and uncheck section I.
 
 | Scenario | Safe staging method | Expected |
 |---|---|---|
@@ -430,7 +430,7 @@ Boot log must show no `ConfigError`. `python db/staging_preflight.py` must print
 | Duplicate webhook delivery | post the same signed payload twice | second response `duplicate: true`, still one row, one notification |
 | Tenant isolation | two synthetic tenants; dashboard on tenant A | tenant B's requests never listed; status change on B refused |
 | Quotation, flag off | synthetic tenant with no `configuration.quotations` | no quotation row; a typed `quote` offers staff instead of a price |
-| Quotation, flag on | section H checked, `WHATSAPP_SEND_ENABLED=1`, your own number, catalogue loaded | item/size/quantity collected, catalogue-priced summary, `quotations.source = 'whatsapp'` with one `quotation_briefs` row |
+| Quotation, flag on | section I checked, `WHATSAPP_SEND_ENABLED=1`, your own number, catalogue loaded | item/size/quantity collected, catalogue-priced summary, `quotations.source = 'whatsapp'` with one `quotation_briefs` row |
 | Quotation PDF | ask for the PDF after the summary | document received; one `quotation_deliveries` row `sent`; replaying the same inbound payload sends nothing |
 | Quotation PDF failure | `WHATSAPP_SEND_ENABLED=0`, or a deliberately bad access token | delivery row `failed` with a code, customer told staff will send it, no duplicate |
 | Unpriceable request | ask for an item that is not in the catalogue | staff handover with the details collected, no invented price |

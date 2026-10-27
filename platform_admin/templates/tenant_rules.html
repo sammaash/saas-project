@@ -399,7 +399,7 @@ and a failed save leaves the stored configuration exactly as it was.</p>
 {% endfor %}
 
 <section class="card config-section" id="config-quotations">
-  <h3>H. WhatsApp quotations</h3>
+  <h3>I. WhatsApp quotations</h3>
   {% if errors.get('quotations') %}<p class="flash error">{{ errors.quotations }}</p>{% endif %}
   {% call section_form('quotations', 'Save quotation settings', tenant.id, version) %}
     <input type="hidden" name="present_quotations_enabled" value="1">

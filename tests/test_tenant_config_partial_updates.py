@@ -662,7 +662,7 @@ class QuotationOptInTests(ConfigurationManagerTestCase):
         return (self.quotations(tenant_id) or {}).get("enabled")
 
     def enable(self, tenant_id: str | None = None):
-        """Submit section H exactly as the browser does for a checked box."""
+        """Submit section I exactly as the browser does for a checked box."""
         return self.post(
             f"/tenants/{tenant_id or self.tenant_id}/rules/quotations",
             {"present_quotations_enabled": "1", "quotations_enabled": "1"},
@@ -680,6 +680,13 @@ class QuotationOptInTests(ConfigurationManagerTestCase):
         html = self.page(f"/tenants/{self.tenant_id}/rules")
         self.assertIn('name="present_quotations_enabled"', html)
         self.assertFalse(self.checkbox_is_checked(html, "quotations_enabled"))
+
+    def test_each_section_has_its_own_letter(self):
+        """The quotations section is I: the menu builder already owns H."""
+        html = self.page(f"/tenants/{self.tenant_id}/rules")
+        self.assertIn("H. WhatsApp customer menu", html)
+        self.assertIn("I. WhatsApp quotations", html)
+        self.assertNotIn("H. WhatsApp quotations", html)
 
     def test_the_form_and_the_read_api_agree_with_the_saved_value(self):
         self.assertEqual(self.enable().status_code, 302)

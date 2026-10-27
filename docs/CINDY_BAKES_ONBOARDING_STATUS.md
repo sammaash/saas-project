@@ -711,7 +711,7 @@ tenant-scoped:
 | Feature | Schema | Opt-in |
 |---|---|---|
 | Customer menu (browse, order status, hours, FAQs, staff) | none required (`0035` optional) | `configuration.menu.enabled: true` |
-| Customer quotations + PDF delivery | `0036_whatsapp_quotations.sql` + `0037_quotation_briefs_and_deliveries.sql` | `configuration.quotations.enabled: true` (rules tab, section H) |
+| Customer quotations + PDF delivery | `0036_whatsapp_quotations.sql` + `0037_quotation_briefs_and_deliveries.sql` | `configuration.quotations.enabled: true` (rules tab, section I) |
 
 ### New schema objects in `0036` and `0037`
 
