@@ -27,6 +27,11 @@ PLATFORM_TABLES = (
     "catalogue_import_batches", "quotations", "quotation_lines", "whatsapp_webhook_events",
     "whatsapp_conversations", "saas_schema_migrations",
 )
+# Tables created after the hardening pass (0029/0030) are deliberately absent above: those
+# migrations replay a fixed table list, so they cannot clean a table that did not exist when
+# they were written. Every later migration must revoke its own Supabase default grants -- 0037
+# does exactly that for the two quotation tables, which is asserted by
+# DefaultPrivilegeTests.test_the_quotation_tables_are_reachable_only_by_app_backend.
 AUTHENTICATED_EXPECTED = {
     "tenants": {"SELECT"},
     "tenant_channels": {"SELECT"},
@@ -101,6 +106,43 @@ class DefaultPrivilegeTests(SaasDatabaseTestCase):
         with self.superuser() as cursor:
             self._ensure_service_role(cursor)
             self._assert_intended_privileges(cursor)
+
+    def test_the_quotation_tables_are_reachable_only_by_app_backend(self):
+        """0037 must not expose quotation data through a Supabase-exposed role.
+
+        These tables are newer than the hardening pass (0029/0030), which replays a fixed
+        table list and therefore cannot clean them: 0037 revokes the Supabase default grants
+        itself. Both halves matter -- the table grant, and the policy that filters the rows,
+        because RLS is what a table grant is useless without.
+        """
+        with self.superuser() as cursor:
+            self._ensure_service_role(cursor)
+            for table in ("quotation_briefs", "quotation_deliveries"):
+                for role in ("anon", "authenticated", "service_role"):
+                    with self.subTest(table=table, role=role):
+                        self.assertEqual(_granted(cursor, role, table), set())
+            cursor.execute(
+                "select tablename, policyname, roles::text from pg_policies "
+                "where schemaname = 'public' "
+                "and tablename in ('quotation_briefs', 'quotation_deliveries')"
+            )
+            rows = cursor.fetchall()
+        self.assertEqual(
+            sorted({tablename for tablename, _, _ in rows}),
+            ["quotation_briefs", "quotation_deliveries"],
+            "migration 0037 is not applied",
+        )
+        for tablename, policyname, roles in rows:
+            with self.subTest(table=tablename, policy=policyname):
+                self.assertEqual(
+                    {
+                        name.strip()
+                        for name in (roles or "").strip("{}").split(",")
+                        if name.strip()
+                    },
+                    {"app_backend"},
+                    f"{tablename}.{policyname} must target app_backend only",
+                )
 
     def _simulate_hosted_grants_then_harden(self, repeat):
         import psycopg  # noqa: PLC0415
