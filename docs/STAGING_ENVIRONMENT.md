@@ -109,8 +109,9 @@ would pass for **any** host. `SAAS_STAGING_DB_HOST` closes that gap — both DSN
 exact hostname, so a staging boot cannot point at the legacy staging instance, another tenant's
 database, or any other host by mistake. Comparing each DSN against the declared host also
 guarantees the two DSNs agree with one another. The reference check still guards `SUPABASE_URL`
-(Auth). `db/staging_preflight.py` reports a missing reference as a `WARN` (`project`) and any
-host problem as a `FAIL` (`db-host`).
+(Auth). `db/staging_preflight.py` reports a missing reference as a `WARN` (`project`), any host
+problem as a `FAIL` (`db-host`), and a DSN carrying a query string or fragment as a `FAIL`
+(`dsn-overrides`); the complete list of codes is in the table below.
 
 **Why a DSN may not carry a query string.** libpq reads connection parameters from the URI
 query string, so `?host=` and `?hostaddr=` redirect the connection to a different server (and
@@ -135,15 +136,58 @@ without them now fails the boot check with the missing table name instead of fai
 first customer quotation at runtime, so `0037` must be applied **before** the code that
 reads those tables is deployed.
 
-`python db/staging_preflight.py` applies the same rules offline and explains every finding:
+`python db/staging_preflight.py` applies the same rules offline and explains every finding at one
+of three levels:
 
 ```bash
-python db/staging_preflight.py --env-file .env.staging     # exit 0 = safe, 1 = refused
+python db/staging_preflight.py --env-file .env.staging     # exit 0 = safe, 1 = any FAIL
 python db/staging_preflight.py --json                      # machine-readable
 ```
 
-It opens no database connection and prints only roles, project references and variable
-names — never a host, password or token.
+**`FAIL` — the configuration must not be deployed; this is what sets exit code 1:**
+
+| Code | Condition |
+|---|---|
+| `environment` | `SAAS_ENVIRONMENT` is not `staging` |
+| `production-ref` | `SAAS_PRODUCTION_PROJECT_REF` is not set |
+| `dsn` | a required DSN (`SAAS_DATABASE_URL`, `SAAS_PLATFORM_DATABASE_URL`) is not set |
+| `privileged-role` | a DSN uses `service_role`, `postgres` or `supabase_admin` |
+| `role` | a DSN uses a role other than `app_backend` / `saas_platform_admin` |
+| `production-dsn` | a DSN resolves to the production project reference |
+| `production-supabase` | `SUPABASE_URL` resolves to the production project reference |
+| `split-project` | the two DSNs name different project references |
+| `db-host` | `SAAS_STAGING_DB_HOST` is not set, a DSN has no hostname, a DSN host differs from it, or the two DSNs use different hosts |
+| `dsn-overrides` | a DSN carries a query string or a URL fragment |
+| `whatsapp-send` | `WHATSAPP_SEND_ENABLED` is not set, or is not `0`/`1` |
+| `operator-dsn` | `SAAS_OPERATOR_DATABASE_URL` is present |
+| `dev-mode` | `PLATFORM_DEV_MODE` or `PLATFORM_INSECURE_COOKIES` is `1` |
+
+**`WARN` — reported, but the exit code stays 0:**
+
+| Code | Condition |
+|---|---|
+| `project` | a DSN names no Supabase project reference — **expected** for a Railway DSN |
+| `whatsapp-token` | sending is enabled but no `WHATSAPP_ACCESS_TOKEN_*` is configured, so every send will fail |
+| `whatsapp-token-origin` | sending is enabled and tokens exist — confirm each one belongs to a staging/test number |
+| `test-dsn` | `SAAS_TEST_DATABASE_URL` is set; that variable is for local/CI runs only |
+| `channels` | `PLATFORM_ALLOW_ACTIVE_CHANNELS=1`, which lets operators activate live channels |
+
+**`INFO` — context only:** `environment`, `production-ref`, `role`, `project`, `whatsapp-send`
+and `whatsapp-token`. An `INFO` finding reports the configuration as read; it establishes
+nothing about a remote database.
+
+It opens no database connection and prints only variable names, roles and project references —
+never a host, password, token or DSN. Only a `FAIL` sets exit code 1; a `WARN` never blocks a
+deploy. This is a **configuration shape** check: it cannot establish that a database is
+reachable, that it is the intended instance, that it is empty, or that production is excluded —
+in particular, while `SAAS_PRODUCTION_PROJECT_REF` is still a placeholder the
+`production-dsn`/`production-supabase` checks cannot fire, so a `PASS` says nothing about
+production isolation. The read-only identity check in §5.2 is the control that inspects the
+server.
+
+`PLATFORM_SESSION_MINUTES` and `PLATFORM_TRUSTED_PROXIES` are **not** validated here: their
+integer ranges (`1`–`720` and `0`–`5`) are enforced at runtime by `Settings.from_env()`, so a
+`FAIL`-free preflight says nothing about them.
 
 ## 5. Provisioning steps
 
@@ -186,14 +230,45 @@ database is private, the operator shell must run **inside** the staging project'
 Railway shell) or through a temporary TCP proxy that is removed immediately afterwards. The
 repository holds 37 migrations; `0037_quotation_briefs_and_deliveries.sql` is the newest and
 must be applied before the dashboard code boots. On a database that has never been migrated,
-`--status` prints `no migrations recorded yet` and lists every file as pending:
+`--status` prints `no migrations recorded yet` and lists **all 37** files as pending — the ledger
+table does not exist yet, and `--status` reports that state instead of failing with
+`UndefinedTable`:
 
 ```bash
 export OP='postgresql://postgres:<owner-pw>@<STAGING-DB-INTERNAL-HOST>:5432/railway'
-python db/run_migrations.py --database-url "$OP" --status   # expect 0035, 0036 and 0037 pending
-python db/run_migrations.py --database-url "$OP"            # applies 0035, 0036 and 0037
+python db/run_migrations.py --database-url "$OP" --status   # fresh database: all 37 pending
+python db/run_migrations.py --database-url "$OP"            # applies 0001 .. 0037
 python db/run_migrations.py --database-url "$OP" --status   # expect 37 applied, no mismatches
 ```
+
+Expecting only `0035`, `0036` and `0037` to be pending is correct **only** for a database that is
+already migrated through `0034`: those three are the migrations this feature adds, not the set a
+new database reports.
+
+**The runner temporarily changes role membership.** Before applying anything,
+`db/run_migrations.py:ensure_provisioner_access()` checks whether the operator login is a
+superuser. When it is not, it creates `saas_platform_provisioner` if absent (with the same
+attributes `0013` gives it) and grants the operator login membership of that role — on
+PostgreSQL 16+ as `grant saas_platform_provisioner to current_user with inherit true, set true`
+— because `ALTER FUNCTION … OWNER TO` and `CREATE OR REPLACE` on provisioner-owned functions
+require it. `release_provisioner_access()` revokes that membership from a `finally` block, so it
+is released on the normal path and when a migration raises.
+
+Confirm the release after the run:
+
+```sql
+select r.rolname as role, m.rolname as member
+  from pg_auth_members am
+  join pg_roles r on r.oid = am.roleid
+  join pg_roles m on m.oid = am.member
+ where r.rolname = 'saas_platform_provisioner';
+```
+
+Only memberships that existed before the run should remain — typically none. **The `finally`
+block cannot run if the process or the connection is terminated abnormally** (killed shell, lost
+connection), so the revocation is best-effort rather than guaranteed: any unexpected remaining
+membership must be investigated and revoked deliberately. Do not work around this by editing the
+migration runner; it is the supported path for a non-superuser on hosted PostgreSQL.
 
 `0036` is the committed variant A file (checksum `9dd2c780deaecfad`); it only adds the
 WhatsApp columns to `quotations`. The quotation tables themselves arrive in `0037`. Neither
@@ -207,7 +282,12 @@ non-loopback host; `--reset` drops the `public` and `app` schemas and is restric
 by the runner. Staging data is created through the dashboard as a synthetic tenant, never from a
 seed file.
 
-Confirm the ledger and the known checksums (`sha256(file)[:16]`):
+Confirm the ledger. The recorded value is `sha256(file)[:16]` computed **the way the runner
+computes it**: `db/run_migrations.py:_checksum()` hashes `path.read_text(encoding="utf-8")`,
+which normalizes CRLF to LF before hashing. Hashing the raw bytes on disk can therefore disagree
+with the ledger for a file whose working copy has CRLF endings — `0035` is such a file (raw bytes
+give `b825628e2e2ddc49`, the runner gives `06fac1777fa3caaa`). Use the runner's method, or trust
+the ledger query below, which stores exactly the runner's value:
 
 ```sql
 select version, checksum from public.saas_schema_migrations
@@ -220,6 +300,21 @@ select version, checksum from public.saas_schema_migrations
 select to_regclass('public.quotation_briefs'), to_regclass('public.quotation_deliveries');
 select relname, relrowsecurity, relforcerowsecurity from pg_class
  where oid in ('public.quotation_briefs'::regclass, 'public.quotation_deliveries'::regclass);
+```
+
+Cross-check the files themselves without touching a database — no connection and no credentials,
+only local reads:
+
+```bash
+python - <<'PY'
+import hashlib, pathlib
+for name in ("0035_menu_state_and_reply_correlation.sql",
+             "0036_whatsapp_quotations.sql",
+             "0037_quotation_briefs_and_deliveries.sql"):
+    path = pathlib.Path("db/migrations") / name
+    digest = hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    print(name, digest)
+PY
 ```
 
 `0035` adds only a nullable correlation column and two `conversations.menu_state*` columns,
@@ -241,6 +336,13 @@ applied:
 | --- | --- | --- | --- |
 | `app_backend` | `0002_roles.sql` | `NOLOGIN` (`NOBYPASSRLS`) | `LOGIN` **and** a password |
 | `saas_platform_admin` | `0013_phase1_security_hardening.sql` | `NOLOGIN NOINHERIT NOBYPASSRLS` | a password only — `0015_platform_provisioning_login.sql` already grants `LOGIN` |
+| `saas_platform_provisioner` | `0013_phase1_security_hardening.sql` | `NOLOGIN NOINHERIT NOBYPASSRLS` | **nothing** — it is not an application login |
+
+`saas_platform_provisioner` owns the `SECURITY DEFINER` platform functions
+(`0021_platform_provisioning.sql` alters their owner to it and grants `EXECUTE` to
+`saas_platform_admin`), and the migration runner borrows it through the temporary membership
+described in §5.3. Only the two application roles need logins: do not set an application password
+for `saas_platform_provisioner`.
 
 ```sql
 alter role app_backend         with login password '<strong-random-A>';
@@ -411,9 +513,11 @@ Still open:
 * **Supabase free-tier projects pause after a week of inactivity**, which would break staging
   sign-in. Either keep the Auth project exercised, or budget a paid plan if staging must be
   always available.
-* **PostgreSQL 17 is chosen deliberately.** The suite is proven on PostgreSQL 16 and 17 only;
-  moving staging to 18 requires re-running the migration and full-suite validation on an 18
-  instance first.
+* **PostgreSQL 17 is chosen deliberately, and is not yet verified by committed CI evidence.**
+  The committed CI workflow pins PostgreSQL 16 (`.github/workflows/saas-isolation.yml` uses
+  `image: postgres:16`), so the first staging migration run is also the first PostgreSQL 17 run
+  of this suite: record its outcome before treating 17 as verified. Moving staging to 18
+  requires re-running the migration and full-suite validation on an 18 instance first.
 * **The Railway CLI link is a foot-gun.** The working directory used for this project is linked
   to the *production* project. Always confirm the target with `railway status` before any
   Railway command, and never deploy from a production-linked directory.
