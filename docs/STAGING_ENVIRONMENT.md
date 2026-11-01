@@ -57,6 +57,7 @@ is the only supported way to reach the database without exposing it publicly.
 | `SAAS_STAGING_DB_HOST` | for staging | the **private hostname the staging database must use**; both DSNs are matched against it, case-insensitively |
 | `SAAS_DATABASE_URL` | yes | role `app_backend` on the **staging Railway database**, reached over its private internal hostname |
 | `SAAS_PLATFORM_DATABASE_URL` | yes | role `saas_platform_admin` on the **same** Railway instance, over the **same** internal hostname |
+| `SAAS_STARTUP_DATABASE_CHECKS` | staging only | `false` skips role/schema connection probes during process startup; default is `true`, and `false` is rejected outside staging |
 | `PLATFORM_SECRET_KEY` | yes | new random ≥32 chars, different from production |
 | `SUPABASE_URL` | yes | `https://<STAGING_AUTH_REF>.supabase.co` — the **Auth-only** staging project |
 | `SUPABASE_ANON_KEY` | yes | staging anon (public) key; `service_role`/`sb_secret_` keys are rejected |
@@ -135,14 +136,16 @@ values — appear in the message, and `db/staging_preflight.py` reports the same
 `FAIL` (`dsn-overrides`).
 
 The guard is **inert unless staging is declared**, so the existing production deployment
-(`SAAS_ENVIRONMENT` unset) keeps booting unchanged. The pre-existing checks still apply in
-both environments: dedicated roles only (no `postgres`/`service_role`), `https` Supabase URL,
-non-secret anon key, role verification, and the `REQUIRED_SCHEMA` check that now includes
-`public.handover_requests` (migration 0034) and the two quotation tables
-`public.quotation_briefs` / `public.quotation_deliveries` (migration 0037). A database
-without them now fails the boot check with the missing table name instead of failing the
-first customer quotation at runtime, so `0037` must be applied **before** the code that
-reads those tables is deployed.
+(`SAAS_ENVIRONMENT` unset) keeps booting unchanged. Dedicated-role checks (no
+`postgres`/`service_role`), the `https` Supabase URL and the non-secret anon key are always
+validated from configuration. The role and `REQUIRED_SCHEMA` database probes run at startup
+by default in both environments. `SAAS_STARTUP_DATABASE_CHECKS=false` is a staging-only
+opt-out for a deliberately database-disconnected initial process start; it does not disable
+database access by application routes, so database-backed features are not ready until an
+operator has provisioned and migrated the staging database and startup checks are re-enabled.
+With checks enabled, `REQUIRED_SCHEMA` includes `public.handover_requests` (migration 0034)
+and the two quotation tables `public.quotation_briefs` / `public.quotation_deliveries`
+(migration 0037); a database without them fails boot before those routes can serve requests.
 
 `python db/staging_preflight.py` applies the same rules offline and explains every finding at one
 of three levels:
@@ -396,6 +399,13 @@ deploying `sammaash/saas-project` from the **`staging`** branch → add the vari
 healthcheck path `/login` (no dedicated health endpoint exists) → deploy. It must sit in the same
 project **and the same environment** as the database, or the private DSNs will not resolve.
 
+For a deliberately database-disconnected initial process start,
+`SAAS_STARTUP_DATABASE_CHECKS=false` must be set on the staging application only. In this
+mode, `/login` verifies that the web process responds; it does not verify database readiness,
+and database-backed routes are not ready. Keep the staging service isolated from users until
+the staging database has been provisioned and migrated, then remove the opt-out and redeploy
+so the role and schema checks run.
+
 Boot log must show no `ConfigError`. `python db/staging_preflight.py` must print
 `STAGING PREFLIGHT: PASS` when run with the same variables.
 
@@ -538,4 +548,3 @@ Still open:
   to the *production* project. Always confirm the target with `railway status` before any
   Railway command, and never deploy from a production-linked directory.
 * This document deliberately contains no credentials, project references or tenant UUIDs.
-

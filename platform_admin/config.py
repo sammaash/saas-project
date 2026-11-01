@@ -1,6 +1,6 @@
 """Dashboard configuration, read from the server environment only.
 
-``Settings.from_env()`` validates everything at startup and refuses to start (fails
+``Settings.from_env()`` validates deployment configuration and refuses to start (fails
 closed) when required production configuration is missing or unsafe.
 """
 
@@ -284,6 +284,7 @@ class Settings:
     #: ``production`` unless ``SAAS_ENVIRONMENT`` declares otherwise. Only ``staging`` adds
     #: the isolation checks in :func:`_staging_guard`.
     environment: str = "production"
+    startup_database_checks: bool = True
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -314,6 +315,14 @@ class Settings:
         environment = _staging_guard(
             environ, environ["SAAS_DATABASE_URL"], environ["SAAS_PLATFORM_DATABASE_URL"]
         )
+        startup_database_checks = _strict_flag(
+            environ, "SAAS_STARTUP_DATABASE_CHECKS", default=True
+        )
+        if not startup_database_checks and environment != "staging":
+            raise ConfigError(
+                "SAAS_STARTUP_DATABASE_CHECKS may be false only when "
+                "SAAS_ENVIRONMENT=staging."
+            )
 
         try:
             session_minutes = int(environ.get("PLATFORM_SESSION_MINUTES", "60"))
@@ -348,6 +357,7 @@ class Settings:
                 environ, "MENU_SIMULATOR_ALLOW_REMOTE_DATABASE"
             ),
             environment=environment,
+            startup_database_checks=startup_database_checks,
         )
 
 
@@ -432,3 +442,11 @@ def verify_database_schema(settings: Settings) -> None:
             + ", ".join(missing)
             + ". Apply the pending migrations with db/run_migrations.py before starting."
         )
+
+
+def verify_startup_database(settings: Settings) -> None:
+    """Run database startup probes unless the staging-only opt-out is enabled."""
+    if not settings.startup_database_checks:
+        return
+    verify_database_roles(settings)
+    verify_database_schema(settings)

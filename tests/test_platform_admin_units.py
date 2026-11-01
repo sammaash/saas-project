@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
+import runpy
 import time
 import unittest
 import uuid
@@ -23,6 +25,7 @@ from platform_admin.config import (
     missing_schema_objects,
     project_refs,
     verify_database_schema,
+    verify_startup_database,
 )
 from platform_admin.services import audit
 from platform_admin.services import validation as v
@@ -542,6 +545,61 @@ class StagingEnvironmentGuardTests(unittest.TestCase):
         )
         self.assertEqual(settings.environment, "production")
         self.assertFalse(settings.whatsapp_send_enabled)
+
+    def test_database_startup_checks_can_only_be_disabled_for_staging(self):
+        self.assertTrue(Settings.from_env(self.staging_env()).startup_database_checks)
+        settings = Settings.from_env(
+            self.staging_env(SAAS_STARTUP_DATABASE_CHECKS="false")
+        )
+        self.assertFalse(settings.startup_database_checks)
+
+        with patch("platform_admin.config.verify_database_roles") as verify_roles, patch(
+            "platform_admin.config.verify_database_schema"
+        ) as verify_schema:
+            verify_startup_database(settings)
+        verify_roles.assert_not_called()
+        verify_schema.assert_not_called()
+
+        with patch("platform_admin.config.verify_database_roles") as verify_roles, patch(
+            "platform_admin.config.verify_database_schema"
+        ) as verify_schema:
+            verify_startup_database(Settings.from_env(self.staging_env()))
+        verify_roles.assert_called_once()
+        verify_schema.assert_called_once()
+
+        with self.assertRaisesRegex(ConfigError, "only when SAAS_ENVIRONMENT=staging"):
+            Settings.from_env(
+                self.staging_env(
+                    SAAS_ENVIRONMENT="production",
+                    SAAS_PRODUCTION_PROJECT_REF=None,
+                    SUPABASE_URL=f"https://{self.PRODUCTION_REF}.supabase.co",
+                    SAAS_DATABASE_URL=self._pooled("app_backend", self.PRODUCTION_REF),
+                    SAAS_PLATFORM_DATABASE_URL=self._pooled(
+                        "saas_platform_admin", self.PRODUCTION_REF
+                    ),
+                    SAAS_STARTUP_DATABASE_CHECKS="false",
+                )
+            )
+
+    def test_database_startup_check_setting_is_strict(self):
+        with self.assertRaisesRegex(ConfigError, "SAAS_STARTUP_DATABASE_CHECKS"):
+            Settings.from_env(self.staging_env(SAAS_STARTUP_DATABASE_CHECKS="maybe"))
+
+    def test_wsgi_startup_does_not_connect_when_staging_checks_are_disabled(self):
+        environment = self.staging_env(SAAS_STARTUP_DATABASE_CHECKS="false")
+        with patch.dict(os.environ, environment, clear=True):
+            with patch(
+                "saas.db.connect", side_effect=AssertionError("database connect attempted")
+            ) as app_connect, patch(
+                "saas.db.connect_platform",
+                side_effect=AssertionError("platform database connect attempted"),
+            ) as platform_connect:
+                runpy.run_path(
+                    str(REPO / "platform_admin" / "railway_app.py"),
+                    run_name="railway_startup_test",
+                )
+        app_connect.assert_not_called()
+        platform_connect.assert_not_called()
 
     def test_an_explicit_production_environment_skips_the_staging_checks(self):
         settings = Settings.from_env(
