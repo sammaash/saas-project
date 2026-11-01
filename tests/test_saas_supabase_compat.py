@@ -306,6 +306,8 @@ class _Cursor:
             self.row = (1,) if self.conn.role_exists else None
         elif "pg_has_role" in sql:
             self.row = (self.conn.has_membership,)
+        elif "current_database()" in sql:
+            self.row = ("railway",)
 
     def fetchone(self):
         return self.row
@@ -378,7 +380,13 @@ class ProvisionerAccessTests(unittest.TestCase):
         fake_psycopg = SimpleNamespace(connect=lambda url: conn)
         with mock.patch.object(runner, "_psycopg", return_value=fake_psycopg), \
                 mock.patch.object(runner, "apply_migrations", side_effect=apply_side_effect):
-            return runner.main(["--database-url", "postgresql://u@db.example.com/postgres", *extra])
+            return runner.main(
+                [
+                    "--database-url",
+                    "postgresql://u@postgres.railway.internal:5432/railway",
+                    *extra,
+                ]
+            )
 
     def test_membership_is_released_even_when_a_migration_fails(self):
         conn = _Conn()

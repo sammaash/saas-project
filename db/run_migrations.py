@@ -26,6 +26,12 @@ MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
 LOCAL_DIR = REPO_ROOT / "db" / "local"
 SEEDS_DIR = REPO_ROOT / "db" / "seeds"
 
+# Staging target configuration - explicitly configured expected values
+# These should be set according the specific Railway staging project setup
+# Hostname must match the exact Railway internal service hostname
+EXPECTED_STAGING_HOSTNAME = "postgres.railway.internal"
+# Database name must be exactly "railway" - do not accept "postgres" as default
+EXPECTED_STAGING_DATABASE = "railway"
 # Tracks which migrations have been applied. Versioned by file name so ordering is
 # reproducible and a modified migration is detected instead of silently ignored.
 LEDGER_SQL = """
@@ -38,6 +44,83 @@ create table if not exists public.saas_schema_migrations (
 
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Explicitly approved disposable database names for loopback hosts.
+# These are the only database names permitted for localhost/127.0.0.1/::1 targets.
+# Do not add arbitrary local database names - they will be rejected.
+APPROVED_DISPOSABLE_DATABASE_NAMES = frozenset({"saas_platform"})
+
+
+def parse_database_url(database_url: str) -> dict | None:
+    """
+    Parse and validate a PostgreSQL connection URL.
+
+    Returns dict with validated components, or None if URL is invalid.
+    Validates host and database names for recognized targets, requires port 5432
+    for staging, and rejects malformed URLs or connection-target overrides.
+
+    Does NOT connect to the database; purely string analysis.
+    """
+    try:
+        parts = urlsplit(database_url)
+        hostname = parts.hostname
+        port = parts.port
+    except (ValueError, TypeError):
+        return None
+
+    # Validate scheme
+    if parts.scheme not in ("postgresql", "postgres"):
+        return None
+
+    # Extract and validate hostname
+    if not hostname:
+        return None
+    hostname = hostname.lower()
+
+    # Validate hostname
+    # Accept exact expected staging hostname, or local/loopback hostnames
+    # Local URLs are accepted only for the explicitly approved disposable database.
+    if hostname != EXPECTED_STAGING_HOSTNAME and hostname not in LOOPBACK_HOSTS:
+        return None
+    if hostname == EXPECTED_STAGING_HOSTNAME and port != 5432:
+        return None
+    if hostname == EXPECTED_STAGING_HOSTNAME and os.environ.get("PGHOSTADDR"):
+        return None
+
+    path_segments = [segment for segment in parts.path.split("/") if segment]
+    if len(path_segments) != 1:
+        return None
+    path_database = path_segments[0]
+
+    if hostname in LOOPBACK_HOSTS:
+        if path_database not in APPROVED_DISPOSABLE_DATABASE_NAMES:
+            return None
+    elif path_database != EXPECTED_STAGING_DATABASE:
+        return None
+
+    redirecting_parameters = {"host", "hostaddr", "port", "dbname", "service"}
+    query = parse_qs(parts.query, keep_blank_values=True)
+    if redirecting_parameters.intersection(key.lower() for key in query):
+        return None
+    if parts.fragment or "supabase" in database_url.lower():
+        return None
+
+    return {
+        "scheme": parts.scheme,
+        "hostname": hostname,
+        "port": port,
+        "database": path_database,
+        "query": parts.query,
+        "fragment": parts.fragment,
+    }
+
+
+def is_local_target(url: str, environ: dict[str, str] | None = None) -> bool:
+    """True only when every possible connection target is loopback or a unix socket."""
+    hosts = database_hosts(url, environ)
+    if hosts is None:
+        return False
+    return all(host.lower() in LOOPBACK_HOSTS or host.startswith("/") for host in hosts)
 
 
 def database_hosts(url: str, environ: dict[str, str] | None = None) -> list[str] | None:
@@ -56,6 +139,7 @@ def database_hosts(url: str, environ: dict[str, str] | None = None) -> list[str]
         hosts += [item for value in params.get(key, []) for item in value.split(",")]
     if not hosts:
         hosts += [item for item in environ.get("PGHOST", "").split(",") if item]
+    if "hostaddr" not in params:
         hosts += [item for item in environ.get("PGHOSTADDR", "").split(",") if item]
     return [host.strip() for host in hosts]
 
@@ -308,6 +392,24 @@ def main(argv: list[str] | None = None) -> int:
     if not args.database_url:
         parser.error("set SAAS_DATABASE_URL or pass --database-url")
 
+    # Validate every target before importing psycopg or opening a connection.
+    if is_supabase_target(args.database_url):
+        parser.error("Supabase database target is not supported")
+
+    parsed_url = parse_database_url(args.database_url)
+    if parsed_url is None:
+        parser.error(
+            "database target is not an approved loopback disposable database "
+            "or the expected staging database"
+        )
+    hostname = parsed_url["hostname"]
+    if hostname in LOOPBACK_HOSTS:
+        if not is_local_target(args.database_url):
+            parser.error("loopback database URL resolves to a non-loopback host")
+    elif not validate_staging_target(parsed_url):
+        parser.error("database target does not match the expected staging target")
+
+    # === PER-FLAG CHECKS FOLLOWING STAGING VALIDATION ===
     dev_data = args.include_local or args.seed
     if dev_data:
         if is_supabase_target(args.database_url):
@@ -326,18 +428,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset:
         try:
             database_url = urlsplit(args.database_url)
-            hostname = database_url.hostname
+            reset_hostname = database_url.hostname
         except ValueError:
-            hostname = None
-        if hostname is None:
+            reset_hostname = None
+        if reset_hostname is None:
             parser.error("--reset requires a valid localhost database URL")
         if database_url.query or database_url.fragment:
             parser.error("--reset refuses URL parameters or fragments that could override the host")
-        if "supabase" in hostname.lower():
+        if "supabase" in (reset_hostname or "").lower():
             parser.error("--reset is forbidden for Supabase URLs")
-        if hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        if (reset_hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
             parser.error("--reset is restricted to localhost/loopback database URLs")
 
+    # Now proceed to connect – staging target has already been validated
     psycopg = _psycopg()
 
     with psycopg.connect(args.database_url) as conn:
@@ -354,6 +457,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.status:
             print_status(conn)
             return 0
+
+        # Recheck the staging identity immediately before migrations; local targets
+        # were restricted to the disposable-name allowlist before connecting.
+        if hostname not in LOOPBACK_HOSTS and not validate_staging_target(parsed_url):
+            print("FAIL: Staging target validation failed - blocking migration")
+            sys.exit(1)
+
+        # Check runtime database identity (fail-closed): verify we're connected to the intended database
+        if not check_runtime_database_identity(conn, parsed_url["database"]):
+            print("FAIL: Runtime database identity check failed - blocking migration")
+            sys.exit(1)
 
         granted = ensure_provisioner_access(conn)
         try:
@@ -377,5 +491,81 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def validate_staging_target(parsed_url: dict | None) -> bool:
+    """
+    Validate that a parsed database URL represents the expected staging target.
+
+    Performs independent checks for:
+    - Hostname matches expected staging service hostname
+    - Database name is exactly the expected staging database
+    - No production indicators that can be verified
+    - Supabase is not the target
+
+    Returns True only when ALL checks pass. Blocks execution if any check fails.
+    """
+    if parsed_url is None:
+        print("FAIL: Could not parse or validate database URL")
+        return False
+
+    hostname = parsed_url["hostname"]
+    database = parsed_url["database"]
+
+    # Check 1: Hostname must match expected staging service hostname exactly
+    # Do not rely on hostname suffix alone or absence of "prod" words
+    expected_hostname = EXPECTED_STAGING_HOSTNAME
+    if hostname != expected_hostname:
+        print(f"FAIL: Hostname '{hostname}' does not match expected staging hostname '{expected_hostname}'")
+        print("Do not rely on hostname suffix alone or absence of 'prod' words as proof of staging identity")
+        return False
+
+    # Check 2: Database name must be exactly the expected staging database
+    # Do not accept "postgres" as alternative without independent evidence
+    if database != EXPECTED_STAGING_DATABASE:
+        print(f"FAIL: Database name '{database}' does not match expected staging database '{EXPECTED_STAGING_DATABASE}'")
+        print("Do not accept 'postgres' as default without independent evidence that it is the intended database")
+        return False
+
+    # All checks passed
+    print(f"PASS: Staging target validation successful")
+    print(f"  Host: {hostname}")
+    print(f"  Database: {database}")
+    return True
+
+
+def check_runtime_database_identity(conn, expected_database: str) -> bool:
+    """
+    Runtime identity check for the connected database.
+
+    This is a separate runtime check that must fail closed if the actual
+    database identity cannot be verified. It operates on an active database
+    connection and checks the database's identity metadata.
+
+    Returns True only when database identity can be positively verified.
+    Returns False and blocks execution if identity cannot be verified.
+
+    Note: This check requires psycopg connection and should be called after
+    establishing the connection, before applying migrations.
+    """
+    try:
+        with conn.cursor() as cursor:
+            # Check the database name by querying the current database
+            cursor.execute("SELECT current_database()")
+            current_db = cursor.fetchone()[0]
+
+            if current_db != expected_database:
+                print(
+                    f"FAIL: Current database '{current_db}' does not match "
+                    f"the requested database '{expected_database}'"
+                )
+                print("Cannot verify database identity - blocking for safety")
+                return False
+
+            # If we get here, basic identity checks passed
+            print(f"PASS: Runtime database identity check passed (database='{current_db}')")
+            return True
+
+    except Exception as e:
+        # If any error occurs during the identity check, fail closed
+        print(f"FAIL: Runtime database identity check error: {e}")
+        print("Cannot verify database identity - blocking for safety")
+        return False

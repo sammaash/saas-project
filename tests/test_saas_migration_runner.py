@@ -6,6 +6,7 @@ import contextlib
 import io
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,14 @@ except ImportError:
         require_test_database_url,
         test_database_url,
     )
+
+
+@contextlib.contextmanager
+def _fake_psycopg():
+    """Provide a fake lazy-imported driver so tests can prove whether connect is reached."""
+    driver = mock.MagicMock()
+    with mock.patch.dict(sys.modules, {"psycopg": driver}):
+        yield driver
 
 
 class ResetSafetyTests(unittest.TestCase):
@@ -83,6 +92,11 @@ class DevelopmentDataGuardTests(unittest.TestCase):
             main(["--database-url", url, *flags])
         self.assertEqual(caught.exception.code, 2)
 
+    def _refused_before_connect(self, url, *flags):
+        with _fake_psycopg() as driver:
+            self._refused(url, *flags)
+        driver.connect.assert_not_called()
+
     def test_local_and_seed_are_refused_for_remote_hosts(self):
         for flag in ("--include-local", "--seed"):
             with self.subTest(flag=flag):
@@ -101,31 +115,52 @@ class DevelopmentDataGuardTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PGHOST": "production.example.com"}):
             self._refused("postgresql:///platform", "--include-local")
 
-    def test_override_lets_a_non_local_host_through_the_guard(self):
+    def test_pghostaddr_environment_cannot_redirect_a_loopback_url(self):
+        with mock.patch.dict(os.environ, {"PGHOSTADDR": "10.1.2.3"}):
+            self._refused_before_connect(
+                "postgresql://postgres@localhost/saas_platform"
+            )
+
+    def test_override_does_not_let_an_unapproved_remote_through_the_guard(self):
+        """--allow-nonlocal-dev should NOT bypass the staging-target guard.
+        """
+        for flags in (
+            (),
+            ("--allow-nonlocal-dev",),
+            ("--include-local", "--allow-nonlocal-dev"),
+            ("--seed", "--allow-nonlocal-dev"),
+        ):
+            with self.subTest(flags=flags):
+                self._refused_before_connect(self.REMOTE, *flags)
+
+    def test_arbitrary_loopback_database_names_are_rejected_before_connect(self):
+        for host in ("localhost", "127.0.0.1", "[::1]"):
+            for database in ("platform", "postgres"):
+                with self.subTest(host=host, database=database):
+                    self._refused_before_connect(
+                        f"postgresql://postgres@{host}/{database}"
+                    )
+
+    def test_approved_loopback_database_reaches_connect_without_override(self):
         class Reached(Exception):
             pass
 
-        with mock.patch("db.run_migrations._psycopg", side_effect=Reached):
-            with self.assertRaises(Reached):
-                main(["--database-url", self.REMOTE, "--include-local", "--allow-nonlocal-dev"])
-
-    def test_loopback_hosts_pass_the_guard_without_an_override(self):
-        class Reached(Exception):
-            pass
-
-        for url in ("postgresql://postgres@localhost/platform", "postgresql://postgres@127.0.0.1:5433/platform",
-                    "postgresql://postgres@[::1]/platform"):
-            with self.subTest(url=url), mock.patch("db.run_migrations._psycopg", side_effect=Reached):
+        urls = (
+            "postgresql://postgres@localhost/saas_platform",
+            "postgresql://postgres@127.0.0.1:5433/saas_platform",
+            "postgresql://postgres@[::1]/saas_platform",
+        )
+        for url in urls:
+            with self.subTest(url=url), _fake_psycopg() as driver:
+                driver.connect.side_effect = Reached
                 with self.assertRaises(Reached):
-                    main(["--database-url", url, "--include-local", "--seed"])
+                    main(["--database-url", url, "--status"])
+                driver.connect.assert_called_once_with(url)
 
-    def test_plain_migrations_are_not_blocked_on_remote_hosts(self):
-        class Reached(Exception):
-            pass
-
-        with mock.patch("db.run_migrations._psycopg", side_effect=Reached):
-            with self.assertRaises(Reached):
-                main(["--database-url", self.REMOTE])
+    def test_plain_migrations_are_blocked_on_unapproved_remote_hosts(self):
+        for flags in ((), ("--include-local",), ("--seed",), ("--status",)):
+            with self.subTest(flags=flags):
+                self._refused_before_connect(self.REMOTE, *flags)
 
     def test_is_local_target_classification(self):
         local = ("postgresql://u@localhost/db", "postgresql://u@127.0.0.1/db", "postgresql://u@[::1]/db",
@@ -339,6 +374,239 @@ class ZeroThirtySevenGuardTests(SaasDatabaseTestCase):
                     (MIGRATION_0037,),
                 )
                 self.assertEqual(cursor.fetchone()[0], 0, "a refused migration was recorded")
+
+
+class StagingTargetValidationTests(unittest.TestCase):
+    """Tests for the fail-closed staging target validation guard."""
+
+    def test_valid_staging_target_accepts(self):
+        """A valid Railway staging target should pass validation."""
+        staging_url = "postgresql://app_backend:password@postgres.railway.internal:5432/railway"
+        parsed = migration_runner.parse_database_url(staging_url)
+        self.assertIsNotNone(parsed)
+        self.assertTrue(migration_runner.validate_staging_target(parsed))
+
+    def test_production_hostname_rejected(self):
+        """Production hostnames should be rejected."""
+        prod_url = "postgresql://app_backend:password@prod-db.example.com:5432/production"
+        parsed = migration_runner.parse_database_url(prod_url)
+        self.assertIsNone(parsed)
+
+    def test_supabase_target_rejected(self):
+        """Supabase URLs should be rejected by parse_database_url."""
+        supabase_url = "postgresql://postgres:secret@db.example.supabase.co/postgres"
+        parsed = migration_runner.parse_database_url(supabase_url)
+        self.assertIsNone(parsed)
+
+    def test_wrong_database_name_rejected(self):
+        """Non-Railway database names should be rejected."""
+        wrong_url = "postgresql://app_backend:password@postgres.railway.internal:5432/wrongdb"
+        parsed = migration_runner.parse_database_url(wrong_url)
+        self.assertIsNone(parsed)
+
+    def test_localhost_target_rejected(self):
+        """Localhost targets should be rejected for staging migrations."""
+        local_url = "postgresql://app_backend:password@localhost:5432/railway"
+        parsed = migration_runner.parse_database_url(local_url)
+        self.assertIsNone(parsed)
+
+    def test_invalid_scheme_rejected(self):
+        """Invalid schemes should be rejected."""
+        invalid_url = "mysql://app_backend:password@postgres.railway.internal:5432/railway"
+        parsed = migration_runner.parse_database_url(invalid_url)
+        self.assertIsNone(parsed)
+
+    def test_missing_port_rejected(self):
+        """Missing port should be rejected."""
+        no_port_url = "postgresql://app_backend:password@postgres.railway.internal/railway"
+        parsed = migration_runner.parse_database_url(no_port_url)
+        self.assertIsNone(parsed)
+
+    def test_wrong_port_rejected(self):
+        """Wrong port should be rejected."""
+        wrong_port_url = "postgresql://app_backend:password@postgres.railway.internal:5433/railway"
+        parsed = migration_runner.parse_database_url(wrong_port_url)
+        self.assertIsNone(parsed)
+
+
+class AlternativeGuardDesignTests(unittest.TestCase):
+    """Additional tests exploring guard design edge cases."""
+
+    def test_hostname_vs_suffix_checking(self):
+        """Ensure guard does NOT rely on hostname suffix alone."""
+        url = "postgresql://user:pass@random-service.railway.internal:5432/railway"
+        parsed = migration_runner.parse_database_url(url)
+        self.assertIsNone(parsed)
+
+    def test_database_name_independence_from_postgres(self):
+        """Ensure 'postgres' database name is not accepted as default."""
+        postgres_db_url = "postgresql://user:pass@postgres.railway.internal:5432/postgres"
+        parsed = migration_runner.parse_database_url(postgres_db_url)
+        self.assertIsNone(parsed)
+
+    def test_production_indicators_in_path(self):
+        """Production indicators in the path should not be accepted."""
+        prod_path_url = "postgresql://user:pass@postgres.railway.internal:5432/production"
+        parsed = migration_runner.parse_database_url(prod_path_url)
+        self.assertIsNone(parsed)
+
+
+class StagingTargetGuardTests(unittest.TestCase):
+    """Tests for the staging target guard that applies to ALL database operations."""
+
+    REMOTE = "postgresql://postgres:secret@production.example.com/platform"
+    SUPABASE = "postgresql://postgres:secret@db.abcdef.supabase.co/postgres"
+    VALID_STAGING = "postgresql://app_backend:password@postgres.railway.internal:5432/railway"
+    LOCALHOST = "postgresql://postgres@localhost/platform"
+    LOOPBACK_127 = "postgresql://postgres@127.0.0.1/platform"
+    LOOPBACK_IPV6 = "postgresql://postgres@[::1]/platform"
+
+    def _refused(self, url, *flags):
+        with self.assertRaises(SystemExit) as caught:
+            main(["--database-url", url, *flags])
+        self.assertEqual(caught.exception.code, 2)
+
+    def _accepted(self, url, *flags):
+        try:
+            main(["--database-url", url, *flags])
+            return True
+        except SystemExit:
+            return False
+
+    def test_status_with_unapproved_remote_is_blocked(self):
+        """--status should block unapproved remote URLs (not just ordinary migrations)."""
+        # Without dev flags, unapproved remote should be blocked
+        self._refused(self.REMOTE, "--status")
+
+        # With --include-local, unapproved remote should still be blocked
+        self._refused(self.REMOTE, "--include-local", "--status")
+
+        # With --seed, unapproved remote should still be blocked
+        self._refused(self.REMOTE, "--seed", "--status")
+
+    def test_allow_nonlocal_dev_does_not_bypass_staging_target_guard(self):
+        """--allow-nonlocal-dev should NOT bypass the staging-target guard."""
+        # --allow-nonlocal-dev alone should not let unapproved remote through
+        self._refused(self.REMOTE, "--allow-nonlocal-dev")
+
+        # --allow-nonlocal-dev with --include-local should not let unapproved remote through
+        self._refused(self.REMOTE, "--include-local", "--allow-nonlocal-dev")
+
+        # --allow-nonlocal-dev with --seed should not let unapproved remote through
+        self._refused(self.REMOTE, "--seed", "--allow-nonlocal-dev")
+
+    def test_loopback_hosts_accepted_with_status(self):
+        """Loopback hosts with approved disposable database names are accepted with --status.
+
+        Uses mocked connection - no PostgreSQL server or DNS resolution required.
+        Loopback hosts are authorized against the explicit disposable-database allowlist
+        before the mocked connection is reached.
+        """
+        from db.run_migrations import LOOPBACK_HOSTS
+
+        # Test that loopback hostnames are accepted (preflight validation passes)
+        # without requiring a real database connection
+        loopback_urls = [
+            "postgresql://postgres@localhost:5432/saas_platform",
+            "postgresql://postgres@127.0.0.1:5432/saas_platform",
+            "postgresql://postgres@[::1]:5432/saas_platform",
+        ]
+
+        class Reached(Exception):
+            pass
+
+        for db_url in loopback_urls:
+            with self.subTest(url=db_url):
+                parts = urlsplit(db_url)
+                hostname = parts.hostname
+                self.assertIn(hostname, LOOPBACK_HOSTS,
+                              f"Hostname {hostname} should be a recognized loopback address")
+                with _fake_psycopg() as driver:
+                    driver.connect.side_effect = Reached
+                    with self.assertRaises(Reached):
+                        main(["--database-url", db_url, "--status"])
+                driver.connect.assert_called_once_with(db_url)
+
+    def test_valid_staging_target_accepted_with_status(self):
+        """Valid staging target should be accepted with --status (mocked connection).
+
+        Uses mocked connection - no DNS resolution or real server required.
+        Verifies the staging target URL components (postgres.railway.internal / railway)
+        are validated before psycopg.connect() is called.
+        """
+        from db.run_migrations import EXPECTED_STAGING_HOSTNAME, EXPECTED_STAGING_DATABASE
+
+        # Parse the valid staging URL and verify components
+        parsed = migration_runner.parse_database_url(self.VALID_STAGING)
+        self.assertIsNotNone(parsed, "Valid staging URL should parse successfully")
+
+        # Hostname should match the expected staging hostname
+        self.assertEqual(parsed["hostname"], EXPECTED_STAGING_HOSTNAME,
+                         f"Hostname should be {EXPECTED_STAGING_HOSTNAME}")
+
+        # Database name should be the expected staging database
+        self.assertEqual(parsed["database"], EXPECTED_STAGING_DATABASE,
+                         f"Database name should be {EXPECTED_STAGING_DATABASE}")
+
+    def test_valid_staging_target_reaches_connect_with_fake_driver(self):
+        class Reached(Exception):
+            pass
+
+        with _fake_psycopg() as driver:
+            driver.connect.side_effect = Reached
+            with self.assertRaises(Reached):
+                main(["--database-url", self.VALID_STAGING, "--status"])
+        driver.connect.assert_called_once_with(self.VALID_STAGING)
+
+    def test_pghostaddr_cannot_redirect_the_staging_target(self):
+        with mock.patch.dict(os.environ, {"PGHOSTADDR": "10.1.2.3"}):
+            with _fake_psycopg() as driver:
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--database-url", self.VALID_STAGING, "--status"])
+            self.assertEqual(caught.exception.code, 2)
+        driver.connect.assert_not_called()
+
+    def test_override_allows_dev_data_on_the_valid_staging_target(self):
+        class Reached(Exception):
+            pass
+
+        with _fake_psycopg() as driver:
+            driver.connect.side_effect = Reached
+            with self.assertRaises(Reached):
+                main(
+                    [
+                        "--database-url",
+                        self.VALID_STAGING,
+                        "--include-local",
+                        "--allow-nonlocal-dev",
+                    ]
+                )
+        driver.connect.assert_called_once_with(self.VALID_STAGING)
+
+    def test_runtime_identity_accepts_only_approved_database_names(self):
+        for current_database, expected_database, expected in (
+            ("railway", "railway", True),
+            ("saas_platform", "saas_platform", True),
+            ("railway", "saas_platform", False),
+            ("saas_platform", "railway", False),
+            ("other_database", "railway", False),
+        ):
+            with self.subTest(
+                current_database=current_database, expected_database=expected_database
+            ):
+                connection = mock.MagicMock()
+                cursor = connection.cursor.return_value.__enter__.return_value
+                cursor.fetchone.return_value = (current_database,)
+                self.assertEqual(
+                    migration_runner.check_runtime_database_identity(
+                        connection, expected_database
+                    ),
+                    expected,
+                )
+
+    def test_supabase_blocked_with_status_and_override(self):
+        """Supabase should be blocked with --status and --allow-nonlocal-dev."""
+        self._refused(self.SUPABASE, "--status", "--allow-nonlocal-dev")
 
 
 if __name__ == "__main__":
