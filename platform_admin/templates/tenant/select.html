@@ -1,0 +1,27 @@
+{% extends "tenant/base.html" %}
+{% block title %}Choose a tenant - Tenant Portal{% endblock %}
+{% block content %}
+{% from "_macros.html" import csrf_field %}
+<h1>Choose a tenant</h1>
+<p class="muted">You have access to {{ memberships|length }} tenants.</p>
+<div class="card">
+  <table>
+    <thead><tr><th>Tenant</th><th>Role</th><th></th></tr></thead>
+    <tbody>
+      {% for membership in memberships %}
+      <tr>
+        <td>{{ membership.tenant_id }}</td>
+        <td><span class="badge active">{{ membership.role }}</span></td>
+        <td>
+          <form method="post" action="{{ url_for('tenant_auth.select_tenant_submit') }}" class="inline">
+            {{ csrf_field() }}
+            <input type="hidden" name="tenant_id" value="{{ membership.tenant_id }}">
+            <button type="submit">Open</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

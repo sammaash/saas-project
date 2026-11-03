@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}Tenant Portal{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ url_for('tenant_dashboard.home') }}">Tenant Portal</a>
+  {% if session.get('t_user_id') %}
+  <nav>
+    {% if g.get('tenant_id') %}
+    <a href="{{ url_for('tenant_dashboard.tenant_home', tenant_id=g.tenant_id) }}">Overview</a>
+    <a href="{{ url_for('tenant_dashboard.catalogue', tenant_id=g.tenant_id) }}">Catalogue</a>
+    <a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id) }}">Enquiries</a>
+    <a href="{{ url_for('tenant_dashboard.quotations', tenant_id=g.tenant_id) }}">Quotations</a>
+    <a href="{{ url_for('tenant_dashboard.handovers', tenant_id=g.tenant_id) }}">Handovers</a>
+    <a href="{{ url_for('tenant_auth.select_tenant') }}">Switch tenant</a>
+    {% else %}
+    <a href="{{ url_for('tenant_dashboard.home') }}">My tenants</a>
+    {% endif %}
+  </nav>
+  <form method="post" action="{{ url_for('tenant_auth.logout') }}" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="link">Sign out</button>
+  </form>
+  {% endif %}
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

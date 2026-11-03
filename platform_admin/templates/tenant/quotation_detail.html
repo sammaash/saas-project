@@ -1,0 +1,27 @@
+{% extends "tenant/base.html" %}
+{% block title %}{{ quotation.quotation_number }} - Tenant Portal{% endblock %}
+{% block content %}
+<h1>{{ quotation.quotation_number }} <span class="badge">{{ quotation.status }}</span></h1>
+<p class="muted">{{ quotation.customer_name }}{% if quotation.customer_contact %} · {{ quotation.customer_contact }}{% endif %}</p>
+<div class="card">
+  <p>Issued {{ quotation.issue_date }} · Expires {{ quotation.expiry_date or '—' }}</p>
+  <table>
+    <thead><tr><th>SKU</th><th>Description</th><th>Qty</th><th>Unit price</th><th>Subtotal</th></tr></thead>
+    <tbody>
+      {% for line in quotation.lines %}
+      <tr>
+        <td>{{ line.sku or '—' }}</td>
+        <td>{{ line.description }}</td>
+        <td>{{ line.quantity }}</td>
+        <td>{{ line.unit_price }}</td>
+        <td>{{ line.subtotal }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p>Subtotal: {{ quotation.subtotal }} {{ quotation.currency }} ·
+     Tax: {{ quotation.tax_amount }} · <strong>Total: {{ quotation.total }} {{ quotation.currency }}</strong></p>
+  {% if quotation.terms %}<p class="muted">{{ quotation.terms }}</p>{% endif %}
+</div>
+<p><a href="{{ url_for('tenant_dashboard.quotations', tenant_id=g.tenant_id) }}">Back to quotations</a></p>
+{% endblock %}

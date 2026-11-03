@@ -1,0 +1,30 @@
+{% extends "tenant/base.html" %}
+{% block title %}{{ profile.tenant.name }} - Tenant Portal{% endblock %}
+{% block content %}
+<h1>{{ profile.tenant.name }} <span class="badge {{ profile.tenant.status }}">{{ profile.tenant.status }}</span></h1>
+<p class="muted">{{ profile.tenant.slug }}</p>
+<p class="muted">Signed in as {{ g.tenant_email }} ({{ g.tenant_role }})</p>
+<div class="card">
+  <h2>Handover requests</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+      {% for status, count in summary.items() %}
+      <tr><td>{{ status }}</td><td>{{ count }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="card">
+  <h2>Views</h2>
+  <nav class="tabs">
+    <a href="{{ url_for('tenant_dashboard.catalogue', tenant_id=g.tenant_id) }}">Catalogue</a>
+    <a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id) }}">Enquiries</a>
+    <a href="{{ url_for('tenant_dashboard.quotations', tenant_id=g.tenant_id) }}">Quotations</a>
+    <a href="{{ url_for('tenant_dashboard.handovers', tenant_id=g.tenant_id) }}">Handovers</a>
+    {% if g.tenant_role == 'owner' %}
+    <a href="{{ url_for('tenant_dashboard.settings', tenant_id=g.tenant_id) }}">Settings</a>
+    {% endif %}
+  </nav>
+</div>
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "tenant/base.html" %}
+{% block title %}Settings - Tenant Portal{% endblock %}
+{% block content %}
+<h1>{{ profile.tenant.name }} — settings</h1>
+<p class="muted">Owner view · read-only</p>
+<div class="card">
+  <table>
+    <tbody>
+      <tr><th>Slug</th><td>{{ profile.tenant.slug }}</td></tr>
+      <tr><th>Status</th><td><span class="badge {{ profile.tenant.status }}">{{ profile.tenant.status }}</span></td></tr>
+      <tr><th>Timezone</th><td>{{ profile.settings.timezone or '—' }}</td></tr>
+      <tr><th>Currency</th><td>{{ profile.settings.currency or '—' }}</td></tr>
+    </tbody>
+  </table>
+</div>
+<p><a href="{{ url_for('tenant_dashboard.tenant_home', tenant_id=g.tenant_id) }}">Back to overview</a></p>
+{% endblock %}

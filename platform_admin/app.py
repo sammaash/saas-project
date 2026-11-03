@@ -133,4 +133,10 @@ def create_app(
     from .routes import register_routes  # noqa: PLC0415  (avoids an import cycle)
 
     register_routes(app)
+
+    from .routes.tenant_auth import tenant_auth_bp  # noqa: PLC0415  (avoids an import cycle)
+    from .routes.tenant_dashboard import tenant_dashboard_bp  # noqa: PLC0415
+
+    app.register_blueprint(tenant_auth_bp)
+    app.register_blueprint(tenant_dashboard_bp)
     return app

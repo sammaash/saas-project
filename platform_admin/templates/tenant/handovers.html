@@ -1,0 +1,33 @@
+{% extends "tenant/base.html" %}
+{% block title %}Handovers - Tenant Portal{% endblock %}
+{% block content %}
+<h1>Handover requests</h1>
+<div class="card">
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+      {% for status, count in summary.items() %}
+      <tr><td>{{ status }}</td><td>{{ count }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="card">
+  <table>
+    <thead><tr><th>Customer</th><th>Requested</th><th>Reason</th><th>Status</th><th>Created</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.customer_name or row.wa_id or '—' }}</td>
+        <td>{{ row.requested_product or '—' }}</td>
+        <td>{{ row.reason }}</td>
+        <td><span class="badge">{{ row.status }}</span></td>
+        <td>{{ row.created_at }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">No handover requests yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

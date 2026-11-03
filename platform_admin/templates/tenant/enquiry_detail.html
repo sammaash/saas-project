@@ -1,0 +1,24 @@
+{% extends "tenant/base.html" %}
+{% block title %}{{ customer.name or 'Customer' }} - Tenant Portal{% endblock %}
+{% block content %}
+<h1>{{ customer.name or 'Customer' }}</h1>
+<p class="muted">{{ customer.wa_id }}{% if customer.email %} · {{ customer.email }}{% endif %}</p>
+<div class="card">
+  <h2>Conversations</h2>
+  <table>
+    <thead><tr><th>Started</th><th>Status</th><th>Last message</th></tr></thead>
+    <tbody>
+      {% for conversation in conversations %}
+      <tr>
+        <td><a href="{{ url_for('tenant_dashboard.conversation_detail', tenant_id=g.tenant_id, customer_id=customer.id, conversation_id=conversation.id) }}">{{ conversation.created_at }}</a></td>
+        <td><span class="badge">{{ conversation.status }}</span></td>
+        <td>{{ conversation.last_message_at or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="muted">No conversations yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p><a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id) }}">Back to enquiries</a></p>
+{% endblock %}

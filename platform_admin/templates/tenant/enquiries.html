@@ -1,0 +1,25 @@
+{% extends "tenant/base.html" %}
+{% block title %}Enquiries - Tenant Portal{% endblock %}
+{% block content %}
+<h1>Enquiries</h1>
+<p class="muted">{{ total }} customer{{ '' if total == 1 else 's' }}</p>
+<div class="card">
+  <table>
+    <thead><tr><th>Name</th><th>WhatsApp</th><th>Email</th><th>Last interaction</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><a href="{{ url_for('tenant_dashboard.customer_detail', tenant_id=g.tenant_id, customer_id=row.id) }}">{{ row.name or '—' }}</a></td>
+        <td>{{ row.wa_id }}</td>
+        <td>{{ row.email or '—' }}</td>
+        <td>{{ row.last_interaction_at or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="muted">No customers yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if page > 1 %}<a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id, page=page-1) }}">Previous</a>{% endif %}
+{% if rows|length == page_size %}<a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id, page=page+1) }}">Next</a>{% endif %}
+{% endblock %}

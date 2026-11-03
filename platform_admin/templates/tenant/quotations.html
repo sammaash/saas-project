@@ -1,0 +1,24 @@
+{% extends "tenant/base.html" %}
+{% block title %}Quotations - Tenant Portal{% endblock %}
+{% block content %}
+<h1>Quotations</h1>
+<div class="card">
+  <table>
+    <thead><tr><th>Number</th><th>Customer</th><th>Issued</th><th>Expires</th><th>Total</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><a href="{{ url_for('tenant_dashboard.quotation_detail', tenant_id=g.tenant_id, quotation_id=row.id) }}">{{ row.quotation_number }}</a></td>
+        <td>{{ row.customer_name }}</td>
+        <td>{{ row.issue_date }}</td>
+        <td>{{ row.expiry_date or '—' }}</td>
+        <td>{{ row.total }} {{ row.currency }}</td>
+        <td><span class="badge">{{ row.status }}</span></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">No quotations yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
