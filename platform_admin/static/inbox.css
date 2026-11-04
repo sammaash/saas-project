@@ -1,0 +1,59 @@
+/* Samma Inbox — mobile-first conversation UI (WhatsApp-inspired, no branding). */
+
+.inbox-filters { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+.inbox-filters input[type="search"] { flex: 1 1 220px; min-height: 44px; padding: .5rem .75rem; border: 1px solid #ccc; border-radius: 8px; font-size: 1rem; }
+.inbox-filters select { min-height: 44px; padding: .4rem .5rem; border: 1px solid #ccc; border-radius: 8px; font-size: 1rem; background: #fff; }
+.inbox-filters button { min-height: 44px; }
+
+/* Mobile-first: one column. The list is the landing view; opening a thread
+   swaps to the full-screen chat. Desktop shows both side by side. */
+.inbox-shell { display: block; }
+.inbox-shell.has-selection .inbox-list { display: none; }
+.inbox-shell:not(.has-selection) .inbox-chat { display: none; }
+
+.inbox-list { display: flex; flex-direction: column; gap: .5rem; }
+.thread { display: block; background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: .75rem; color: inherit; text-decoration: none; }
+.thread.active { border-color: #3b5bdb; box-shadow: 0 0 0 1px #3b5bdb; }
+.thread-top { display: flex; justify-content: space-between; gap: .5rem; align-items: baseline; }
+.thread-name { font-weight: 600; overflow-wrap: anywhere; }
+.thread-time { color: #777; font-size: .78rem; white-space: nowrap; }
+.thread-preview { display: block; color: #555; font-size: .9rem; margin: .25rem 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-meta { display: flex; flex-wrap: wrap; gap: .35rem; }
+
+.inbox-back { display: inline-block; min-height: 44px; line-height: 44px; font-weight: 600; text-decoration: none; color: #3b5bdb; }
+.chat-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; align-items: center; background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: .75rem; }
+.chat-flags { display: flex; flex-wrap: wrap; gap: .35rem; }
+
+.msg-stream { display: flex; flex-direction: column; gap: .55rem; background: #f0f1f4; border: 1px solid #ddd; border-radius: 10px; padding: .75rem; margin: .75rem 0; max-height: 62vh; overflow-y: auto; }
+.msg { max-width: 88%; padding: .55rem .75rem; border-radius: 12px; background: #fff; border: 1px solid #e2e2e6; overflow-wrap: anywhere; }
+.msg.inbound { align-self: flex-start; }
+.msg.outbound { align-self: flex-end; background: #e7ecfb; }
+.msg-sender { display: block; font-size: .72rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: #666; margin-bottom: .2rem; }
+.msg.sender-assistant .msg-sender { color: #3b5bdb; }
+.msg.sender-staff .msg-sender { color: #1f7a3d; }
+.msg.sender-system .msg-sender { color: #8a6d1f; }
+.msg-meta { margin-top: .25rem; font-size: .74rem; color: #777; }
+.msg-state { font-weight: 600; }
+.msg-state.sent { color: #1f7a3d; }
+.msg-state.suppressed { color: #8a6d1f; }
+.msg-state.failed { color: #8b2c2c; }
+.msg-state.unknown { color: #5b4a8b; }
+
+.conv-controls, .composer { background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: .75rem; margin: .75rem 0; }
+.conv-controls h3 { margin: .25rem 0 .5rem; }
+.conv-buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
+.conv-buttons button, .composer button { min-height: 44px; padding: .5rem .9rem; border-radius: 8px; border: 1px solid #3b5bdb; background: #3b5bdb; color: #fff; font-size: .95rem; }
+.conv-buttons button:disabled, .composer button:disabled { background: #c9cede; border-color: #c9cede; color: #4a4f63; cursor: not-allowed; }
+.composer textarea { width: 100%; min-height: 88px; box-sizing: border-box; padding: .6rem .75rem; border: 1px solid #ccc; border-radius: 8px; font: inherit; resize: vertical; margin: .35rem 0; }
+
+.customer-drawer { margin: .75rem 0; }
+.customer-drawer summary { min-height: 44px; line-height: 44px; font-weight: 600; cursor: pointer; }
+.lead-card table th { white-space: nowrap; }
+
+@media (min-width: 721px) {
+  .inbox-shell { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 1rem; align-items: start; }
+  .inbox-shell .inbox-list,
+  .inbox-shell:not(.has-selection) .inbox-chat { display: flex; }
+  .inbox-shell.has-selection .inbox-list { display: flex; }
+  .inbox-chat { margin-top: 0; }
+}

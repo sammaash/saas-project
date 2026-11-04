@@ -256,6 +256,20 @@ def resolve_channel(settings: Settings, phone_number_id: str) -> dict[str, Any] 
             return dict(zip((column.name for column in cursor.description), row, strict=True))
 
 
+def get_channel(settings: Settings, tenant_id: str, channel_id: str) -> dict[str, Any] | None:
+    """One tenant channel by id (for outbound sends), scoped to the caller's tenant."""
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            "select * from public.tenant_channels "
+            "where id = %s and tenant_id = app.current_tenant_id()",
+            (channel_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(zip((column.name for column in cursor.description), row, strict=True))
+
+
 def claim_event(
     settings: Settings, tenant_id: str, channel_id: str, message_id: str, customer_key: str
 ) -> bool:

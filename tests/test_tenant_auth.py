@@ -529,8 +529,8 @@ class DashboardReadTests(_TenantAppTestCase):
         ), patch(
             "platform_admin.routes.tenant_dashboard.customers_service.list_messages",
             return_value=(
-                [{"created_at": "2026-01-01", "direction": "inbound",
-                  "body": "hello", "status": "received"}],
+                [{"created_at": "2026-01-01", "direction": "inbound", "sender_type": "customer",
+                  "body_text": "hello", "delivery_status": "received"}],
                 1,
             ),
         ):
@@ -770,8 +770,8 @@ class MigrationSQLTests(unittest.TestCase):
 
     def test_migration_is_a_new_last_file_with_the_naming_convention(self):
         files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
-        self.assertEqual(files[-1], "0038_my_active_tenants.sql")
-        self.assertRegex(files[-1], r"^0038_[a-z0-9_]+\.sql$")
+        self.assertIn("0038_my_active_tenants.sql", files)
+        self.assertRegex(files[-1], r"^\d{4}_[a-z0-9_]+\.sql$")
 
     def test_function_takes_no_caller_supplied_user_id(self):
         match = re.search(

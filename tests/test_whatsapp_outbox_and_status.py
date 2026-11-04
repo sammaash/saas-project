@@ -18,6 +18,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+try:
+    from .webhook_dispatch_support import fake_dispatch
+except ImportError:  # discovery inside the tests directory
+    from webhook_dispatch_support import fake_dispatch  # type: ignore[no-redef]
+
 from platform_admin.app import create_app
 from platform_admin.config import Settings
 from platform_admin.services import customers as customer_service
@@ -219,6 +224,7 @@ class StatusParsingTests(unittest.TestCase):
         )
 
 
+@patch("platform_admin.routes.outbound_dispatch.dispatch_reply", new=fake_dispatch)
 class WebhookOutboxTests(unittest.TestCase):
     """The route must record intent, send once, then record the outcome."""
 

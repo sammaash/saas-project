@@ -12,8 +12,8 @@
       <tr>
         <td>{{ message.created_at }}</td>
         <td>{{ message.direction }}</td>
-        <td>{{ message.body or '—' }}</td>
-        <td>{{ message.status or '—' }}</td>
+        <td>{{ message.body_text or '—' }}</td>
+        <td>{{ message.delivery_status or '—' }}</td>
       </tr>
       {% else %}
       <tr><td colspan="4" class="muted">No messages yet.</td></tr>

@@ -23,6 +23,7 @@ from saas.db import connect
 from saas.tenant_context import tenant_transaction
 
 from ..config import Settings
+from . import conversation_control
 from .validation import ServiceError
 
 logger = logging.getLogger("platform_admin.customers")
@@ -380,55 +381,168 @@ def save_message(
         raise ServiceError("Invalid delivery status.", 400)
 
     with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
-        # The new column is referenced ONLY when a value is supplied. That keeps the
-        # statement byte-for-byte equivalent to the pre-0035 one for every existing caller
-        # (inbound messages and dashboard writes), so an un-migrated database keeps
-        # persisting history instead of failing every insert.
-        columns = [
-            "tenant_id", "channel_id", "conversation_id", "direction", "sender_type",
-            "provider_message_id", "message_type", "body_text", "payload",
-            "provider_timestamp", "delivery_status", "error_code", "error_message",
-        ]
-        parameters: list[Any] = [
-            channel_id, conversation_id, direction, sender_type, provider_message_id,
-            message_type, body_text, Jsonb(payload) if payload is not None else None,
-            provider_timestamp, delivery_status, error_code, error_message,
-        ]
-        returning = (
-            "id, tenant_id, channel_id, conversation_id, direction, sender_type, "
-            "provider_message_id, message_type, body_text, payload, provider_timestamp, "
-            "received_at, delivery_status, error_code, error_message"
+        return _insert_message(
+            cursor,
+            channel_id,
+            conversation_id,
+            direction=direction,
+            sender_type=sender_type,
+            provider_message_id=provider_message_id,
+            message_type=message_type,
+            body_text=body_text,
+            payload=payload,
+            provider_timestamp=provider_timestamp,
+            delivery_status=delivery_status,
+            error_code=error_code,
+            error_message=error_message,
+            reply_to_provider_message_id=reply_to_provider_message_id,
         )
-        if reply_to_provider_message_id is not None:
-            columns.append("reply_to_provider_message_id")
-            parameters.append(reply_to_provider_message_id)
-            returning += ", reply_to_provider_message_id"
-        returning += ", created_at, updated_at"
-        placeholders = ", ".join("%s" for _ in parameters)
-        try:
+
+
+def _insert_message(
+    cursor: Any,
+    channel_id: str,
+    conversation_id: str,
+    *,
+    direction: str,
+    sender_type: str,
+    provider_message_id: str | None = None,
+    message_type: str = "text",
+    body_text: str | None = None,
+    payload: dict[str, Any] | None = None,
+    provider_timestamp: str | None = None,
+    delivery_status: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    reply_to_provider_message_id: str | None = None,
+) -> dict[str, Any]:
+    """Insert one message row on an existing cursor and return it.
+
+    Shared by ``save_message`` and ``add_staff_reply`` so both persistence paths
+    keep identical validation of provider failures and reply correlation.
+    """
+    # The new column is referenced ONLY when a value is supplied. That keeps the
+    # statement byte-for-byte equivalent to the pre-0035 one for every existing caller
+    # (inbound messages and dashboard writes), so an un-migrated database keeps
+    # persisting history instead of failing every insert.
+    columns = [
+        "tenant_id", "channel_id", "conversation_id", "direction", "sender_type",
+        "provider_message_id", "message_type", "body_text", "payload",
+        "provider_timestamp", "delivery_status", "error_code", "error_message",
+    ]
+    parameters: list[Any] = [
+        channel_id, conversation_id, direction, sender_type, provider_message_id,
+        message_type, body_text, Jsonb(payload) if payload is not None else None,
+        provider_timestamp, delivery_status, error_code, error_message,
+    ]
+    returning = (
+        "id, tenant_id, channel_id, conversation_id, direction, sender_type, "
+        "provider_message_id, message_type, body_text, payload, provider_timestamp, "
+        "received_at, delivery_status, error_code, error_message"
+    )
+    if reply_to_provider_message_id is not None:
+        columns.append("reply_to_provider_message_id")
+        parameters.append(reply_to_provider_message_id)
+        returning += ", reply_to_provider_message_id"
+    returning += ", created_at, updated_at"
+    placeholders = ", ".join("%s" for _ in parameters)
+    try:
+        cursor.execute(
+            f"insert into public.messages ({', '.join(columns)}) "
+            f"values (app.current_tenant_id(), {placeholders}) "
+            f"returning {returning}",
+            tuple(parameters),
+        )
+    except ServiceError:
+        raise
+    except Exception as error:  # noqa: BLE001 - translate expected failures
+        constraint = getattr(getattr(error, "diag", None), "constraint_name", "") or ""
+        message = str(error)
+        if missing_outbox_column(error):
+            # 0035 has not been applied to this database yet.
+            raise SchemaOutOfDateError() from error
+        if "messages_outbound_reply_unique" in constraint or "messages_outbound_reply_unique" in message:
+            raise DuplicateReplyError() from error
+        if "messages_provider_message_unique" in constraint or "messages_provider_message_unique" in message:
+            raise ServiceError(
+                "A message with this provider message id already exists.", 409
+            ) from error
+        raise ServiceError(f"Failed to save message: {message}", 500) from error
+    row = cursor.fetchone()
+    return _row_to_dict(cursor, row)
+
+
+def add_staff_reply(
+    settings: Settings,
+    *,
+    tenant_id: str,
+    channel_id: str,
+    conversation_id: str,
+    actor_user_id: str,
+    body_text: str,
+) -> dict[str, Any]:
+    """Record a staff reply and take human ownership in ONE transaction.
+
+    TXN A' of the dispatch design: flip ``ai_mode`` to ``human`` (with its audit
+    event) and insert the outbound ``sender_type='staff'`` row atomically, so any
+    automated dispatch that starts after this commits is suppressed. The provider
+    send itself happens afterwards through ``outbound_dispatch.dispatch_reply``.
+    """
+    text = (body_text or "").strip()
+    if not text:
+        raise ServiceError("Message text is required.", 400)
+    if len(text) > 4096:
+        raise ServiceError("Messages are limited to 4096 characters.", 400)
+    try:
+        with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
             cursor.execute(
-                f"insert into public.messages ({', '.join(columns)}) "
-                f"values (app.current_tenant_id(), {placeholders}) "
-                f"returning {returning}",
-                tuple(parameters),
+                "select set_config('lock_timeout', %s, true)",
+                ("5s",),
             )
-        except ServiceError:
-            raise
-        except Exception as error:  # noqa: BLE001 - translate expected failures
-            constraint = getattr(getattr(error, "diag", None), "constraint_name", "") or ""
-            message = str(error)
-            if missing_outbox_column(error):
-                # 0035 has not been applied to this database yet.
-                raise SchemaOutOfDateError() from error
-            if "messages_outbound_reply_unique" in constraint or "messages_outbound_reply_unique" in message:
-                raise DuplicateReplyError() from error
-            if "messages_provider_message_unique" in constraint or "messages_provider_message_unique" in message:
-                raise ServiceError(
-                    "A message with this provider message id already exists.", 409
-                ) from error
-            raise ServiceError(f"Failed to save message: {message}", 500) from error
-        row = cursor.fetchone()
-        return _row_to_dict(cursor, row)
+            cursor.execute(
+                "select ai_mode from public.conversations "
+                "where id = %s and tenant_id = app.current_tenant_id() for update",
+                (conversation_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ServiceError("Conversation not found.", 404)
+            previous = row[0]
+            if previous != "human":
+                cursor.execute(
+                    "update public.conversations set ai_mode = 'human', updated_at = now() "
+                    "where id = %s and tenant_id = app.current_tenant_id()",
+                    (conversation_id,),
+                )
+                conversation_control.record_event(
+                    cursor,
+                    conversation_id=conversation_id,
+                    actor_user_id=actor_user_id,
+                    event_type="human_takeover",
+                    previous_mode=previous,
+                    new_mode="human",
+                    metadata={"source": "staff_reply"},
+                )
+            return _insert_message(
+                cursor,
+                channel_id,
+                conversation_id,
+                direction="outbound",
+                sender_type="staff",
+                message_type="text",
+                body_text=text,
+                payload={"text": text},
+            )
+    except ServiceError:
+        raise
+    except Exception as error:  # noqa: BLE001
+        if getattr(error, "sqlstate", None) in ("42703", "42P01"):
+            raise ServiceError(
+                "Conversation control schema is missing (migration 0039).", 503
+            ) from error
+        if getattr(error, "sqlstate", None) == "55P03":
+            raise ServiceError("Conversation is busy - try again.", 409) from error
+        raise
 
 
 def find_outbound_reply(
@@ -606,6 +720,92 @@ def list_messages(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def inbox_threads(
+    settings: Settings,
+    tenant_id: str,
+    *,
+    search: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    """Conversations with customer details and last-message preview for the inbox.
+
+    Read-only. Tenant scope comes from the authenticated session and is re-enforced
+    by RLS (``tenant_id = app.current_tenant_id()``) on every table touched, so rows
+    from other tenants can never appear and conversation ids from other tenants
+    yield nothing. The preview is each thread's newest message. Message bodies are
+    returned to the template only — never logged.
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    if status is not None and status not in ("open", "closed", "archived"):
+        raise ServiceError("Unknown conversation filter.", 400)
+
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        where = "where c.tenant_id = app.current_tenant_id()"
+        params: list[Any] = []
+        if status:
+            where += " and c.status = %s"
+            params.append(status)
+        if search:
+            like = f"%{search.lower()}%"
+            where += """ and (
+                lower(coalesce(cu.name, '')) like %s
+                or lower(cu.wa_id) like %s
+                or lower(coalesce(cu.phone_normalized, '')) like %s
+                or lower(coalesce(preview.body_text, '')) like %s
+            )"""
+            params.extend([like, like, like, like])
+
+        cursor.execute(
+            f"""
+            select count(*) from public.conversations c
+            join public.customers cu on cu.id = c.customer_id
+            left join lateral (
+                select m.body_text from public.messages m
+                where m.conversation_id = c.id
+                  and m.tenant_id = app.current_tenant_id()
+                order by m.received_at desc, m.id desc
+                limit 1
+            ) preview on true
+            {where}
+            """,
+            params,
+        )
+        total = cursor.fetchone()[0]
+
+        cursor.execute(
+            f"""
+            select c.id, c.status, c.assigned_to, c.last_message_at, c.closed_at,
+                   c.created_at,
+                   cu.id as customer_id, cu.name as customer_name, cu.wa_id,
+                   cu.phone_normalized, cu.email, cu.last_interaction_at,
+                   preview.body_text as preview_text,
+                   preview.sender_type as preview_sender,
+                   preview.direction as preview_direction,
+                   preview.received_at as preview_at
+            from public.conversations c
+            join public.customers cu on cu.id = c.customer_id
+            left join lateral (
+                select m.body_text, m.sender_type, m.direction, m.received_at
+                from public.messages m
+                where m.conversation_id = c.id
+                  and m.tenant_id = app.current_tenant_id()
+                order by m.received_at desc, m.id desc
+                limit 1
+            ) preview on true
+            {where}
+            order by coalesce(c.last_message_at, preview.received_at, c.created_at) desc
+            limit %s offset %s
+            """,
+            [*params, page_size, offset],
+        )
+        rows = [_row_to_dict(cursor, row) for row in cursor.fetchall()]
+        return rows, total
+
 
 def _row_to_dict(cursor: Any, row: Any) -> dict[str, Any]:
     if row is None:

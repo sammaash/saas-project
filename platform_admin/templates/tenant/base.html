@@ -6,6 +6,7 @@
   <meta name="robots" content="noindex, nofollow">
   <title>{% block title %}Tenant Portal{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+  {% block styles %}{% endblock %}
 </head>
 <body>
 <header class="top">
@@ -13,6 +14,7 @@
   {% if session.get('t_user_id') %}
   <nav>
     {% if g.get('tenant_id') %}
+    <a href="{{ url_for('tenant_dashboard.inbox', tenant_id=g.tenant_id) }}">Inbox</a>
     <a href="{{ url_for('tenant_dashboard.tenant_home', tenant_id=g.tenant_id) }}">Overview</a>
     <a href="{{ url_for('tenant_dashboard.catalogue', tenant_id=g.tenant_id) }}">Catalogue</a>
     <a href="{{ url_for('tenant_dashboard.enquiries', tenant_id=g.tenant_id) }}">Enquiries</a>

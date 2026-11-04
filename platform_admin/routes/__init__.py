@@ -34,6 +34,7 @@ from ..services import customers as customer_service
 from ..services import handover as handover_service
 from ..services import menu as menu_service
 from ..services import menu_simulator as menu_simulator_service
+from ..services import outbound_dispatch
 from ..services import playground as playground_service
 from ..services import quotations as quotation_service
 from ..services import tenant_config
@@ -238,27 +239,35 @@ def _record_menu_outbound(
         return None, "unavailable"
 
 
-def _finalize_menu_outbound(
+def _dispatch_menu_reply(
     settings,
+    *,
+    channel: dict,
+    phone_number_id: str,
     tenant_id: str,
-    row: dict | None,
-    result: "menu_service.MenuSendResult",
-) -> None:
-    if not row or not row.get("id"):
-        return
-    try:
+    conversation: dict | None,
+    customer_key: str,
+    menu_reply: "menu_service.MenuReply",
+    outbox_row: dict | None,
+    inbound_message_id: str,
+):
+    """Send one recorded menu reply through the dispatch boundary.
+
+    The provider call runs inside the conversation lock after the AI-mode
+    recheck (see ``outbound_dispatch``). Suppressed replies are recorded and
+    acknowledged without sending; outcomes are reported exactly as observed.
+    """
+
+    def _send() -> str:
+        result = _send_menu_reply(
+            settings, channel, phone_number_id, tenant_id, customer_key, menu_reply
+        )
         if result.outcome == "sent" and result.wamid:
-            customer_service.mark_message_sent(
-                settings, tenant_id, str(row["id"]), result.wamid
-            )
-            return
-        customer_service.mark_message_failed(
-            settings,
-            tenant_id,
-            str(row["id"]),
-            error_code=result.error_code
+            return result.wamid
+        raise outbound_dispatch.SendFailed(
+            result.error_code
             or ("ambiguous_send" if result.outcome == "uncertain" else "menu_delivery_failed"),
-            error_message=(
+            (
                 result.error_message
                 or (
                     "WhatsApp outcome unknown"
@@ -266,42 +275,39 @@ def _finalize_menu_outbound(
                     else "Menu delivery failed"
                 )
             )[:500],
-        )
-    except Exception as error:  # noqa: BLE001 - diagnostic only
-        logger.error(
-            "Menu outbound bookkeeping failed tenant=%s error=%s",
-            tenant_id,
-            type(error).__name__,
+            ambiguous=result.outcome == "uncertain",
         )
 
-
-def _finalize_menu_event(
-    settings,
-    tenant_id: str,
-    inbound_message_id: str,
-    result: "menu_service.MenuSendResult",
-) -> None:
-    if result.outcome == "sent" and result.wamid:
+    outcome = outbound_dispatch.dispatch_reply(
+        settings,
+        tenant_id=tenant_id,
+        conversation_id=str(conversation["id"]) if conversation else None,
+        message_row_id=str(outbox_row["id"]) if (outbox_row or {}).get("id") else None,
+        sender_type="assistant",
+        send=_send,
+    )
+    if outcome.kind == "suppressed":
+        whatsapp_service.update_event(
+            settings, tenant_id, inbound_message_id, "failed", "ai_reply_suppressed"
+        )
+        return jsonify(ok=True, menu=True, suppressed=True)
+    if outcome.kind == "sent":
         whatsapp_service.update_event(
             settings,
             tenant_id,
             inbound_message_id,
             "processed",
-            response_message_id=result.wamid,
+            response_message_id=outcome.wamid,
         )
-        return
-    if result.outcome == "uncertain":
-        whatsapp_service.update_event(
-            settings, tenant_id, inbound_message_id, "failed", "menu_delivery_uncertain"
-        )
-        return
+        return jsonify(ok=True, menu=True, delivery="sent")
     whatsapp_service.update_event(
         settings,
         tenant_id,
         inbound_message_id,
         "failed",
-        result.error_code or "menu_delivery_failed",
+        "menu_delivery_uncertain" if outcome.kind == "unknown" else (outcome.error_code or "menu_delivery_failed"),
     )
+    return jsonify(ok=True, menu=True, delivery="uncertain" if outcome.kind == "unknown" else "failed")
 
 
 QUOTATION_FAILED_TEXT = (
@@ -387,16 +393,6 @@ def _deliver_quotation_pdf(
             mime_type="application/pdf",
             content=pdf,
         )
-        wamid = whatsapp_service.send_document(
-            settings,
-            phone_number_id=channel["phone_number_id"],
-            tenant_id=tenant_id,
-            credentials_ref=channel.get("credentials_ref"),
-            recipient=customer_key,
-            media_id=media_id,
-            filename=filename,
-            caption=caption,
-        )
     except whatsapp_service.WhatsAppSendError as error:
         status = "uncertain" if error.ambiguous else "failed"
         saas_quotations.finish_delivery(
@@ -410,7 +406,7 @@ def _deliver_quotation_pdf(
             error_message=(error.provider_message or type(error).__name__)[:500],
         )
         logger.warning(
-            "Quotation document send %s tenant=%s code=%s",
+            "Quotation media upload %s tenant=%s code=%s",
             status,
             tenant_id,
             error.provider_code or error.http_status,
@@ -426,8 +422,73 @@ def _deliver_quotation_pdf(
             error_code="document_send_exception",
             error_message=type(error).__name__,
         )
-        logger.exception("Quotation document send failed tenant=%s", tenant_id)
+        logger.exception("Quotation media upload failed tenant=%s", tenant_id)
         return {"outcome": "uncertain"}
+
+    def _send_document() -> str:
+        try:
+            return whatsapp_service.send_document(
+                settings,
+                phone_number_id=channel["phone_number_id"],
+                tenant_id=tenant_id,
+                credentials_ref=channel.get("credentials_ref"),
+                recipient=customer_key,
+                media_id=media_id,
+                filename=filename,
+                caption=caption,
+            )
+        except whatsapp_service.WhatsAppSendError as error:
+            raise outbound_dispatch.SendFailed(
+                error.provider_code
+                or ("ambiguous_send" if error.ambiguous else "document_rejected"),
+                (error.provider_message or type(error).__name__)[:500],
+                ambiguous=error.ambiguous,
+            ) from error
+        except Exception as error:  # noqa: BLE001 - outcome unknown; never resend
+            raise outbound_dispatch.SendFailed(
+                "document_send_exception", type(error).__name__, ambiguous=True
+            ) from error
+
+    # The document send is an automated customer-facing send: it runs through the
+    # dispatch boundary (conversation lock + AI-mode recheck) like every other.
+    outcome = outbound_dispatch.dispatch_reply(
+        settings,
+        tenant_id=tenant_id,
+        conversation_id=str(conversation["id"]) if conversation else None,
+        message_row_id=None,
+        sender_type="assistant",
+        send=_send_document,
+    )
+    if outcome.kind == "suppressed":
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="failed",
+            media_id=media_id,
+            error_code="ai_reply_suppressed",
+            error_message="Suppressed: automation is paused for this conversation",
+        )
+        return {"outcome": "suppressed"}
+    if outcome.kind != "sent":
+        status = "uncertain" if outcome.kind == "unknown" else "failed"
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status=status,
+            media_id=media_id,
+            error_code=(outcome.error_code or "")[:40] or None,
+            error_message=(outcome.error_message or "")[:500] or None,
+        )
+        logger.warning(
+            "Quotation document send %s tenant=%s code=%s",
+            status,
+            tenant_id,
+            outcome.error_code,
+        )
+        return {"outcome": status}
+    wamid = outcome.wamid
 
     try:
         saas_quotations.finish_delivery(
@@ -603,17 +664,17 @@ def whatsapp_webhook():
                 settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
             )
             return jsonify(ok=True, ambiguous=True)
-        result = _send_menu_reply(
+        return _dispatch_menu_reply(
             settings,
-            channel,
-            event["phone_number_id"],
-            tenant_id,
-            event["customer_key"],
-            reply,
+            channel=channel,
+            phone_number_id=event["phone_number_id"],
+            tenant_id=tenant_id,
+            conversation=conversation,
+            customer_key=event["customer_key"],
+            menu_reply=reply,
+            outbox_row=outbox_row,
+            inbound_message_id=event["message_id"],
         )
-        _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
-        _finalize_menu_event(settings, tenant_id, event["message_id"], result)
-        return jsonify(ok=True, menu=True, delivery=result.outcome)
     channel = whatsapp_service.resolve_channel(settings, event["phone_number_id"])
     if channel is None:
         return jsonify(ok=False, error="Unknown or inactive channel."), 404
@@ -714,17 +775,17 @@ def whatsapp_webhook():
                         settings, tenant_id, event["message_id"], "failed", "ambiguous_send"
                     )
                     return jsonify(ok=True, ambiguous=True)
-                result = _send_menu_reply(
+                return _dispatch_menu_reply(
                     settings,
-                    channel,
-                    event["phone_number_id"],
-                    tenant_id,
-                    customer_key,
-                    menu_reply,
+                    channel=channel,
+                    phone_number_id=event["phone_number_id"],
+                    tenant_id=tenant_id,
+                    conversation=conversation,
+                    customer_key=customer_key,
+                    menu_reply=menu_reply,
+                    outbox_row=outbox_row,
+                    inbound_message_id=event["message_id"],
                 )
-                _finalize_menu_outbound(settings, tenant_id, outbox_row, result)
-                _finalize_menu_event(settings, tenant_id, event["message_id"], result)
-                return jsonify(ok=True, menu=True, delivery=result.outcome)
 
     # An explicit request for the PDF of an existing quotation. This is handled
     # deterministically (and only when the tenant has opted in and sending works), so
@@ -934,50 +995,42 @@ def whatsapp_webhook():
                     tenant_id,
                     type(error).__name__,
                 )
-        try:
-            outbound_id = whatsapp_service.send_text(
+        outcome = outbound_dispatch.dispatch_reply(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=str(conversation["id"]) if conversation else None,
+            message_row_id=str(outbox_row["id"]) if outbox_row else None,
+            sender_type="assistant",
+            send=lambda: whatsapp_service.send_text(
                 settings,
                 phone_number_id=event["phone_number_id"],
                 tenant_id=tenant_id,
                 credentials_ref=channel.get("credentials_ref"),
                 recipient=customer_key,
                 text=reply_text,
+            ),
+        )
+        if outcome.kind == "suppressed":
+            whatsapp_service.update_event(
+                settings, tenant_id, event["message_id"], "failed", "ai_reply_suppressed"
             )
-        except ServiceError as error:
-            if outbox_row:
-                try:
-                    customer_service.mark_message_failed(
-                        settings,
-                        tenant_id,
-                        str(outbox_row["id"]),
-                        error_code=getattr(error, "provider_code", None)
-                        or type(error).__name__,
-                        error_message=getattr(error, "provider_message", None)
-                        or error.message,
-                    )
-                except Exception as mark_error:  # noqa: BLE001 - diagnostic only
-                    logger.error(
-                        "Failed-send recording failed tenant=%s error=%s",
-                        tenant_id,
-                        type(mark_error).__name__,
-                    )
-            raise
-        if outbox_row:
-            try:
-                customer_service.mark_message_sent(
-                    settings, tenant_id, str(outbox_row["id"]), outbound_id
-                )
-            except Exception as error:  # noqa: BLE001 - the reply already reached Meta
-                # The reply went out but its wamid was not recorded. Nothing repairs this
-                # automatically: receipts match on the wamid, and this code does not send
-                # biz_opaque_callback_data yet. See docs/OUTBOUND_DELIVERY.md.
-                logger.error(
-                    "Outbound wamid persistence failed tenant=%s wamid=%s error=%s",
-                    tenant_id,
-                    outbound_id,
-                    type(error).__name__,
-                )
-        elif not outbox_supported and conversation:
+            return jsonify(ok=True, suppressed=True)
+        if outcome.kind in ("failed", "unknown"):
+            # The disposition is already recorded inside the boundary. Report the
+            # observed provider outcome against the event and fail the webhook call
+            # exactly as before. Nothing here (or anywhere) resends.
+            whatsapp_service.update_event(
+                settings,
+                tenant_id,
+                event["message_id"],
+                "failed",
+                "ambiguous_send"
+                if outcome.kind == "unknown"
+                else (outcome.error_type or "ServiceError"),
+            )
+            return jsonify(ok=False, error=outcome.error_message or "Send failed."), 502
+        outbound_id = outcome.wamid
+        if not outbox_row and not outbox_supported and conversation:
             # Pre-0035 schema: preserve the original behaviour of recording the outbound
             # message after a successful send. Correlation is unavailable, history is not.
             try:

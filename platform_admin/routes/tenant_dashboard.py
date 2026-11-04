@@ -9,7 +9,7 @@ adds no writes, no invitations, no member management and no messaging.
 
 from __future__ import annotations
 
-from flask import Blueprint, abort, g, redirect, render_template, request, url_for
+from flask import Blueprint, abort, flash, g, redirect, render_template, request, url_for
 
 from saas import tenant_membership
 
@@ -22,11 +22,15 @@ from ..authz import (
 )
 from ..services import (
     catalogue as catalogue_service,
+    conversation_control,
     customers as customers_service,
     handover as handover_service,
+    outbound_dispatch,
     quotations as quotations_service,
     tenants as tenants_service,
+    whatsapp as whatsapp_service,
 )
+from ..services.validation import ServiceError
 
 tenant_dashboard_bp = Blueprint("tenant_dashboard", __name__)
 
@@ -155,3 +159,151 @@ def handovers(tenant_id):
 def settings(tenant_id):
     profile = tenants_service.get_profile(context().settings, g.tenant_id)
     return render_template("tenant/settings.html", profile=profile)
+
+
+def _render_inbox(selected_id: str | None):
+    settings = context().settings
+    search = (request.args.get("q") or "").strip() or None
+    status = (request.args.get("status") or "").strip() or None
+    threads, total = customers_service.inbox_threads(
+        settings,
+        g.tenant_id,
+        search=search,
+        status=status,
+        page=_page_arg(),
+    )
+    selected = None
+    messages: list = []
+    customer = None
+    if selected_id is not None:
+        # Cross-tenant ids return None here and on the message queries: 404, never data.
+        selected = customers_service.get_conversation(settings, g.tenant_id, selected_id)
+        if selected is None:
+            abort(404)
+        messages, _ = customers_service.list_messages(
+            settings, g.tenant_id, selected_id
+        )
+        customer = customers_service.get_customer(
+            settings, g.tenant_id, str(selected["customer_id"])
+        )
+    return render_template(
+        "tenant/inbox.html",
+        threads=threads,
+        total=total,
+        selected=selected,
+        messages=messages,
+        customer=customer,
+        search=search,
+        status=status,
+        sending_enabled=settings.whatsapp_send_enabled,
+    )
+
+
+@tenant_dashboard_bp.get("/t/<uuid:tenant_id>/inbox")
+@member_required
+def inbox(tenant_id):
+    return _render_inbox(None)
+
+
+@tenant_dashboard_bp.get("/t/<uuid:tenant_id>/inbox/<uuid:conversation_id>")
+@member_required
+def inbox_conversation(tenant_id, conversation_id):
+    return _render_inbox(str(conversation_id))
+
+
+@tenant_dashboard_bp.post("/t/<uuid:tenant_id>/inbox/<uuid:conversation_id>/mode")
+@member_required
+def inbox_set_mode(tenant_id, conversation_id):
+    new_mode = (request.form.get("mode") or "").strip()
+    result = conversation_control.set_mode(
+        context().settings,
+        actor_user_id=g.tenant_user_id,
+        tenant_id=g.tenant_id,
+        conversation_id=str(conversation_id),
+        new_mode=new_mode,
+    )
+    flash("Conversation mode updated." if result == "changed" else "Conversation mode unchanged.")
+    return redirect(
+        url_for("tenant_dashboard.inbox_conversation", tenant_id=g.tenant_id, conversation_id=conversation_id)
+    )
+
+
+@tenant_dashboard_bp.post("/t/<uuid:tenant_id>/inbox/<uuid:conversation_id>/attention")
+@member_required
+def inbox_set_attention(tenant_id, conversation_id):
+    value = (request.form.get("value") or "").strip()
+    if value not in ("0", "1"):
+        raise ServiceError("Invalid attention flag.", 400)
+    result = conversation_control.set_needs_attention(
+        context().settings,
+        actor_user_id=g.tenant_user_id,
+        tenant_id=g.tenant_id,
+        conversation_id=str(conversation_id),
+        active=value == "1",
+    )
+    flash("Attention flag updated." if result == "changed" else "Attention flag unchanged.")
+    return redirect(
+        url_for("tenant_dashboard.inbox_conversation", tenant_id=g.tenant_id, conversation_id=conversation_id)
+    )
+
+
+@tenant_dashboard_bp.post("/t/<uuid:tenant_id>/inbox/<uuid:conversation_id>/reply")
+@member_required
+def inbox_reply(tenant_id, conversation_id):
+    settings = context().settings
+    # Sending is rejected BEFORE any write: no mode change, no audit event and no
+    # message row are recorded while WhatsApp sending is disabled.
+    if not settings.whatsapp_send_enabled:
+        raise ServiceError("Sending is disabled in this environment.", 503)
+    text = request.form.get("text") or ""
+    conversation = customers_service.get_conversation(
+        settings, g.tenant_id, str(conversation_id)
+    )
+    if conversation is None:
+        abort(404)
+    customer = customers_service.get_customer(
+        settings, g.tenant_id, str(conversation["customer_id"])
+    )
+    channel = whatsapp_service.get_channel(
+        settings, g.tenant_id, str(conversation["channel_id"])
+    )
+    if customer is None or channel is None:
+        abort(404)
+    recipient = str(customer.get("wa_id") or "")
+    phone_number_id = str(channel.get("phone_number_id") or "")
+    if not recipient or not phone_number_id:
+        raise ServiceError(
+            "This conversation is not connected to a WhatsApp channel.", 409
+        )
+    row = customers_service.add_staff_reply(
+        settings,
+        tenant_id=g.tenant_id,
+        channel_id=str(conversation["channel_id"]),
+        conversation_id=str(conversation_id),
+        actor_user_id=g.tenant_user_id,
+        body_text=text,
+    )
+    outcome = outbound_dispatch.dispatch_reply(
+        settings,
+        tenant_id=g.tenant_id,
+        conversation_id=str(conversation_id),
+        message_row_id=str(row["id"]),
+        sender_type="staff",
+        send=lambda: whatsapp_service.send_text(
+            settings,
+            phone_number_id=phone_number_id,
+            tenant_id=g.tenant_id,
+            credentials_ref=channel.get("credentials_ref"),
+            recipient=recipient,
+            text=text,
+        ),
+    )
+    if outcome.kind == "sent":
+        flash("Reply sent.")
+    elif outcome.kind == "failed":
+        flash("Reply failed to send.", "error")
+    else:
+        flash("Reply outcome unknown - pending reconciliation.", "error")
+    return redirect(
+        url_for("tenant_dashboard.inbox_conversation", tenant_id=g.tenant_id, conversation_id=conversation_id)
+    )
