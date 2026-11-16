@@ -159,6 +159,18 @@ class Migration0038NonSuperuserPg17Tests(unittest.TestCase):
             conn.execute("create role authenticated nologin inherit")
             conn.execute("create role service_role nologin inherit bypassrls")
             conn.execute("create role authenticator login noinherit")
+            # Supabase grants everything the migration role creates in schema public to
+            # the Data API roles (production inventory 2026-11-16). Without this the
+            # model cannot see a migration that forgets to revoke from them.
+        # Default ACLs are per database: set them in template1 so every database created
+        # below (template and per-test copies) carries them, as a Supabase project does.
+        with cls._connect(BOOTSTRAP, "template1", autocommit=True) as conn:
+            for kind in ("tables", "sequences", "functions"):
+                conn.execute(
+                    f"alter default privileges for role postgres in schema public"
+                    f" grant all on {kind} to anon, authenticated, service_role"
+                )
+        with cls._connect(BOOTSTRAP, "postgres", autocommit=True) as conn:
             conn.execute(f"create database {PRE_0038_TEMPLATE} owner postgres")
 
         # Bring the template to production's state (ledger 0001-0037) with the real runner,
@@ -424,6 +436,48 @@ class Migration0038NonSuperuserPg17Tests(unittest.TestCase):
             finally:
                 conn.rollback()
 
+    def _exposed_role_violations(self, dbname: str) -> list:
+        """Privileges the Supabase Data API roles must never hold on this platform's objects.
+
+        anon and service_role: nothing on any public table or sequence. authenticated: nothing
+        on a backend-only table, and never TRUNCATE/TRIGGER/REFERENCES (which bypass RLS).
+        """
+        try:
+            from tests.saas_test_support import AUTHENTICATED_INACCESSIBLE_TABLES  # noqa: PLC0415
+        except ImportError:  # pragma: no cover
+            from saas_test_support import AUTHENTICATED_INACCESSIBLE_TABLES  # type: ignore  # noqa: PLC0415
+        with self._connect(BOOTSTRAP, dbname) as conn:
+            rows = conn.execute(
+                "select r.rolname, c.relname, c.relkind::text, p.priv from pg_class c"
+                " cross join (values ('anon'), ('authenticated'), ('service_role')) r(rolname)"
+                " cross join unnest(array['SELECT','INSERT','UPDATE','DELETE','TRUNCATE',"
+                "   'REFERENCES','TRIGGER']) p(priv)"
+                " where c.relnamespace = 'public'::regnamespace and c.relkind in ('r', 'S')"
+                "   and (c.relkind = 'r' or p.priv in ('SELECT', 'UPDATE'))"
+                "   and has_table_privilege(r.rolname, c.oid, p.priv)"
+            ).fetchall()
+        violations = []
+        for role, name, kind, priv in rows:
+            if role in ("anon", "service_role"):
+                violations.append((role, name, priv))
+            elif kind == "S" and name.split("_id_seq")[0] in AUTHENTICATED_INACCESSIBLE_TABLES:
+                violations.append((role, name, priv))
+            elif name in AUTHENTICATED_INACCESSIBLE_TABLES or name == "saas_schema_migrations":
+                violations.append((role, name, priv))
+            elif priv in ("TRUNCATE", "TRIGGER", "REFERENCES"):
+                violations.append((role, name, priv))
+        return sorted(violations)
+
+    def test_supabase_default_privileges_reproduce_the_production_leak_until_0041(self):
+        """0001-0037 under Supabase defaults leave orders exposed (as found in production)."""
+        leaked = self._exposed_role_violations(PRE_0038_TEMPLATE)
+        self.assertIn(("anon", "orders", "TRUNCATE"), leaked)
+        self.assertIn(("service_role", "order_items_id_seq", "UPDATE"), leaked)
+        database = self._fresh_database(self.BUNDLE_DATABASE)
+        self.assertIsNone(
+            self._execute_script("postgres", database, build_bundle(self.LAST_PRODUCTION_VERSION)))
+        self.assertEqual(self._exposed_role_violations(database), [])
+
     def test_full_chain_0001_to_latest_via_run_migrations_main_as_non_superuser(self):
         """Fresh empty database, every migration file, the runner's CLI entry point."""
         database = self._fresh_runner_database(from_template=False)
@@ -444,6 +498,7 @@ class Migration0038NonSuperuserPg17Tests(unittest.TestCase):
         self.assertEqual(state["function"][0], PROVISIONER)
         self.assertEqual(state["operator_owned_definers"], DOCUMENTED_OPERATOR_OWNED_DEFINERS)
         self._assert_production_at_rest(state, template_acl)
+        self.assertEqual(self._exposed_role_violations(database), [])
 
 
     # ------------------------------------------------------- production bundle and reset
