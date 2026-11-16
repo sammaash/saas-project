@@ -395,6 +395,22 @@ def platform_admin_test_url() -> str | None:
 PLATFORM_ADMIN_USER_ID = "f0000000-0000-4000-8000-000000000001"
 
 
+def record_verified_account(cursor: Any, user_id: str) -> None:
+    """Give ``user_id`` a platform directory entry inside an ``as_platform`` transaction.
+
+    Migration 0043: tenant readiness only counts an owner whose account the platform
+    verified through Supabase Auth (it has a ``platform_user_directory`` row). Tests that
+    provision with a synthetic owner id record it here; the transaction is rolled back.
+    """
+    cursor.execute("reset role")
+    cursor.execute(
+        "insert into public.platform_user_directory (user_id, email) values (%s, %s) "
+        "on conflict (user_id) do nothing",
+        (user_id, f"verified-{str(user_id)[:8]}@example.test"),
+    )
+    cursor.execute("set local role saas_platform_admin")
+
+
 @contextlib.contextmanager
 def as_platform(
     user_id: str | None, register: bool = True, url: str | None = None

@@ -311,3 +311,12 @@ def remove_member(
 ) -> None:
     with platform_transaction(admin_user_id, url) as cursor:
         cursor.execute("select app.platform_remove_member(%s, %s)", (tenant_id, membership_id))
+
+
+def list_unattached_accounts(
+    admin_user_id: str, search: str | None = None, url: str | None = None
+) -> list[dict[str, Any]]:
+    """Directory accounts with no membership (for example a failed onboarding)."""
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute("select * from app.platform_list_unattached_accounts(%s)", (search,))
+        return _rows(cursor)

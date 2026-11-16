@@ -15,7 +15,15 @@ import urllib.error
 from unittest.mock import patch
 
 from platform_admin.app import create_app
-from platform_admin.auth import AuthError, Authenticator, Identity
+from platform_admin.auth import (
+    LINK_TOKEN_MAX_AGE_SECONDS,
+    AuthError,
+    Authenticator,
+    Identity,
+    SupabaseAuthenticator,
+    check_link_claims,
+)
+from platform_admin.routes import tenant_auth as tenant_auth_routes
 from platform_admin.auth_admin import (
     AuthAdmin,
     AuthAdminError,
@@ -248,7 +256,10 @@ class TokenAuthenticator(Authenticator):
     def login(self, email, password):
         raise AuthError("Invalid email or password.")
 
-    def verify_token(self, token):
+    def verify_token(self, token):  # pragma: no cover - the callback must never use this
+        raise AssertionError("the invitation callback must use verify_link_token")
+
+    def verify_link_token(self, token):
         if token not in self.tokens:
             raise AuthError("Invalid or expired credentials.")
         return self.tokens[token]
@@ -279,6 +290,20 @@ class RecordingAuthAdmin(AuthAdmin):
 
 class PasswordSetupFlowTests(unittest.TestCase):
     def setUp(self):
+        # The reset gate lives in the database (0043); here it is a recorded stand-in.
+        self.claims: list[str] = []
+        eligible = {"owner@bakery.test"}
+
+        def claim(email, url=None, **_):
+            self.claims.append(email)
+            return email in eligible
+
+        patcher = patch.object(tenant_auth_routes.password_reset, "claim", side_effect=claim)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        floor = patch.object(tenant_auth_routes, "RESET_RESPONSE_FLOOR_SECONDS", 0)
+        floor.start()
+        self.addCleanup(floor.stop)
         self.admin = RecordingAuthAdmin()
         self.authenticator = TokenAuthenticator({"good-token": Identity(USER_ID, "owner@bakery.test")})
         self.app = create_app(
@@ -356,12 +381,164 @@ class PasswordSetupFlowTests(unittest.TestCase):
             token = self._csrf()
             response = self.client.post("/t/forgot-password", data={"csrf_token": token, "email": email})
             self.assertEqual(response.status_code, 200)
-            answers.append(response.get_data(as_text=True).count("If an account exists"))
-        self.assertEqual(answers, [1, 1])
-        self.assertEqual([r[1] for r in self.admin.resets], [CALLBACK, CALLBACK])
+            answers.append(response.get_data(as_text=True))
+        self.assertEqual(answers[0], answers[1], "the page must be identical for both emails")
+        self.assertIn("If an account exists", answers[0])
+        self.assertEqual(self.claims, ["owner@bakery.test", "missing@bakery.test"])
+        # Only the eligible address reaches Supabase's email quota.
+        self.assertEqual(self.admin.resets, [("owner@bakery.test", CALLBACK)])
+
+    def test_forgot_password_hides_internal_failures(self):
+        with patch.object(tenant_auth_routes.password_reset, "claim", side_effect=RuntimeError("db down")):
+            response = self.client.post("/t/forgot-password", data={
+                "csrf_token": self._csrf(), "email": "owner@bakery.test"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("If an account exists", response.get_data(as_text=True))
+        self.assertEqual(self.admin.resets, [])
+
+    def test_forgot_password_takes_at_least_the_response_floor(self):
+        sleeps = []
+        with patch.object(tenant_auth_routes, "RESET_RESPONSE_FLOOR_SECONDS", 5.0), \
+                patch.object(tenant_auth_routes.time, "sleep", side_effect=sleeps.append):
+            self.client.post("/t/forgot-password", data={
+                "csrf_token": self._csrf(), "email": "missing@bakery.test"})
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreater(sleeps[0], 4.0)
+
+    def test_tenant_sign_out_ends_a_half_finished_password_setup(self):
+        self._open_link()
+        with self.client.session_transaction() as session:
+            token = session["csrf_token"]
+        self.client.post("/t/logout", data={"csrf_token": token})
+        with self.client.session_transaction() as session:
+            self.assertNotIn("t_pw_user_id", session)
 
     def test_login_page_links_to_password_reset(self):
         self.assertIn("/t/forgot-password", self.client.get("/t/login").get_data(as_text=True))
+
+
+# ---------------------------------------------------------------------------
+# H2: only a fresh invitation / recovery / OTP token can set a password
+# ---------------------------------------------------------------------------
+LINK_SECRET = "a-long-enough-hs256-secret-for-link-tests-0123456789"
+
+
+def _signed(now=None, **overrides):
+    import jwt  # noqa: PLC0415
+
+    now = int(time.time() if now is None else now)
+    claims = {
+        "sub": USER_ID, "aud": "authenticated", "iss": f"{BASE}/auth/v1",
+        "exp": now + 3600, "iat": now, "email": "owner@bakery.test",
+        "amr": [{"method": "invite", "timestamp": now}],
+    }
+    claims.update(overrides)
+    return jwt.encode({k: v for k, v in claims.items() if v is not None}, LINK_SECRET, algorithm="HS256")
+
+
+class LinkTokenClaimTests(unittest.TestCase):
+    NOW = 1_800_000_000
+
+    def check(self, **claims):
+        base = {"iat": self.NOW, "amr": [{"method": "invite", "timestamp": self.NOW}]}
+        base.update(claims)
+        check_link_claims(base, now=self.NOW)
+
+    def test_fresh_invitation_recovery_and_otp_are_accepted(self):
+        for method in ("invite", "recovery", "otp"):
+            with self.subTest(method=method):
+                self.check(amr=[{"method": method, "timestamp": self.NOW - 60}])
+
+    def test_password_sessions_and_other_methods_are_refused(self):
+        refused = (
+            [{"method": "password", "timestamp": self.NOW}],
+            [{"method": "password", "timestamp": self.NOW}, {"method": "recovery", "timestamp": self.NOW}],
+            [{"method": "oauth", "timestamp": self.NOW}],
+            [{"method": "magiclink", "timestamp": self.NOW}],
+            [{"method": "token_refresh", "timestamp": self.NOW}],
+            [{"method": "totp", "timestamp": self.NOW}],
+        )
+        for amr in refused:
+            with self.subTest(amr=amr), self.assertRaises(AuthError):
+                self.check(amr=amr)
+
+    def test_missing_or_malformed_amr_is_refused(self):
+        for amr in (None, [], "invite", [{"method": "invite"}], [{"method": "invite", "timestamp": "x"}],
+                    [{"method": "invite", "timestamp": True}], ["invite"]):
+            with self.subTest(amr=amr), self.assertRaises(AuthError):
+                self.check(amr=amr)
+
+    def test_fifteen_minute_age_limit(self):
+        limit = LINK_TOKEN_MAX_AGE_SECONDS
+        self.assertEqual(limit, 15 * 60)
+        self.check(amr=[{"method": "recovery", "timestamp": self.NOW - limit}], iat=self.NOW - limit)
+        with self.assertRaises(AuthError):
+            self.check(amr=[{"method": "recovery", "timestamp": self.NOW - limit - 1}])
+        with self.assertRaises(AuthError):
+            self.check(iat=self.NOW - limit - 1)
+        with self.assertRaises(AuthError):
+            self.check(iat=None)
+        with self.assertRaises(AuthError):  # far-future timestamps are not "fresh"
+            self.check(amr=[{"method": "invite", "timestamp": self.NOW + 3600}])
+
+
+class LinkTokenVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.auth = SupabaseAuthenticator(BASE, ANON_KEY, jwt_secret=LINK_SECRET)
+
+    def test_signed_invitation_token_is_accepted(self):
+        identity = self.auth.verify_link_token(_signed())
+        self.assertEqual((identity.user_id, identity.email), (USER_ID, "owner@bakery.test"))
+
+    def test_password_session_token_is_refused_but_still_valid_for_sign_in(self):
+        token = _signed(amr=[{"method": "password", "timestamp": int(time.time())}])
+        self.assertEqual(self.auth.verify_token(token).user_id, USER_ID)
+        with self.assertRaises(AuthError):
+            self.auth.verify_link_token(token)
+
+    def test_stale_recovery_token_is_refused_even_when_unexpired(self):
+        old = int(time.time()) - 20 * 60
+        token = _signed(now=old, exp=int(time.time()) + 3600,
+                        amr=[{"method": "recovery", "timestamp": old}])
+        with self.assertRaises(AuthError):
+            self.auth.verify_link_token(token)
+
+    def test_forged_signature_is_refused(self):
+        import jwt  # noqa: PLC0415
+
+        claims = {"sub": USER_ID, "aud": "authenticated", "iss": f"{BASE}/auth/v1",
+                  "exp": int(time.time()) + 60, "iat": int(time.time()),
+                  "amr": [{"method": "invite", "timestamp": int(time.time())}]}
+        forged = jwt.encode(claims, "another-secret-that-is-long-enough-000000", algorithm="HS256")
+        with self.assertRaises(AuthError):
+            self.auth.verify_link_token(forged)
+
+    def test_base_authenticator_fails_closed(self):
+        class Minimal(Authenticator):
+            def login(self, email, password):
+                raise AuthError("no")
+
+        with self.assertRaises(AuthError):
+            Minimal().verify_link_token(_signed())
+
+    def test_callback_route_refuses_a_password_session_token(self):
+        admin = RecordingAuthAdmin()
+        app = create_app(Settings(secret_key="k" * 40, cookie_secure=False, public_url=PUBLIC),
+                         authenticator=self.auth, auth_admin=admin)
+        client = app.test_client()
+        client.get("/t/auth/callback")
+        with client.session_transaction() as session:
+            csrf_token = session["csrf_token"]
+        password_token = _signed(amr=[{"method": "password", "timestamp": int(time.time())}])
+        response = client.post("/t/auth/callback", data={"csrf_token": csrf_token, "access_token": password_token})
+        self.assertEqual(response.status_code, 400)
+        with client.session_transaction() as session:
+            self.assertNotIn("t_pw_user_id", session)
+            csrf_token = session["csrf_token"]
+        self.assertEqual(client.get("/t/set-password").status_code, 400)
+        response = client.post("/t/auth/callback", data={"csrf_token": csrf_token, "access_token": _signed()})
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/t/set-password"))
 
 
 class OnboardingRoutesRequireAdminTests(unittest.TestCase):

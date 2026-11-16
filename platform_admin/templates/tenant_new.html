@@ -4,12 +4,13 @@
 <h1>Create tenant</h1>
 <p class="muted">The tenant is created as a draft. Configure it, add its catalogue, then activate it.
 Timezone and currency default to Africa/Nairobi and KES.</p>
+<p class="muted">This creates a tenant with no owner. To create a business together with its owner's
+account, use <a href="{{ url_for('admin.tenant_onboard') }}">Onboard a business</a>; to add an owner
+later, use the tenant's Members tab.</p>
 <form method="post" class="card narrow">
   {{ csrf_field() }}
   <label>Business name <input name="name" value="{{ form.get('name', '') }}" required maxlength="200"></label>
   <label>Slug <input name="slug" value="{{ form.get('slug', '') }}" required pattern="[a-z0-9][a-z0-9-]{2,39}"></label>
-  <label>Owner user id (verified Auth UUID, optional)
-    <input name="owner_user_id" value="{{ form.get('owner_user_id', '') }}" placeholder="leave blank to assign later"></label>
   <button type="submit">Create draft tenant</button>
 </form>
 {% endblock %}

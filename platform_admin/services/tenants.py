@@ -119,11 +119,18 @@ def create_tenant(settings: Settings, admin_id: str, form: dict[str, Any]) -> st
     slug = v.slug(form.get("slug"))
     timezone = v.timezone(form.get("timezone") or "Africa/Nairobi")
     currency = v.currency(form.get("currency") or "KES")
-    owner = v.optional_uuid(form.get("owner_user_id"), "Owner user id")
+    # An owner is never assigned here: a typed UUID cannot be verified against Supabase
+    # Auth and would create a "phantom" owner. Owners are added through "Onboard a
+    # business" or the tenant's Members tab, both of which resolve the real account.
+    if str(form.get("owner_user_id") or "").strip():
+        raise v.ServiceError(
+            "Owners are no longer assigned by user id here. Use \"Onboard a business\", or "
+            "add the owner from the tenant's Members tab after creating it."
+        )
     plan_id = v.optional_uuid(form.get("plan_id"), "Plan")
     with v.translated():
         return platform.provision_tenant(
-            admin_id, name, slug, timezone, currency, owner, plan_id,
+            admin_id, name, slug, timezone, currency, None, plan_id,
             url=settings.platform_database_url,
         )
 

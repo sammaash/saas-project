@@ -128,6 +128,7 @@ class DashboardTestCase(SaasDatabaseTestCase):
                 cursor.execute("delete from public.audit_log where tenant_id = any(%s)", (ids,))
                 cursor.execute("delete from public.tenants where id = any(%s)", (ids,))
             cursor.execute("delete from public.reserved_phone_numbers where phone_number_id like 'pa-reserved-%'")
+            cursor.execute("delete from public.platform_user_directory where email like 'pa-owner-%@example.test'")
             cursor.execute(
                 "delete from public.platform_admins where user_id = %s", (PLATFORM_ADMIN_USER_ID,)
             )
@@ -179,9 +180,32 @@ class DashboardTestCase(SaasDatabaseTestCase):
         self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
         return re.search(r"/tenants/([0-9a-f-]{36})", response.headers["Location"]).group(1)
 
+    def add_verified_owner(self, tenant_id, user_id=None) -> str:
+        """An active owner whose account the platform verified (it has a directory entry).
+
+        Stands in for the Members tab / "Onboard a business" flows, which resolve the account
+        through Supabase Auth; those are covered end to end in test_onboarding_members.py.
+        """
+        user_id = user_id or str(uuid.uuid4())
+        conn = _connect()
+        with conn, conn.cursor() as cursor:  # committed (superuser() always rolls back)
+            cursor.execute(
+                "insert into public.platform_user_directory (user_id, email) values (%s, %s) "
+                "on conflict (user_id) do nothing",
+                (user_id, f"pa-owner-{user_id[:8]}@example.test"),
+            )
+            cursor.execute(
+                "insert into public.tenant_users (tenant_id, user_id, role, status) "
+                "values (%s, %s, 'owner', 'active')",
+                (tenant_id, user_id),
+            )
+        conn.close()
+        return user_id
+
     def onboard(self, spec) -> str:
-        """The one generic workflow: create -> profile -> rules -> catalogue -> activate."""
-        tenant_id = self.create_tenant(spec, owner_user_id=str(uuid.uuid4()))
+        """The one generic workflow: create -> owner -> profile -> rules -> catalogue -> activate."""
+        tenant_id = self.create_tenant(spec)
+        self.add_verified_owner(tenant_id)
         base = f"/tenants/{tenant_id}"
         self.assertEqual(self.post(f"{base}/profile", {
             "name": spec["name"], "timezone": "Africa/Nairobi", "currency": spec["currency"]}).status_code, 302)
@@ -315,7 +339,8 @@ class OnboardingTests(DashboardTestCase):
         self.assertEqual((stored[ids[0]][0], stored[ids[1]][0]), ("KES", "USD"))
 
     def test_activation_is_blocked_until_the_tenant_is_ready(self):
-        tenant_id = self.create_tenant(SPECS[0], owner_user_id=str(uuid.uuid4()))
+        tenant_id = self.create_tenant(SPECS[0])
+        self.add_verified_owner(tenant_id)
         response = self.post(f"/tenants/{tenant_id}/status", {"status": "active"})
         self.assertIn("not ready to activate", self.message_after(response))
         self.assertEqual(self.tenant_status(tenant_id), "draft")
@@ -826,7 +851,12 @@ class AuditAttributionTests(DashboardTestCase):
         self.post(f"{base}/profile", {"name": "Alpha Salon", "timezone": "Africa/Nairobi", "currency": "KES"})
         self.post(f"{base}/rules", {"business_rules": "{}"})
         self.post(f"{base}/catalogue/products", {"name": "Thing"})
-        self.post(f"{base}/members", {"user_id": str(uuid.uuid4()), "role": "staff"})
+        # (Member changes need a verified Supabase account; their attribution is covered in
+        # test_onboarding_members.AuditCompletenessTests.)
+        with self.superuser() as cursor:
+            cursor.execute("select id::text from public.plans where is_active limit 1")
+            plan_id = cursor.fetchone()[0]
+        self.post(f"{base}/subscription", {"plan_id": plan_id, "status": "trial"})
         self.post(f"{base}/whatsapp/connect", {"phone_number_id": "pa-attrib-1", "confirm_slug": SPECS[0]["slug"]})
         with self.superuser() as cursor:
             cursor.execute(
@@ -867,8 +897,9 @@ class BotPlaygroundTests(DashboardTestCase):
                 "name": "saas-test",
                 "slug": "saas-test",
                 "currency": "KES",
-            }, owner_user_id=TENANT_ONE_OWNER_USER_ID)
+            })
             self.addCleanup(self._delete_exact_test_tenant, tenant_id, "saas-test")
+            self.add_verified_owner(tenant_id, TENANT_ONE_OWNER_USER_ID)
             self.post(f"/tenants/{tenant_id}/profile", {
                 "name": "saas-test",
                 "timezone": "Africa/Nairobi",
@@ -1056,8 +1087,26 @@ class MemberAndSubscriptionTests(DashboardTestCase):
         with self.superuser() as cursor:
             cursor.execute("select count(*) from public.tenant_users where tenant_id = %s", (self.tenant,))
             self.assertEqual(cursor.fetchone()[0], 0)
-        self.post(base, {"user_id": str(uuid.uuid4()), "role": "owner"})
-        self.assertIn("member.added", self.audit_actions(self.tenant))
+        # Without Supabase Auth administration an account cannot be verified, so even a
+        # well-formed UUID is refused: no unverified ("phantom") member is ever created.
+        response = self.post(base, {"user_id": str(uuid.uuid4()), "role": "owner"})
+        self.assertIn("cannot be verified", self.message_after(response))
+        with self.superuser() as cursor:
+            cursor.execute("select count(*) from public.tenant_users where tenant_id = %s", (self.tenant,))
+            self.assertEqual(cursor.fetchone()[0], 0)
+        self.assertNotIn("member.added", self.audit_actions(self.tenant))
+
+    def test_legacy_create_tenant_refuses_an_owner_user_id(self):
+        response = self.post("/tenants/new", {"name": "Phantom", "slug": SLUG_PREFIX + "phantom",
+                                              "timezone": "Africa/Nairobi", "currency": "KES",
+                                              "owner_user_id": str(uuid.uuid4())})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Onboard a business", response.get_data(as_text=True))
+        with self.superuser() as cursor:
+            cursor.execute("select count(*) from public.tenants where slug = %s", (SLUG_PREFIX + "phantom",))
+            self.assertEqual(cursor.fetchone()[0], 0)
+        page = self.client.get("/tenants/new").get_data(as_text=True)
+        self.assertNotIn('name="owner_user_id"', page)
 
     def test_subscription_can_be_set_and_changed(self):
         base = f"/tenants/{self.tenant}/subscription"

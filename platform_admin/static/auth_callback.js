@@ -13,7 +13,8 @@
   }
   var token = params.get("access_token");
   var type = params.get("type");
-  var allowed = { invite: true, recovery: true, signup: true, magiclink: true };
+  // Only invitation and recovery links are expected; the server re-checks the token itself.
+  var allowed = { invite: true, recovery: true };
   if (params.get("error") || !token || !allowed[type]) {
     status.textContent = "This link is invalid or has expired. Ask for a new invitation or password reset.";
     return;

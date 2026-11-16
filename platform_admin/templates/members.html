@@ -1,10 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Members - Platform Admin{% endblock %}
 {% block content %}
+{% from "_macros.html" import csrf_field %}
 <h1>Members</h1>
 <p class="muted">Every tenant membership. Add or invite people from a tenant's Members tab.
-A tenant always keeps at least one active owner.</p>
+A tenant keeps at least one active owner, and once it has an owner with a verified account it keeps one.</p>
 <form method="get" class="card filters">
+  <label>Show <select name="view">
+    <option value="all" {{ 'selected' if filters.view == 'all' else '' }}>All memberships</option>
+    <option value="unverified" {{ 'selected' if filters.view == 'unverified' else '' }}>Unverified memberships</option>
+    <option value="unattached" {{ 'selected' if filters.view == 'unattached' else '' }}>Accounts without a membership</option>
+  </select></label>
   <label>Search name or email <input name="q" value="{{ filters.q }}" maxlength="200"></label>
   <label>Tenant <select name="tenant_id"><option value="">All tenants</option>
     {% for t in tenants %}<option value="{{ t.id }}" {{ 'selected' if filters.tenant_id == t.id|string else '' }}>{{ t.name }}</option>{% endfor %}</select></label>
@@ -14,9 +20,34 @@ A tenant always keeps at least one active owner.</p>
     {% for s in statuses %}<option {{ 'selected' if filters.status == s else '' }}>{{ s }}</option>{% endfor %}</select></label>
   <button type="submit">Filter</button>
 </form>
+{% if filters.view == 'unattached' %}
+<p class="muted">Accounts this platform invited or linked that have no tenant membership, for example
+when an onboarding failed after the invitation was sent. Give them access here instead of inviting
+them again: the account is looked up by email, so no second account is created.</p>
+<table>
+  <tr><th>Person</th><th>Invited</th><th>Give access</th></tr>
+  {% for a in accounts %}
+  <tr>
+    <td>{{ a.full_name or '' }}<br>{{ a.email }}<br><code class="muted">{{ a.user_id }}</code></td>
+    <td>{% if a.invited_at %}{{ a.invited_at.strftime('%Y-%m-%d') }}{% else %}<span class="muted">linked</span>{% endif %}</td>
+    <td>
+      <form method="post" action="{{ url_for('admin.members_link_account') }}" class="inline">
+        {{ csrf_field() }}
+        <input type="hidden" name="email" value="{{ a.email }}">
+        <input type="hidden" name="user_id" value="{{ a.user_id }}">
+        <select name="tenant_id" aria-label="Tenant" required>{% for t in tenants %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}</select>
+        <select name="role" aria-label="Role">{% for r in roles %}<option>{{ r }}</option>{% endfor %}</select>
+        <button type="submit">Add to tenant</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}<tr><td colspan="3" class="muted">Every known account has a membership.</td></tr>{% endfor %}
+</table>
+{% else %}
 <table>
   <tr><th>Tenant</th><th>Person</th><th>Role</th><th>Status</th><th>Actions</th></tr>
   {% for m in members %}{% with return_to='members', show_tenant=True %}{% include "_member_rows.html" %}{% endwith %}
   {% else %}<tr><td colspan="5" class="muted">No members match.</td></tr>{% endfor %}
 </table>
+{% endif %}
 {% endblock %}

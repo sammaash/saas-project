@@ -2078,17 +2078,40 @@ def tenant_onboard():
 @admin_required
 def members():
     settings = context().settings
-    filters = {key: request.args.get(key, "") for key in ("q", "tenant_id", "role", "status")}
+    filters = {key: request.args.get(key, "") for key in ("q", "tenant_id", "role", "status", "view")}
+    view = filters["view"] if filters["view"] in members_service.MEMBER_VIEWS else "all"
+    filters["view"] = view
+    rows: list = []
+    accounts: list = []
     try:
-        rows = members_service.list_members(settings, g.admin_id, filters)
+        if view == "unattached":
+            accounts = members_service.list_unattached_accounts(settings, g.admin_id, filters["q"])
+        else:
+            rows = members_service.list_members(settings, g.admin_id, filters)
+            if view == "unverified":
+                rows = [row for row in rows if not row.get("email")]
     except ServiceError as error:
         flash(error.message, "error")
-        rows = []
     tenants = tenant_service.list_tenants(settings, g.admin_id)
     return render_template(
-        "members.html", members=rows, tenants=tenants, filters=filters,
+        "members.html", members=rows, accounts=accounts, tenants=tenants, filters=filters,
         roles=members_service.MEMBER_ROLES, statuses=members_service.MEMBER_STATUSES,
     )
+
+
+@admin_bp.post("/members/link")
+@admin_required
+def members_link_account():
+    """Give an account without a membership access to a tenant (verified by email)."""
+    ctx = context()
+    form = _form()
+    tenant = _tenant(form.get("tenant_id") or "")
+    try:
+        flash(members_service.add_existing_member(
+            ctx.settings, ctx.auth_admin, g.admin_id, tenant["id"], form), "ok")
+    except ServiceError as error:
+        flash(error.message, "error")
+    return redirect(url_for("admin.members", view="unattached"))
 
 
 def _members_return(tenant_id: str):

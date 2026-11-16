@@ -525,6 +525,25 @@ def _open_json(request: urllib.request.Request) -> dict[str, Any]:
         ) from error
 
 
+def require_sendable_channel(settings: Settings, tenant_id: str, phone_number_id: str) -> None:
+    """Refuse any outbound call unless the channel AND its tenant are active.
+
+    ``app.resolve_whatsapp_channel`` (0028) returns a row only for an active WhatsApp
+    channel of an active tenant, so a suspended, inactive or draft tenant (or a disabled
+    channel, or a phone number id that belongs to another tenant) can never send. This is
+    the single choke point shared by every outbound shape (text, buttons, list, media,
+    document), whichever route or service triggered it.
+    """
+    try:
+        channel = resolve_channel(settings, phone_number_id)
+    except Exception as error:  # noqa: BLE001 - fail closed when the database is unreachable
+        raise ServiceError("Sending is unavailable right now.", 503) from error
+    if channel is None or str(channel["tenant_id"]) != str(tenant_id):
+        raise ServiceError(
+            "This business's WhatsApp channel is not active, so nothing was sent.", 409
+        )
+
+
 def _post_message(
     settings: Settings,
     *,
@@ -540,6 +559,7 @@ def _post_message(
     """
     if not settings.whatsapp_send_enabled:
         raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
+    require_sendable_channel(settings, tenant_id, phone_number_id)
     token = access_token(settings, tenant_id, credentials_ref)
     outbound = urllib.request.Request(
         f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
@@ -715,6 +735,7 @@ def upload_media(
         raise ServiceError("WhatsApp sending is disabled in this environment.", 503)
     if not content:
         raise ServiceError("The document is empty.", 400)
+    require_sendable_channel(settings, tenant_id, phone_number_id)
     token = access_token(settings, tenant_id, credentials_ref)
     body, content_type = _multipart(
         {"messaging_product": "whatsapp", "type": mime_type},

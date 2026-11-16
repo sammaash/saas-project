@@ -70,18 +70,17 @@ def membership_for(
 ) -> dict[str, str] | None:
     """``{"role": "owner" | "staff"}`` for an active membership, else ``None``.
 
-    Non-active statuses (``invited``, ``disabled``, …) are denied here because the
-    RLS predicates only accept ``status = 'active'``. The tenant id comes from the
+    Non-active memberships (``invited``, ``disabled``, …) and tenants that are not
+    ``draft`` or ``active`` (``suspended``, ``inactive``) are denied. The tenant id comes from the
     request URL but is only ever compared server-side against the caller's own rows.
     """
     if not tenant_id or not isinstance(tenant_id, str):
         raise ValueError("A tenant_id is required for membership checks.")
     with member_transaction(user_id, url) as cursor:
-        cursor.execute(
-            "select app.is_tenant_member(%s), app.is_tenant_owner(%s)",
-            (tenant_id, tenant_id),
-        )
+        # Migration 0043: an active membership of a draft or active tenant only. A
+        # suspended or inactive tenant admits nobody to the portal.
+        cursor.execute("select app.my_tenant_membership(%s)", (tenant_id,))
         row = cursor.fetchone()
-    if row is None or not row[0]:
+    if row is None or row[0] not in ("owner", "staff"):
         return None
-    return {"role": "owner" if row[1] else "staff"}
+    return {"role": row[0]}

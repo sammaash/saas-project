@@ -471,6 +471,7 @@ REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.order_payments", ()),
     ("public.handover_requests", ()),
     ("public.platform_user_directory", ()),
+    ("public.password_reset_requests", ()),
 )
 
 

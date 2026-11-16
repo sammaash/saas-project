@@ -20,6 +20,7 @@ from saas_test_support import (
     TENANT_TWO_OWNER_USER_ID,
     SaasDatabaseTestCase,
     as_platform,
+    record_verified_account,
 )
 from test_saas_platform import _add_catalogue, _errors, _provision
 
@@ -195,6 +196,7 @@ class ChannelWriteBoundaryTests(SaasDatabaseTestCase):
     def test_active_channel_needs_an_active_tenant_and_identifiers_are_frozen_while_active(self):
         with as_platform(PLATFORM_ADMIN_USER_ID) as cursor:
             tenant = _provision(cursor, owner=PLATFORM_ADMIN_USER_ID)
+            record_verified_account(cursor, PLATFORM_ADMIN_USER_ID)
             cursor.execute("select app.platform_create_channel(%s, 'frozen-phone-1')", (tenant,))
             channel = cursor.fetchone()[0]
             cursor.execute("savepoint s")

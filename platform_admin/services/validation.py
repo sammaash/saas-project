@@ -138,6 +138,10 @@ def translate_db_error(error: Exception) -> ServiceError | None:
             return ServiceError(message[0].upper() + message[1:] + ".", 409)
         if message.startswith("an active channel requires"):
             return ServiceError("An active channel requires an active tenant.", 409)
+        if message.startswith("tenant must retain at least one active owner with a verified account"):
+            return ServiceError(
+                "A tenant must keep at least one active owner with a verified account. "
+                "Add another verified owner first.", 409)
         if message.startswith("tenant must retain"):
             return ServiceError("A tenant must keep at least one active owner.", 409)
         if message.startswith(("this phone number is reserved", "disable the channel",

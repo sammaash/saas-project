@@ -521,6 +521,13 @@ class DeliveryStatusWebhookTests(unittest.TestCase):
 class SenderPayloadTests(unittest.TestCase):
     """The plain-text request body must not change. This is the production-safety test."""
 
+    def setUp(self):
+        # The active-tenant/active-channel gate needs a database; it is exercised end to
+        # end in test_onboarding_members.SuspendedTenantTests. Here it is a recorded stub.
+        gate = patch("platform_admin.services.whatsapp.require_sendable_channel")
+        self.channel_gate = gate.start()
+        self.addCleanup(gate.stop)
+
     @patch("platform_admin.services.whatsapp.access_token", return_value="test-token")
     @patch("platform_admin.services.whatsapp.urllib.request.urlopen")
     def test_plain_text_payload_is_byte_identical(self, urlopen, token):

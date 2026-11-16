@@ -216,6 +216,33 @@ class WhatsAppWebhookTests(unittest.TestCase):
 
 
 class WhatsAppSenderTests(unittest.TestCase):
+
+    def setUp(self):
+        # The active-tenant/active-channel gate needs a database; it is exercised end to
+        # end in test_onboarding_members.SuspendedTenantTests. Here it is a recorded stub.
+        gate = patch("platform_admin.services.whatsapp.require_sendable_channel")
+        self.channel_gate = gate.start()
+        self.addCleanup(gate.stop)
+
+    def test_the_channel_gate_runs_before_credentials_or_any_provider_call(self):
+        settings = Settings(secret_key="s" * 40, whatsapp_send_enabled=True)
+        self.channel_gate.side_effect = ServiceError("not active", 409)
+        with patch("platform_admin.services.whatsapp.access_token") as token, patch(
+            "platform_admin.services.whatsapp.urllib.request.urlopen"
+        ) as urlopen:
+            for call in (
+                lambda: whatsapp.send_text(settings, phone_number_id="phone-test-1", tenant_id="tenant-1",
+                                           credentials_ref="tenants/tenant-1/whatsapp",
+                                           recipient="+254700000001", text="Hello"),
+                lambda: whatsapp.upload_media(settings, phone_number_id="phone-test-1", tenant_id="tenant-1",
+                                              credentials_ref="tenants/tenant-1/whatsapp",
+                                              filename="q.pdf", mime_type="application/pdf", content=b"%PDF"),
+            ):
+                with self.assertRaisesRegex(ServiceError, "not active"):
+                    call()
+        self.channel_gate.assert_called_with(settings, "tenant-1", "phone-test-1")
+        token.assert_not_called()
+        urlopen.assert_not_called()
     def test_sending_is_disabled_by_default_without_reading_credentials(self):
         settings = Settings(secret_key="s" * 40)
         with patch("platform_admin.services.whatsapp.access_token") as token, patch(

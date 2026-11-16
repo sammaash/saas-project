@@ -36,6 +36,9 @@ MEMBER_ROLES = ("owner", "staff")
 MEMBER_STATUSES = ("invited", "active", "disabled")
 NEW_MEMBER_STATUSES = ("active", "invited")
 OWNER_MODES = ("invite", "link")
+#: Members page views: every membership, memberships whose account the platform has not
+#: verified (placeholders, legacy UUIDs), and verified accounts that hold no membership.
+MEMBER_VIEWS = ("all", "unverified", "unattached")
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,25 @@ def _invite_new_account(
         raise _service_error(error) from None
 
 
+def _remember_invited_account(
+    settings: Settings, admin_id: str, account: AuthUser, full_name: str | None
+) -> None:
+    """Record a just-invited account in the directory in its OWN committed transaction.
+
+    The provisioning transaction that follows may still fail; the invited account must
+    stay visible (Members -> "Accounts without a membership") so it can be linked instead
+    of being invited again. A failure here is logged and never blocks the onboarding: the
+    provisioning transaction writes the same row.
+    """
+    try:
+        platform.upsert_user_directory(
+            admin_id, account.id, account.email, full_name, True,
+            url=settings.platform_database_url,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("could not record the invited account in the directory")
+
+
 def _recovery_message(error_message: str, email: str, invited: bool, what: str) -> str:
     account = "was created and the invitation email was sent" if invited else "is unchanged"
     return (
@@ -173,6 +195,7 @@ def onboard(
         account, invited = _verified_account(auth_admin, owner_email, owner_user_id), False
     else:
         account, invited = _invite_new_account(settings, auth_admin, owner_email, owner_name), True
+        _remember_invited_account(settings, admin_id, account, owner_name)
 
     # 4. Provision atomically with the real Auth UUID.
     try:
@@ -237,36 +260,33 @@ def add_existing_member(
     if not email and not user_id:
         raise v.ServiceError("Enter the account's email (or its user id).")
 
-    if settings.auth_admin_configured:
-        if email:
-            account = _verified_account(auth_admin, email, user_id)
-        else:
-            try:
-                account = auth_admin.get_user(user_id)
-            except AuthAdminError as error:
-                raise _service_error(error) from None
-            if account is None:
-                raise v.ServiceError("No Supabase Auth account has that user id.", 404)
-        user_id, email, verified = account.id, account.email, True
-        full_name = full_name or account.full_name
+    # Every membership must point at a real Supabase account. Without the service key an
+    # account cannot be verified, so nothing is added (no "phantom" members or owners).
+    if not settings.auth_admin_configured:
+        raise v.ServiceError(
+            "Supabase Auth administration is not configured on this server "
+            "(SUPABASE_SERVICE_ROLE_KEY and PLATFORM_PUBLIC_URL), so the account cannot be "
+            "verified and nothing was added.",
+            503,
+        )
+    if email:
+        account = _verified_account(auth_admin, email, user_id)
     else:
-        # Without the service key the account cannot be verified: keep the original
-        # behaviour (an operator-supplied UUID) and say so.
-        if not user_id:
-            raise v.ServiceError(
-                "Supabase Auth administration is not configured, so accounts cannot be found by "
-                "email. Enter the account's user id instead.",
-                503,
-            )
-        verified = False
+        try:
+            account = auth_admin.get_user(user_id)
+        except AuthAdminError as error:
+            raise _service_error(error) from None
+        if account is None:
+            raise v.ServiceError("No Supabase Auth account has that user id.", 404)
+    user_id, email = account.id, account.email
+    full_name = full_name or account.full_name
 
     with v.translated():
         platform.add_member(
             admin_id, tenant_id, user_id, role, status,
             email=email, full_name=full_name, url=settings.platform_database_url,
         )
-    note = "" if verified else " (not verified against Supabase Auth: the service key is not configured)"
-    return f"Added {email or user_id} as {role}{note}."
+    return f"Added {email} as {role}."
 
 
 def invite_member(
@@ -281,6 +301,7 @@ def invite_member(
         if platform.get_tenant(admin_id, tenant_id, url=settings.platform_database_url) is None:
             raise v.ServiceError("Tenant not found.", 404)
     account = _invite_new_account(settings, auth_admin, email, full_name)
+    _remember_invited_account(settings, admin_id, account, full_name)
     try:
         with v.translated():
             platform.add_member(
@@ -320,6 +341,17 @@ def remove(settings: Settings, admin_id: str, tenant_id: str, membership_id: str
     return "Tenant access revoked. The person's Auth account was not deleted."
 
 
+def _audit_member_event(
+    settings: Settings, admin_id: str, tenant_id: str, member: dict[str, Any], action: str
+) -> None:
+    """Audit an action that has no database write of its own (ids only, no email)."""
+    with v.translated():
+        platform.record_audit(
+            admin_id, tenant_id, action, "tenant_user", member["membership_id"],
+            {"user_id": member["user_id"]}, url=settings.platform_database_url,
+        )
+
+
 def resend_invitation(
     settings: Settings, auth_admin: AuthAdmin, admin_id: str, tenant_id: str, membership_id: str
 ) -> str:
@@ -327,17 +359,23 @@ def resend_invitation(
     if not member.get("email"):
         raise v.ServiceError("This member has no email on record; add them again by email.", 409)
     try:
-        auth_admin.invite(member["email"], member.get("full_name"), _callback(settings))
+        account = auth_admin.invite(member["email"], member.get("full_name"), _callback(settings))
     except AuthAdminError as error:
         if error.code == "email_exists":
             raise v.ServiceError(
                 "This person has already accepted an invitation. Send a password reset instead.", 409
             ) from None
         raise _service_error(error) from None
-    with v.translated():
-        platform.upsert_user_directory(admin_id, member["user_id"], member["email"],
-                                       member.get("full_name"), True,
-                                       url=settings.platform_database_url)
+    _remember_invited_account(settings, admin_id, account, member.get("full_name"))
+    _audit_member_event(settings, admin_id, tenant_id, member, "member.invitation_resent")
+    if account.id != member["user_id"]:
+        # The original account was deleted in Supabase and the invitation created a new
+        # one. The membership still points at the old id, so say exactly what to do.
+        return (
+            f"Invitation sent to {member['email']}, but it created a NEW account: the one this "
+            "membership points to no longer exists. Add the new account from \"Accounts without "
+            "a membership\" and revoke this membership."
+        )
     return f"Invitation re-sent to {member['email']}."
 
 
@@ -351,4 +389,15 @@ def send_password_reset(
         auth_admin.send_password_reset(member["email"], _callback(settings))
     except AuthAdminError as error:
         raise _service_error(error) from None
+    _audit_member_event(settings, admin_id, tenant_id, member, "member.password_reset_sent")
     return f"Password reset email sent to {member['email']}."
+
+
+def list_unattached_accounts(settings: Settings, admin_id: str, search: Any = None) -> list[dict[str, Any]]:
+    """Accounts the platform invited or linked that hold no membership at all."""
+    search = v.text(search, "Search", max_length=200, required=False)
+    with v.translated():
+        rows = platform.list_unattached_accounts(admin_id, search, url=settings.platform_database_url)
+    for row in rows:
+        row["user_id"] = str(row["user_id"])
+    return rows

@@ -11,6 +11,7 @@ the credentials and stores only the verified identity in the signed cookie.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 
@@ -25,7 +26,7 @@ from flask import (
     url_for,
 )
 
-from saas import tenant_membership
+from saas import password_reset, tenant_membership
 
 from .. import csrf
 from ..auth import AuthError, LoginRateLimiter
@@ -38,6 +39,7 @@ from ..authz import (
 )
 
 tenant_auth_bp = Blueprint("tenant_auth", __name__)
+logger = logging.getLogger("platform_admin.tenant_auth")
 
 #: One generic error for every failed sign-in: wrong password, unknown account,
 #: no tenant membership, malformed input. Never hints at which one occurred.
@@ -55,6 +57,9 @@ _RESET_LIMITER = LoginRateLimiter()
 PASSWORD_SETUP_KEYS = ("t_pw_user_id", "t_pw_email", "t_pw_exp")
 PASSWORD_SETUP_SECONDS = 15 * 60
 LINK_ERROR = "This link is invalid or has expired. Ask for a new invitation or password reset."
+#: Every reset request takes at least this long, so response time does not reveal
+#: whether an email was actually sent.
+RESET_RESPONSE_FLOOR_SECONDS = 1.0
 RESET_SENT_MESSAGE = (
     "If an account exists for that email, we have sent a link to choose a new password."
 )
@@ -190,7 +195,9 @@ def auth_callback_submit():
     if not token or len(token) > 8192:
         return render_template("tenant/auth_callback.html", error=LINK_ERROR), 400
     try:
-        identity = context().authenticator.verify_token(token)
+        # Only a fresh invitation/recovery/OTP token (amr) is accepted here; an ordinary
+        # password-session token can never be used to set a new password.
+        identity = context().authenticator.verify_link_token(token)
     except AuthError:
         return render_template("tenant/auth_callback.html", error=LINK_ERROR), 400
     _clear_password_setup()
@@ -225,6 +232,7 @@ def set_password():
 def forgot_password():
     if request.method == "GET":
         return render_template("tenant/forgot_password.html", notice=None, error=None)
+    started = time.monotonic()
     settings = context().settings
     ip = request.remote_addr or "unknown"
     raw_email = (request.form.get("email") or "").strip().lower()
@@ -239,7 +247,19 @@ def forgot_password():
         return render_template("tenant/forgot_password.html", notice=None, error=str(error)), 400
     if settings.public_url:
         try:
-            context().auth_admin.send_password_reset(email, auth_callback_url(settings.public_url))
+            # Migration 0043: true only for an account with an active membership of a
+            # draft/active tenant, under per-email and global hourly caps shared by every
+            # application process. Nothing else reaches Supabase's email quota.
+            if password_reset.claim(email, url=settings.app_database_url):
+                context().auth_admin.send_password_reset(
+                    email, auth_callback_url(settings.public_url)
+                )
         except AuthAdminError:
             pass  # Same answer whether or not the account exists or Supabase refused.
+        except Exception:  # noqa: BLE001 - the answer never reveals an internal failure
+            logger.exception("password reset request could not be processed")
+    # Same answer and (at least) the same duration whatever happened above.
+    remaining = RESET_RESPONSE_FLOOR_SECONDS - (time.monotonic() - started)
+    if remaining > 0:
+        time.sleep(remaining)
     return render_template("tenant/forgot_password.html", notice=RESET_SENT_MESSAGE, error=None)

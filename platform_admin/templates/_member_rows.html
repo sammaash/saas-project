@@ -3,7 +3,8 @@
 <tr>
   {% if show_tenant %}<td><a href="{{ url_for('admin.tenant_members', tenant_id=m.tenant_id) }}">{{ m.tenant_name }}</a>
     <br><span class="muted">{{ m.tenant_slug }} · {{ m.tenant_status }}</span></td>{% endif %}
-  <td>{% if m.email %}{{ m.full_name or '' }}<br>{{ m.email }}{% else %}<span class="muted">No Auth account on record</span>{% endif %}
+  <td>{% if m.email %}{{ m.full_name or '' }}<br>{{ m.email }}{% else %}<span class="badge unverified">Unverified</span>
+    <span class="muted">No Auth account on record: this membership cannot sign in and does not count as a verified owner.</span>{% endif %}
     <br><code class="muted">{{ m.user_id }}</code></td>
   <td><span class="badge">{{ m.role }}</span></td>
   <td><span class="badge {{ m.status }}">{{ m.status }}</span>{% if m.invited_at %}<br><span class="muted">invited {{ m.invited_at.strftime('%Y-%m-%d') }}</span>{% endif %}</td>
@@ -19,9 +20,11 @@
       {% else %}<input type="hidden" name="status" value="active"><button type="submit">Activate</button>{% endif %}
     </form>
     {% if m.email %}
+    {% if m.invited_at %}
     <form method="post" action="{{ url_for('admin.tenant_member_resend', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
       {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}"><button type="submit">Resend invitation</button>
     </form>
+    {% endif %}
     <form method="post" action="{{ url_for('admin.tenant_member_password_reset', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
       {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}"><button type="submit">Send password reset</button>
     </form>

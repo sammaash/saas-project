@@ -692,10 +692,11 @@ class MembershipLookupTests(unittest.TestCase):
 
     def test_membership_for_owner_staff_and_denial(self):
         cases = [
-            ({"columns": ("m", "o"), "rows": [(True, True)]}, {"role": "owner"}),
-            ({"columns": ("m", "o"), "rows": [(True, False)]}, {"role": "staff"}),
-            ({"columns": ("m", "o"), "rows": [(False, False)]}, None),
-            ({"columns": ("m", "o"), "rows": [(None, None)]}, None),  # fail closed
+            ({"columns": ("role",), "rows": [("owner",)]}, {"role": "owner"}),
+            ({"columns": ("role",), "rows": [("staff",)]}, {"role": "staff"}),
+            ({"columns": ("role",), "rows": [(None,)]}, None),  # no membership / closed tenant
+            ({"columns": ("role",), "rows": [("admin",)]}, None),  # unknown role: fail closed
+            ({"columns": ("role",), "rows": []}, None),  # fail closed
         ]
         for result, expected in cases:
             with self.subTest(expected=expected):
@@ -709,7 +710,7 @@ class MembershipLookupTests(unittest.TestCase):
         _, cursor, _ = self._run(
             [
                 {"columns": ("ok",), "rows": [("ok",)]},
-                {"columns": ("m", "o"), "rows": [(True, False)]},
+                {"columns": ("role",), "rows": [("staff",)]},
             ],
             lambda: tenant_membership.membership_for("user-1", TENANT_A),
         )
@@ -717,8 +718,9 @@ class MembershipLookupTests(unittest.TestCase):
         self.assertIn("request.jwt.claims", claims_sql)
         self.assertEqual(json.loads(claims_params[0]), {"sub": "user-1"})
         predicate_sql, predicate_params = cursor.executed[1]
-        self.assertIn("app.is_tenant_member", predicate_sql)
-        self.assertEqual(predicate_params, (TENANT_A, TENANT_A))
+        # Migration 0043: membership AND tenant status (draft/active) in one database check.
+        self.assertIn("app.my_tenant_membership", predicate_sql)
+        self.assertEqual(predicate_params, (TENANT_A,))
 
     def test_membership_for_requires_a_user_id(self):
         with patch("saas.tenant_membership.connect") as connect:

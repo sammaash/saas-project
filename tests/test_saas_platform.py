@@ -18,6 +18,7 @@ from saas_test_support import (
     TENANT_TWO_ID,
     SaasDatabaseTestCase,
     as_platform,
+    record_verified_account,
 )
 
 
@@ -403,6 +404,7 @@ class ActivationTests(SaasDatabaseTestCase):
     def test_activation_succeeds_when_ready_and_is_audited(self):
         with as_platform(PLATFORM_ADMIN_USER_ID) as cursor:
             tenant_id = _provision(cursor, owner=PLATFORM_ADMIN_USER_ID)
+            record_verified_account(cursor, PLATFORM_ADMIN_USER_ID)
             _add_catalogue(cursor, tenant_id)
             cursor.execute("select app.platform_set_tenant_status(%s, 'active')", (tenant_id,))
             self.assertEqual(cursor.fetchone()[0], "active")
@@ -442,6 +444,7 @@ class ActivationTests(SaasDatabaseTestCase):
     def test_channel_can_become_active_once_the_tenant_is_active(self):
         with as_platform(PLATFORM_ADMIN_USER_ID) as cursor:
             tenant_id = _provision(cursor, owner=PLATFORM_ADMIN_USER_ID)
+            record_verified_account(cursor, PLATFORM_ADMIN_USER_ID)
             _add_catalogue(cursor, tenant_id)
             cursor.execute("select app.platform_set_tenant_status(%s, 'active')", (tenant_id,))
             cursor.execute("reset role")

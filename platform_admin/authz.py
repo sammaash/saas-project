@@ -51,7 +51,11 @@ def admin_required(view):
 # tenant sign-in or sign-out touches only tenant keys, so a concurrent admin
 # session survives. The admin flow keeps its historical semantics unchanged.
 
-TENANT_SESSION_KEYS = ("t_user_id", "t_email", "t_exp", "t_tenant_id")
+#: Includes the short-lived password-setup keys (``t_pw_*``), so signing in or out of the
+#: portal also ends any half-finished invitation or reset.
+TENANT_SESSION_KEYS = (
+    "t_user_id", "t_email", "t_exp", "t_tenant_id", "t_pw_user_id", "t_pw_email", "t_pw_exp",
+)
 
 
 def clear_tenant_session() -> None:

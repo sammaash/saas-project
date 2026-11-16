@@ -30,13 +30,65 @@ class Identity:
     email: str | None = None
 
 
+#: Supabase ``amr`` methods that prove the person just used an emailed link or code.
+#: An ordinary password sign-in (``password``), a refresh-only session, OAuth or SSO
+#: never qualifies: those must not be able to set a new password without the old one.
+LINK_AUTH_METHODS = frozenset({"invite", "recovery", "otp"})
+#: An invitation or reset link must have been used within this many seconds.
+LINK_TOKEN_MAX_AGE_SECONDS = 15 * 60
+_CLOCK_SKEW_SECONDS = 60
+
+
+def check_link_claims(
+    claims: dict, *, now: float | None = None, max_age: int = LINK_TOKEN_MAX_AGE_SECONDS
+) -> None:
+    """Raise AuthError unless the claims come from a fresh invitation/recovery/OTP link.
+
+    Requirements: an ``amr`` list with an ``invite``, ``recovery`` or ``otp`` entry whose
+    timestamp is at most ``max_age`` seconds old, no ``password`` entry, and an ``iat``
+    that is also at most ``max_age`` seconds old.
+    """
+    now = time.time() if now is None else now
+    error = AuthError("Invalid or expired credentials.")
+    amr = claims.get("amr")
+    if not isinstance(amr, list) or not amr:
+        raise error
+    methods: list[tuple[str, float]] = []
+    for entry in amr:
+        if not isinstance(entry, dict):
+            raise error
+        method, stamp = entry.get("method"), entry.get("timestamp")
+        if not isinstance(method, str) or isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            raise error
+        methods.append((method, float(stamp)))
+    if any(method == "password" for method, _ in methods):
+        raise error
+    if not any(
+        method in LINK_AUTH_METHODS and now - max_age <= stamp <= now + _CLOCK_SKEW_SECONDS
+        for method, stamp in methods
+    ):
+        raise error
+    issued = claims.get("iat")
+    if isinstance(issued, bool) or not isinstance(issued, (int, float)):
+        raise error
+    if not now - max_age <= float(issued) <= now + _CLOCK_SKEW_SECONDS:
+        raise error
+
+
 class Authenticator(abc.ABC):
     @abc.abstractmethod
     def login(self, email: str, password: str) -> Identity:
         """Verify credentials and return the verified identity, or raise AuthError."""
 
     def verify_token(self, token: str) -> Identity:
-        """Verify a Supabase access token (from an invitation or reset link)."""
+        """Verify a Supabase access token."""
+        raise AuthError("Invalid or expired credentials.")
+
+    def verify_link_token(self, token: str) -> Identity:
+        """Verify a token from an invitation or reset link (see ``check_link_claims``).
+
+        Fails closed: an authenticator that cannot inspect the claims accepts nothing.
+        """
         raise AuthError("Invalid or expired credentials.")
 
 
@@ -60,6 +112,23 @@ class SupabaseAuthenticator(Authenticator):
 
     # -- token verification (also used directly by tests) ----------------------
     def verify_token(self, token: str) -> Identity:
+        return self._identity(self._claims(token))
+
+    def verify_link_token(self, token: str) -> Identity:
+        claims = self._claims(token)
+        check_link_claims(claims)
+        return self._identity(claims)
+
+    @staticmethod
+    def _identity(claims: dict) -> Identity:
+        try:
+            user_id = str(uuid.UUID(str(claims["sub"])))
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise AuthError("Invalid or expired credentials.") from error
+        email = claims.get("email")
+        return Identity(user_id=user_id, email=email if isinstance(email, str) else None)
+
+    def _claims(self, token: str) -> dict:
         import jwt  # noqa: PLC0415  (lazy optional dependency)
 
         try:
@@ -78,10 +147,11 @@ class SupabaseAuthenticator(Authenticator):
                 issuer=f"{self._base}/auth/v1",
                 options={"require": ["exp", "sub", "aud", "iss"]},
             )
-            user_id = str(uuid.UUID(str(claims["sub"])))
         except Exception as error:  # noqa: BLE001 - never leak verification detail
             raise AuthError("Invalid or expired credentials.") from error
-        return Identity(user_id=user_id, email=claims.get("email"))
+        if not isinstance(claims, dict):
+            raise AuthError("Invalid or expired credentials.")
+        return claims
 
     # -- login -------------------------------------------------------------------
     def login(self, email: str, password: str) -> Identity:

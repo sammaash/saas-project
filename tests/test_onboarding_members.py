@@ -123,7 +123,10 @@ class OnboardingTestCase(SaasDatabaseTestCase):
                 "insert into public.platform_admins (user_id) values (%s) on conflict do nothing",
                 (PLATFORM_ADMIN_USER_ID,),
             )
+            cursor.execute("select coalesce(max(id), 0) from public.audit_log")
+            self.audit_baseline = cursor.fetchone()[0]
         conn.close()
+        self.addCleanup(self._cleanup_new_audit_rows)
         self.cindy_before = self._cindy_snapshot()
         self.auth_admin = FakeAuthAdmin()
         self.authenticator = FakeAuthenticator()
@@ -160,6 +163,18 @@ class OnboardingTestCase(SaasDatabaseTestCase):
                 cursor.execute("delete from public.platform_user_directory where user_id = any(%s)", (users,))
             cursor.execute(
                 "delete from public.platform_admins where user_id = %s", (PLATFORM_ADMIN_USER_ID,)
+            )
+            # Reset-throttle state (0043) is test-only data in the disposable database.
+            cursor.execute("delete from public.password_reset_requests")
+        conn.close()
+
+    def _cleanup_new_audit_rows(self):
+        """Audit rows these tests wrote on Cindy Bakes or at platform level (no tenant)."""
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute(
+                "delete from public.audit_log where id > %s and (tenant_id is null or tenant_id = %s)",
+                (self.audit_baseline, TENANT_ONE_ID),
             )
         conn.close()
 
@@ -299,15 +314,21 @@ class OnboardingTests(OnboardingTestCase):
         self.assertIn("nothing was deleted", body)
         self.assertIn("Link an existing account", body)
         self.assertIsNone(self.tenant_id("eta"), "the failed provisioning must roll back entirely")
-        self.assertEqual(_rows("select count(*) from public.platform_user_directory where email = %s",
-                               ("owner-eta" + DOMAIN,)), [(0,)])
         account = self.auth_admin.users["owner-eta" + DOMAIN]
+        # M4: the invited account stays discoverable even though provisioning rolled back.
+        self.assertEqual(_rows("select user_id::text from public.platform_user_directory where email = %s",
+                               ("owner-eta" + DOMAIN,)), [(account.id,)])
+        orphans = self.client.get("/members", query_string={"view": "unattached"}).get_data(as_text=True)
+        self.assertIn("owner-eta" + DOMAIN, orphans)
 
         retry = self.onboard("eta", mode="link")
         self.assertEqual(retry.status_code, 302)
         self.assertEqual(len(self.auth_admin.invites), 1, "the retry must not invite again")
         self.assertEqual([m[1:] for m in self.members(self.tenant_id("eta"))],
                          [(account.id, "owner", "active")])
+        orphans = self.client.get("/members", query_string={"view": "unattached"}).get_data(as_text=True)
+        self.assertNotIn("<br>owner-eta" + DOMAIN + "<br>", orphans)  # no table row (the flash may name it)
+        self.assertIn("Every known account has a membership.", orphans)
 
     def test_invalid_input_is_rejected_before_any_supabase_call(self):
         for field, value in (("owner_email", "not-an-email"), ("slug", "Bad Slug"),
@@ -565,6 +586,486 @@ class CindyBakesCompatibilityTests(OnboardingTestCase):
         page = self.client.get(f"/tenants/{TENANT_ONE_ID}/members").get_data(as_text=True)
         self.assertIn(TENANT_ONE_OWNER_USER_ID, page)
         self.assertIn("No Auth account on record", page)
+        self.assertIn("Unverified", page)
+        unverified = self.client.get("/members", query_string={"view": "unverified"}).get_data(as_text=True)
+        self.assertIn(TENANT_ONE_OWNER_USER_ID, unverified)
+        self.assertIn(TENANT_ONE_STAFF_USER_ID, unverified)
+
+    def test_cindy_gets_a_real_owner_then_placeholders_can_be_retired(self):
+        real = self.auth_admin.add_existing("cindy-owner" + DOMAIN, "Cindy Owner")
+        self.post(f"/tenants/{TENANT_ONE_ID}/members",
+                  {"email": "cindy-owner" + DOMAIN, "role": "owner", "status": "active"})
+        placeholder = _rows("select id from public.tenant_users where tenant_id = %s and user_id = %s",
+                            (TENANT_ONE_ID, TENANT_ONE_OWNER_USER_ID))[0][0]
+        real_membership = _rows("select id from public.tenant_users where tenant_id = %s and user_id = %s",
+                                (TENANT_ONE_ID, real.id))[0][0]
+        try:
+            response = self.post(f"/tenants/{TENANT_ONE_ID}/members/{placeholder}/status", {"status": "disabled"})
+            self.assertIn("Membership deactivated", self.follow(response))
+            # The real owner is now the only verified active owner, so it cannot be removed.
+            response = self.post(f"/tenants/{TENANT_ONE_ID}/members/{real_membership}/status",
+                                 {"status": "disabled"})
+            self.assertIn("verified account", self.follow(response))
+            self.assertEqual(_rows("select status from public.tenant_users where id = %s", (real_membership,)),
+                             [("active",)])
+        finally:
+            conn = _connect()
+            with conn, conn.cursor() as cursor:  # restore the seeded placeholder exactly
+                cursor.execute("update public.tenant_users set status = 'active' where id = %s", (placeholder,))
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 / M6: suspended and inactive tenants
+# ---------------------------------------------------------------------------
+def _set_tenant_status(tenant_id: str, status: str) -> None:
+    conn = _connect()
+    with conn, conn.cursor() as cursor:
+        cursor.execute("update public.tenants set status = %s where id = %s", (status, tenant_id))
+    conn.close()
+
+
+class SuspendedTenantTests(OnboardingTestCase):
+    PHONE = "onb-test-phone-001"
+
+    def setUp(self):
+        super().setUp()
+        self.onboard("alpha")
+        self.alpha = self.tenant_id("alpha")
+        self.owner = self.auth_admin.users["owner-alpha" + DOMAIN]
+        self.authenticator.users["owner-alpha" + DOMAIN] = (PASSWORD, self.owner.id)
+
+    def portal_login(self):
+        portal = self.app.test_client()
+        portal.get("/t/login")
+        response = portal.post("/t/login", data={"csrf_token": self.token(portal),
+                                                 "email": "owner-alpha" + DOMAIN, "password": PASSWORD})
+        return portal, response
+
+    def test_draft_and_active_tenants_admit_members(self):
+        for status in ("draft", "active"):
+            with self.subTest(status=status):
+                _set_tenant_status(self.alpha, status)
+                portal, response = self.portal_login()
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(portal.get(f"/t/{self.alpha}/").status_code, 200)
+
+    def test_suspended_and_inactive_tenants_refuse_sign_in_and_existing_sessions(self):
+        portal, _ = self.portal_login()
+        self.assertEqual(portal.get(f"/t/{self.alpha}/").status_code, 200)
+        for status in ("suspended", "inactive"):
+            with self.subTest(status=status):
+                _set_tenant_status(self.alpha, status)
+                # An existing session is re-checked on every request.
+                self.assertEqual(portal.get(f"/t/{self.alpha}/").status_code, 403)
+                self.assertEqual(portal.get(f"/t/{self.alpha}/settings").status_code, 403)
+                reply = portal.post(f"/t/{self.alpha}/inbox/{uuid.uuid4()}/reply",
+                                    data={"csrf_token": self.token(portal), "text": "hello"})
+                self.assertEqual(reply.status_code, 403)
+                # A new sign-in gets the same generic error as a wrong password.
+                fresh, response = self.portal_login()
+                self.assertEqual(response.status_code, 401)
+                self.assertIn("Invalid email or password", response.get_data(as_text=True))
+        _set_tenant_status(self.alpha, "active")
+        portal, response = self.portal_login()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(portal.get(f"/t/{self.alpha}/").status_code, 200)
+
+    def test_suspending_one_tenant_leaves_the_members_other_tenants_open(self):
+        self.onboard("beta", mode="link", email="owner-alpha" + DOMAIN)
+        beta = self.tenant_id("beta")
+        _set_tenant_status(self.alpha, "suspended")
+        portal, response = self.portal_login()
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"/t/{beta}/", response.headers["Location"])
+        self.assertEqual(portal.get(f"/t/{beta}/").status_code, 200)
+        self.assertEqual(portal.get(f"/t/{self.alpha}/").status_code, 403)
+
+    def _activate_with_channel(self, channel_status="active"):
+        _set_tenant_status(self.alpha, "active")
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute(
+                "insert into public.tenant_channels (tenant_id, channel_type, phone_number_id, waba_id, "
+                "display_phone_number, status, is_default, credentials_ref) "
+                "values (%s, 'whatsapp', %s, 'onb-test-waba', '+254700000999', %s, true, %s)",
+                (self.alpha, self.PHONE, channel_status, f"tenants/{self.alpha}/whatsapp"))
+        conn.close()
+
+    def _send(self, settings):
+        from platform_admin.services import whatsapp as whatsapp_service  # noqa: PLC0415
+
+        return whatsapp_service.send_text(
+            settings, phone_number_id=self.PHONE, tenant_id=self.alpha,
+            credentials_ref=f"tenants/{self.alpha}/whatsapp", recipient="254700000001", text="hi")
+
+    def test_outbound_messages_require_an_active_tenant_and_an_active_channel(self):
+        from unittest.mock import MagicMock, patch  # noqa: PLC0415
+
+        from platform_admin.services import whatsapp as whatsapp_service  # noqa: PLC0415
+        from platform_admin.services.validation import ServiceError  # noqa: PLC0415
+
+        settings = _settings(whatsapp_send_enabled=True)
+        self._activate_with_channel()
+        provider = MagicMock()
+        provider.return_value.__enter__.return_value.read.return_value = b'{"messages": [{"id": "wamid.T"}]}'
+        with patch.object(whatsapp_service, "access_token", return_value="test-token") as token, \
+                patch.object(whatsapp_service.urllib.request, "urlopen", provider):
+            self.assertEqual(self._send(settings), "wamid.T")
+            self.assertEqual(provider.call_count, 1)
+            for status in ("suspended", "inactive"):
+                with self.subTest(status=status):
+                    _set_tenant_status(self.alpha, status)
+                    with self.assertRaises(ServiceError) as raised:
+                        self._send(settings)
+                    self.assertEqual(raised.exception.status, 409)
+                    # Refused before the credential lookup and before any provider call.
+                    self.assertEqual(provider.call_count, 1)
+            self.assertEqual(token.call_count, 1)
+            # Another tenant's id with this phone number is refused too (cross-tenant).
+            _set_tenant_status(self.alpha, "active")
+            with self.assertRaises(ServiceError):
+                whatsapp_service.send_text(
+                    settings, phone_number_id=self.PHONE, tenant_id=TENANT_ONE_ID,
+                    credentials_ref=f"tenants/{TENANT_ONE_ID}/whatsapp", recipient="254700000001", text="x")
+            self.assertEqual(provider.call_count, 1)
+
+    def test_a_disabled_channel_cannot_send_even_for_an_active_tenant(self):
+        from platform_admin.services import whatsapp as whatsapp_service  # noqa: PLC0415
+        from platform_admin.services.validation import ServiceError  # noqa: PLC0415
+
+        self._activate_with_channel(channel_status="disabled")
+        with self.assertRaises(ServiceError) as raised:
+            whatsapp_service.require_sendable_channel(_settings(), self.alpha, self.PHONE)
+        self.assertEqual(raised.exception.status, 409)
+
+    def test_inbound_routing_still_requires_an_active_tenant(self):
+        from platform_admin.services import whatsapp as whatsapp_service  # noqa: PLC0415
+
+        self._activate_with_channel()
+        self.assertIsNotNone(whatsapp_service.resolve_channel(_settings(), self.PHONE))
+        _set_tenant_status(self.alpha, "suspended")
+        self.assertIsNone(whatsapp_service.resolve_channel(_settings(), self.PHONE))
+
+
+# ---------------------------------------------------------------------------
+# M1: a deleted and recreated Supabase account
+# ---------------------------------------------------------------------------
+class RecreatedAccountTests(OnboardingTestCase):
+    def test_recreated_account_is_linked_and_the_reassignment_audited(self):
+        email = "owner-alpha" + DOMAIN
+        self.onboard("alpha")
+        old = self.auth_admin.users.pop(email)          # deleted in Supabase ...
+        new = self.auth_admin.add_existing(email, "Owner Alpha")  # ... and created again
+        self.assertNotEqual(old.id, new.id)
+
+        response = self.onboard("beta", mode="link", email=email)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual([m[1:] for m in self.members(self.tenant_id("beta"))], [(new.id, "owner", "active")])
+        self.assertEqual(_rows("select user_id::text from public.platform_user_directory where email = %s",
+                               (email,)), [(new.id,)])
+        self.assertEqual(self.auth_admin.invites, [(email, "Owner Alpha", CALLBACK)], "no second invitation")
+        audit = _rows("select metadata from public.audit_log where action = 'directory.entry_reassigned' "
+                      "and id > %s", (self.audit_baseline,))
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0][0]["previous_user_id"], old.id)
+        self.assertEqual(audit[0][0]["user_id"], new.id)
+        self.assertEqual(audit[0][0]["previous_user_memberships"], 1)
+        self.assertNotIn("@", str(audit[0][0]))
+        # The old membership is now shown as unverified and no longer satisfies readiness.
+        page = self.client.get(f"/tenants/{self.tenant_id('alpha')}/members").get_data(as_text=True)
+        self.assertIn("Unverified", page)
+
+    def test_recreated_account_can_be_added_to_an_existing_tenant(self):
+        email = "staff-re" + DOMAIN
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        self.post(f"/tenants/{alpha}/members/invite", {"full_name": "Staff Re", "email": email, "role": "staff"})
+        self.auth_admin.users.pop(email)
+        new = self.auth_admin.add_existing(email)
+        response = self.post(f"/tenants/{alpha}/members", {"email": email, "role": "staff"})
+        self.assertIn("Added " + email, self.follow(response))
+        self.assertIn(new.id, [m[1] for m in self.members(alpha)])
+        self.assertEqual(_rows("select user_id::text from public.platform_user_directory where email = %s",
+                               (email,)), [(new.id,)])
+
+    def test_resend_to_a_recreated_account_explains_instead_of_pretending(self):
+        email = "owner-alpha" + DOMAIN
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        membership = self.members(alpha)[0][0]
+        self.auth_admin.users.pop(email)   # deleted; a fresh invite creates a NEW account
+        page = self.follow(self.post(f"/tenants/{alpha}/members/{membership}/resend-invite"))
+        self.assertIn("created a NEW account", page)
+        new = self.auth_admin.users[email]
+        self.assertEqual(_rows("select user_id::text from public.platform_user_directory where email = %s",
+                               (email,)), [(new.id,)])
+        unattached = self.client.get("/members", query_string={"view": "unattached"}).get_data(as_text=True)
+        self.assertIn(new.id, unattached)
+
+
+# ---------------------------------------------------------------------------
+# M2: audit completeness without personal data
+# ---------------------------------------------------------------------------
+class AuditCompletenessTests(OnboardingTestCase):
+    def new_audit(self):
+        return _rows("select action, tenant_id::text, actor_user_id::text, metadata from public.audit_log "
+                     "where id > %s order by id", (self.audit_baseline,))
+
+    def test_every_member_action_and_directory_change_is_audited_without_email_or_name(self):
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        owner = self.auth_admin.users["owner-alpha" + DOMAIN]
+        membership = self.members(alpha)[0][0]
+        self.follow(self.post(f"/tenants/{alpha}/members/{membership}/resend-invite"))
+        self.follow(self.post(f"/tenants/{alpha}/members/{membership}/password-reset"))
+
+        rows = self.new_audit()
+        actions = [r[0] for r in rows]
+        for action in ("directory.entry_added", "tenant.provisioned", "tenant.onboarded",
+                       "member.invitation_resent", "directory.entry_updated", "member.password_reset_sent"):
+            self.assertIn(action, actions)
+        by_action = {r[0]: r for r in rows}
+        self.assertEqual(by_action["member.invitation_resent"][1], alpha)
+        self.assertEqual(by_action["member.invitation_resent"][3], {"user_id": owner.id})
+        self.assertEqual(by_action["member.password_reset_sent"][3], {"user_id": owner.id})
+        self.assertEqual(by_action["directory.entry_updated"][3]["changed"], ["invited_at"])
+        self.assertIsNone(by_action["directory.entry_added"][1], "directory events are platform-level")
+        for action, _, actor, metadata in rows:
+            self.assertEqual(actor, PLATFORM_ADMIN_USER_ID, action)
+            if action.startswith(("directory.", "member.")):
+                self.assertNotIn("@", str(metadata), action)
+                self.assertNotIn("Owner Alpha", str(metadata), action)
+
+    def test_an_unchanged_directory_entry_writes_no_audit_row(self):
+        from saas import platform  # noqa: PLC0415
+
+        self.onboard("alpha")
+        owner = self.auth_admin.users["owner-alpha" + DOMAIN]
+        before = len(self.new_audit())
+        platform.upsert_user_directory(PLATFORM_ADMIN_USER_ID, owner.id, owner.email, "Owner Alpha", False,
+                                       url=platform_admin_test_url())
+        self.assertEqual(len(self.new_audit()), before)
+
+
+# ---------------------------------------------------------------------------
+# M3: no phantom owners
+# ---------------------------------------------------------------------------
+class PhantomOwnerTests(OnboardingTestCase):
+    def phantom_owner(self, tenant_id) -> str:
+        phantom = str(uuid.uuid4())
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute("insert into public.tenant_users (tenant_id, user_id, role, status) "
+                           "values (%s, %s, 'owner', 'active') returning id", (tenant_id, phantom))
+            membership = str(cursor.fetchone()[0])
+        conn.close()
+        return membership
+
+    def readiness_owner(self, tenant_id) -> bool:
+        from saas import platform  # noqa: PLC0415
+
+        checks = platform.tenant_readiness(PLATFORM_ADMIN_USER_ID, tenant_id,
+                                           url=platform_admin_test_url())["checks"]
+        return next(c["ok"] for c in checks if c["key"] == "owner")
+
+    def test_a_phantom_owner_never_satisfies_readiness(self):
+        response = self.post("/tenants/new", {"name": "Phantom Co", "slug": SLUG_PREFIX + "phantom",
+                                              "timezone": "Africa/Nairobi", "currency": "KES"})
+        self.assertEqual(response.status_code, 302)
+        tenant = self.tenant_id("phantom")
+        self.phantom_owner(tenant)
+        self.assertFalse(self.readiness_owner(tenant))
+        page = self.follow(self.post(f"/tenants/{tenant}/status", {"status": "active"}))
+        self.assertIn("not ready to activate", page)
+        self.assertIn("owner", page)
+        self.onboard("alpha")
+        self.assertTrue(self.readiness_owner(self.tenant_id("alpha")))
+
+    def test_the_verified_owner_cannot_be_removed_while_only_a_phantom_remains(self):
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        real = self.membership_id(alpha, self.auth_admin.users["owner-alpha" + DOMAIN].id)
+        phantom = self.phantom_owner(alpha)
+        for path, data in (("status", {"status": "disabled"}), ("role", {"role": "staff"}),
+                           ("remove", {"confirm": "revoke"})):
+            page = self.follow(self.post(f"/tenants/{alpha}/members/{real}/{path}", data))
+            self.assertIn("at least one active owner with a verified account", page, path)
+        self.assertEqual(_rows("select role, status from public.tenant_users where id = %s", (real,)),
+                         [("owner", "active")])
+        # The phantom itself can be retired.
+        page = self.follow(self.post(f"/tenants/{alpha}/members/{phantom}/remove", {"confirm": "revoke"}))
+        self.assertIn("Tenant access revoked", page)
+
+    def membership_id(self, tenant_id, user_id):
+        return str(_rows("select id from public.tenant_users where tenant_id = %s and user_id = %s",
+                         (tenant_id, user_id))[0][0])
+
+    def test_unverified_user_ids_are_refused_without_supabase_administration(self):
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        app = create_app(_settings(supabase_service_role_key=None, public_url=None),
+                         authenticator=self.authenticator)
+        client = app.test_client()
+        self.login(client)
+        response = self.post(f"/tenants/{alpha}/members", {"user_id": str(uuid.uuid4()), "role": "owner"},
+                             client=client)
+        self.assertIn("cannot be verified", self.follow(response, client))
+        self.assertEqual(len(self.members(alpha)), 1)
+
+    def test_unknown_user_ids_are_refused_with_supabase_administration(self):
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        page = self.follow(self.post(f"/tenants/{alpha}/members", {"user_id": str(uuid.uuid4()), "role": "owner"}))
+        self.assertIn("No Supabase Auth account has that user id", page)
+        self.assertEqual(len(self.members(alpha)), 1)
+
+    def test_legacy_create_page_cannot_assign_an_owner(self):
+        response = self.post("/tenants/new", {"name": "Phantom Co", "slug": SLUG_PREFIX + "phantom",
+                                              "owner_user_id": str(uuid.uuid4())})
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.tenant_id("phantom"))
+
+
+# ---------------------------------------------------------------------------
+# M4: orphaned invitations
+# ---------------------------------------------------------------------------
+class OrphanedAccountTests(OnboardingTestCase):
+    def test_an_orphaned_account_is_listed_and_linked_without_a_second_account(self):
+        self.onboard("alpha")
+        alpha = self.tenant_id("alpha")
+        response = self.onboard("beta", plan_id=str(uuid.uuid4()))  # provisioning fails after the invite
+        self.assertGreaterEqual(response.status_code, 400)
+        orphan = self.auth_admin.users["owner-beta" + DOMAIN]
+        page = self.client.get("/members", query_string={"view": "unattached"}).get_data(as_text=True)
+        self.assertIn("owner-beta" + DOMAIN, page)
+        self.assertNotIn("owner-alpha" + DOMAIN, page, "accounts with a membership are not orphans")
+        searched = self.client.get("/members", query_string={"view": "unattached", "q": "nobody"}).get_data(
+            as_text=True)
+        self.assertNotIn("owner-beta" + DOMAIN, searched)
+
+        response = self.post("/members/link", {"tenant_id": alpha, "email": orphan.email,
+                                                "user_id": orphan.id, "role": "staff"})
+        self.assertTrue(response.headers["Location"].endswith("/members?view=unattached"))
+        self.assertIn(f"Added {orphan.email} as staff", self.follow(response))
+        self.assertIn((orphan.id, "staff", "active"), [m[1:] for m in self.members(alpha)])
+        self.assertEqual(len(self.auth_admin.invites), 2, "linking never invites again")
+        self.assertEqual(sum(1 for u in self.auth_admin.users.values() if u.email == orphan.email), 1)
+        page = self.client.get("/members", query_string={"view": "unattached"}).get_data(as_text=True)
+        self.assertNotIn("<br>owner-beta" + DOMAIN + "<br>", page)
+
+    def test_link_route_requires_a_real_tenant(self):
+        response = self.post("/members/link", {"tenant_id": str(uuid.uuid4()), "email": "x" + DOMAIN,
+                                                "role": "staff"})
+        self.assertEqual(response.status_code, 404)
+
+
+# ---------------------------------------------------------------------------
+# M5: self-service password reset
+# ---------------------------------------------------------------------------
+class PasswordResetThrottleTests(OnboardingTestCase):
+    def setUp(self):
+        super().setUp()
+        self.onboard("alpha")
+        self.onboard("beta")
+        self.onboard("gamma")
+
+    def claim(self, email, **caps):
+        from saas import password_reset  # noqa: PLC0415
+
+        return password_reset.claim(email, url=app_backend_test_url(), **caps)
+
+    def test_only_active_members_of_open_tenants_are_eligible(self):
+        self.assertTrue(self.claim("owner-alpha" + DOMAIN))
+        self.assertTrue(self.claim("  OWNER-BETA" + DOMAIN.upper() + " "))
+        self.assertFalse(self.claim("nobody" + DOMAIN))
+        self.assertFalse(self.claim(""))
+        _set_tenant_status(self.tenant_id("gamma"), "suspended")
+        self.assertFalse(self.claim("owner-gamma" + DOMAIN))
+        # A disabled membership is not eligible either (placeholder owner keeps the tenant valid).
+        conn = _connect()
+        with conn, conn.cursor() as cursor:
+            cursor.execute("update public.tenants set status = 'active' where id = %s", (self.tenant_id("gamma"),))
+            cursor.execute("insert into public.tenant_users (tenant_id, user_id, role, status) "
+                           "values (%s, gen_random_uuid(), 'owner', 'active')", (self.tenant_id("gamma"),))
+            cursor.execute("update public.tenant_users set status = 'disabled' where tenant_id = %s and user_id = %s",
+                           (self.tenant_id("gamma"), self.auth_admin.users["owner-gamma" + DOMAIN].id))
+        conn.close()
+        self.assertFalse(self.claim("owner-gamma" + DOMAIN))
+
+    def test_per_email_and_global_caps(self):
+        results = [self.claim("owner-alpha" + DOMAIN) for _ in range(5)]
+        self.assertEqual(results, [True, True, True, False, False], "built-in per-email cap is 3 an hour")
+        self.assertTrue(self.claim("owner-beta" + DOMAIN, global_per_hour=4))
+        self.assertFalse(self.claim("owner-gamma" + DOMAIN, global_per_hour=4), "global cap reached")
+        # Callers can only lower the caps, never raise them.
+        self.assertFalse(self.claim("owner-alpha" + DOMAIN, per_email_per_hour=1000))
+
+    def test_caps_hold_across_concurrent_processes(self):
+        import threading  # noqa: PLC0415
+
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def worker():
+            outcome = self.claim("owner-alpha" + DOMAIN)  # a new connection each time
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=worker) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(results), [False] * 9 + [True] * 3)
+
+    def test_requests_are_audited_and_stored_without_the_email(self):
+        self.claim("owner-alpha" + DOMAIN)
+        owner = self.auth_admin.users["owner-alpha" + DOMAIN]
+        audit = _rows("select actor_type, entity_id, metadata from public.audit_log "
+                      "where action = 'auth.password_reset_requested' and id > %s", (self.audit_baseline,))
+        self.assertEqual(audit, [("system", owner.id, {"user_id": owner.id})])
+        stored = _rows("select encode(email_hash, 'hex') from public.password_reset_requests")
+        self.assertEqual(len(stored), 1)
+        self.assertNotIn("owner", stored[0][0])
+        self.assertEqual(len(stored[0][0]), 64)
+
+    def test_client_roles_cannot_read_the_throttle_table(self):
+        import psycopg  # noqa: PLC0415
+
+        conn = psycopg.connect(app_backend_test_url())
+        try:
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                with conn.cursor() as cursor:
+                    cursor.execute("select * from public.password_reset_requests")
+        finally:
+            conn.close()
+        grants = _rows(
+            "select r.rolname from pg_roles r where r.rolname in ('anon', 'authenticated', 'app_backend', "
+            "'service_role') and (has_table_privilege(r.rolname, 'public.password_reset_requests', 'SELECT') "
+            "or has_table_privilege(r.rolname, 'public.password_reset_requests', 'INSERT'))")
+        self.assertEqual(grants, [])
+        callers = _rows(
+            "select r.rolname from pg_roles r where r.rolname in ('anon', 'authenticated', 'service_role') "
+            "and has_function_privilege(r.rolname, 'app.request_password_reset(text, integer, integer)', 'EXECUTE')")
+        self.assertEqual(callers, [])
+
+    def test_forgot_password_page_sends_only_for_eligible_accounts(self):
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from platform_admin.routes import tenant_auth  # noqa: PLC0415
+
+        pages = []
+        portal = self.app.test_client()
+        with patch.object(tenant_auth, "RESET_RESPONSE_FLOOR_SECONDS", 0):
+            for email in ("owner-alpha" + DOMAIN, "nobody" + DOMAIN):
+                portal.get("/t/forgot-password")
+                response = portal.post("/t/forgot-password",
+                                       data={"csrf_token": self.token(portal), "email": email})
+                self.assertEqual(response.status_code, 200)
+                pages.append(response.get_data(as_text=True))
+        self.assertEqual(pages[0], pages[1])
+        self.assertEqual(self.auth_admin.resets, [("owner-alpha" + DOMAIN, CALLBACK)])
 
 
 if __name__ == "__main__":
