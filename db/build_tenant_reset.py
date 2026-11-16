@@ -7,7 +7,8 @@ What it removes
     credential-vault rows.
 
 What it keeps
-    ``plans``, ``platform_admins``, ``reserved_phone_numbers``, the migration ledger, every
+    ``plans``, ``platform_admins``, ``reserved_phone_numbers``, ``platform_user_directory`` (0042;
+    it has no ``tenant_id``), the migration ledger, every
     role, grant, function and policy, and **all of** ``audit_log``: its tenant foreign key is
     ``ON DELETE SET NULL``, so history survives; the original tenant attribution of each audit
     row is preserved in the backup schema. Supabase ``auth.users`` is not touched.

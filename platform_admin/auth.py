@@ -35,6 +35,10 @@ class Authenticator(abc.ABC):
     def login(self, email: str, password: str) -> Identity:
         """Verify credentials and return the verified identity, or raise AuthError."""
 
+    def verify_token(self, token: str) -> Identity:
+        """Verify a Supabase access token (from an invitation or reset link)."""
+        raise AuthError("Invalid or expired credentials.")
+
 
 class SupabaseAuthenticator(Authenticator):
     AUDIENCE = "authenticated"

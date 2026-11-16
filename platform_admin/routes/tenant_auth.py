@@ -29,6 +29,7 @@ from saas import tenant_membership
 
 from .. import csrf
 from ..auth import AuthError, LoginRateLimiter
+from ..auth_admin import AuthAdminError, auth_callback_url, check_password, normalize_email
 from ..authz import (
     clear_tenant_session,
     context,
@@ -46,13 +47,42 @@ THROTTLE_ERROR = "Too many sign-in attempts. Please try again later."
 #: A separate limiter instance from the admin console's, so tenant sign-in
 #: attempts cannot throttle admin sign-in (and vice versa).
 _TENANT_LIMITER = LoginRateLimiter()
+#: Password-reset requests are throttled separately, per IP and email.
+_RESET_LIMITER = LoginRateLimiter()
+
+#: Session keys for the short window between opening an invitation (or reset) link and
+#: choosing a password. They hold only the verified user id and email, never a token.
+PASSWORD_SETUP_KEYS = ("t_pw_user_id", "t_pw_email", "t_pw_exp")
+PASSWORD_SETUP_SECONDS = 15 * 60
+LINK_ERROR = "This link is invalid or has expired. Ask for a new invitation or password reset."
+RESET_SENT_MESSAGE = (
+    "If an account exists for that email, we have sent a link to choose a new password."
+)
+
+
+def _clear_password_setup() -> None:
+    for key in PASSWORD_SETUP_KEYS:
+        session.pop(key, None)
+
+
+def _password_setup_user() -> str | None:
+    user_id = session.get("t_pw_user_id")
+    exp = session.get("t_pw_exp", 0)
+    if not isinstance(user_id, str) or not isinstance(exp, (int, float)) or exp < time.time():
+        _clear_password_setup()
+        return None
+    return user_id
 
 
 @tenant_auth_bp.get("/t/login")
 def login():
     if tenant_session_user_id() is not None:
         return redirect(url_for("tenant_dashboard.home"))
-    return render_template("tenant/login.html", error=None)
+    notice = (
+        "Your password is set. Sign in with your email and new password."
+        if request.args.get("password") == "set" else None
+    )
+    return render_template("tenant/login.html", error=None, notice=notice)
 
 
 @tenant_auth_bp.post("/t/login")
@@ -138,3 +168,78 @@ def select_tenant_submit():
         abort(403)
     session["t_tenant_id"] = raw
     return redirect(url_for("tenant_dashboard.tenant_home", tenant_id=raw))
+
+# ---------------------------------------------------------------------------
+# Invitation acceptance, password setup and password reset
+# ---------------------------------------------------------------------------
+# Supabase sends invitation and reset links to /t/auth/callback with the access token in the
+# URL fragment, which never reaches a server. A same-origin script (static/auth_callback.js)
+# posts it here once, with the CSRF token, and removes it from the address bar. The server
+# verifies it, keeps only the verified user id for 15 minutes, and discards the token.
+# Opening a link grants no tenant access: the person must still choose a password and sign
+# in, and sign-in still requires an active membership.
+
+@tenant_auth_bp.get("/t/auth/callback")
+def auth_callback():
+    return render_template("tenant/auth_callback.html", error=None)
+
+
+@tenant_auth_bp.post("/t/auth/callback")
+def auth_callback_submit():
+    token = (request.form.get("access_token") or "").strip()
+    if not token or len(token) > 8192:
+        return render_template("tenant/auth_callback.html", error=LINK_ERROR), 400
+    try:
+        identity = context().authenticator.verify_token(token)
+    except AuthError:
+        return render_template("tenant/auth_callback.html", error=LINK_ERROR), 400
+    _clear_password_setup()
+    session["t_pw_user_id"] = identity.user_id
+    session["t_pw_email"] = identity.email or ""
+    session["t_pw_exp"] = int(time.time() + PASSWORD_SETUP_SECONDS)
+    csrf.rotate()
+    return redirect(url_for("tenant_auth.set_password"))
+
+
+@tenant_auth_bp.route("/t/set-password", methods=["GET", "POST"])
+def set_password():
+    user_id = _password_setup_user()
+    if user_id is None:
+        return render_template("tenant/auth_callback.html", error=LINK_ERROR), 400
+    email = session.get("t_pw_email", "")
+    if request.method == "GET":
+        return render_template("tenant/set_password.html", email=email, error=None)
+    password = request.form.get("password") or ""
+    confirm = request.form.get("confirm") or ""
+    try:
+        check_password(password, confirm)
+        context().auth_admin.set_password(user_id, password)
+    except AuthAdminError as error:
+        return render_template("tenant/set_password.html", email=email, error=str(error)), 400
+    _clear_password_setup()
+    csrf.rotate()
+    return redirect(url_for("tenant_auth.login", password="set"))
+
+
+@tenant_auth_bp.route("/t/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        return render_template("tenant/forgot_password.html", notice=None, error=None)
+    settings = context().settings
+    ip = request.remote_addr or "unknown"
+    raw_email = (request.form.get("email") or "").strip().lower()
+    if not _RESET_LIMITER.allow(ip, raw_email):
+        return render_template(
+            "tenant/forgot_password.html", notice=None, error=THROTTLE_ERROR
+        ), 429
+    _RESET_LIMITER.record_failure(ip, raw_email)
+    try:
+        email = normalize_email(raw_email)
+    except AuthAdminError as error:
+        return render_template("tenant/forgot_password.html", notice=None, error=str(error)), 400
+    if settings.public_url:
+        try:
+            context().auth_admin.send_password_reset(email, auth_callback_url(settings.public_url))
+        except AuthAdminError:
+            pass  # Same answer whether or not the account exists or Supabase refused.
+    return render_template("tenant/forgot_password.html", notice=RESET_SENT_MESSAGE, error=None)

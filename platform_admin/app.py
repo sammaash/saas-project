@@ -14,6 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from . import csrf
 from .auth import AuthError, Authenticator, Identity, LoginRateLimiter, SupabaseAuthenticator
+from .auth_admin import AuthAdmin, build_auth_admin
 from .config import Settings
 from .services.validation import ServiceError, translate_db_error
 
@@ -49,6 +50,7 @@ class PlatformContext:
     authenticator: Authenticator
     limiter: LoginRateLimiter
     bot_provider: BotResponseProvider | None
+    auth_admin: AuthAdmin | None = None
 
 
 def create_app(
@@ -56,8 +58,11 @@ def create_app(
     *,
     authenticator: Authenticator | None = None,
     bot_provider: BotResponseProvider | None = None,
+    auth_admin: AuthAdmin | None = None,
 ) -> Flask:
     settings = settings or Settings.from_env()
+    if auth_admin is None:
+        auth_admin = build_auth_admin(settings)
     if authenticator is None:
         if settings.supabase_url and settings.supabase_anon_key:
             authenticator = SupabaseAuthenticator(
@@ -97,6 +102,7 @@ def create_app(
         authenticator=authenticator,
         limiter=LoginRateLimiter(),
         bot_provider=bot_provider,
+        auth_admin=auth_admin,
     )
 
     app.before_request(csrf.protect)

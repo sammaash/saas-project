@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Tenants</h1>
-<p><a class="button" href="{{ url_for('admin.tenant_new') }}">Create tenant</a>
+<p><a class="button" href="{{ url_for('admin.tenant_onboard') }}">Onboard a business</a>
+<a class="button" href="{{ url_for('admin.tenant_new') }}">Create tenant</a>
   Filter:
   {% for s in ['', 'draft', 'active', 'suspended', 'inactive'] %}
     <a href="{{ url_for('admin.tenants', status=s) }}">{{ s or 'all' }}</a>

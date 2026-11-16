@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Onboard a business - Platform Admin{% endblock %}
+{% block content %}
+{% from "_macros.html" import csrf_field %}
+<h1>Onboard a business</h1>
+<p class="muted">Creates the tenant as a draft with its owner as an active member, in one step.
+The slug is checked before anyone is invited. Configure the tenant afterwards, then activate it.</p>
+{% if not auth_admin_configured %}
+<p class="flash error">Supabase Auth administration is not configured on this server
+(SUPABASE_SERVICE_ROLE_KEY and PLATFORM_PUBLIC_URL), so owners cannot be invited or looked up.</p>
+{% endif %}
+<form method="post" class="card narrow">
+  {{ csrf_field() }}
+  <fieldset>
+    <legend>1. Business</legend>
+    <label>Business name <input name="name" value="{{ form.get('name', '') }}" required maxlength="200"></label>
+    <label>Tenant slug <input name="slug" value="{{ form.get('slug', '') }}" required pattern="[a-z0-9][a-z0-9-]{2,39}"
+      placeholder="e.g. acme-salon"></label>
+    <label>Contact email <input type="email" name="contact_email" value="{{ form.get('contact_email', '') }}" maxlength="320"></label>
+    <label>Business phone number <input name="contact_phone" value="{{ form.get('contact_phone', '') }}" maxlength="20"
+      placeholder="+254..."></label>
+    <label>Plan
+      <select name="plan_id">
+        <option value="">No subscription yet</option>
+        {% for plan in plans %}
+        <option value="{{ plan.id }}" {{ 'selected' if form.get('plan_id') == plan.id|string else '' }}>{{ plan.name }} ({{ plan.currency }} {{ plan.monthly_price }}/month, starts as trial)</option>
+        {% endfor %}
+      </select></label>
+  </fieldset>
+  <fieldset>
+    <legend>2. Owner</legend>
+    <label>Owner's full name <input name="owner_full_name" value="{{ form.get('owner_full_name', '') }}" required maxlength="200"></label>
+    <label>Owner's email <input type="email" name="owner_email" value="{{ form.get('owner_email', '') }}" required maxlength="320"></label>
+    <label><input type="radio" name="owner_mode" value="invite" {{ 'checked' if form.get('owner_mode', 'invite') == 'invite' else '' }}>
+      Invite: create a new account and email a link to set a password</label>
+    <label><input type="radio" name="owner_mode" value="link" {{ 'checked' if form.get('owner_mode') == 'link' else '' }}>
+      Link an existing account with this email (no email is sent)</label>
+    <label>Existing account's user id (optional, only to double-check a link)
+      <input name="owner_user_id" value="{{ form.get('owner_user_id', '') }}" placeholder="found by email when blank"></label>
+  </fieldset>
+  <button type="submit">Create tenant and owner</button>
+</form>
+{% endblock %}

@@ -12,6 +12,7 @@
     ('whatsapp', 'WhatsApp / Meta', 'admin.tenant_whatsapp'),
     ('customers', 'Customers & Messages', 'admin.customer_list'),
     ('handovers', 'Handovers', 'admin.tenant_handovers'),
+    ('members', 'Members', 'admin.tenant_members'),
     ('audit', 'Audit log', 'admin.tenant_audit')] %}
     <a href="{{ url_for(endpoint, tenant_id=tenant.id) }}" class="{{ 'active' if tab == key else '' }}">{{ label }}</a>
   {% endfor %}

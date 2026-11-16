@@ -182,3 +182,132 @@ def recent_audit(
     with platform_transaction(admin_user_id, url) as cursor:
         cursor.execute("select * from app.platform_recent_audit(%s, %s)", (tenant_id, limit))
         return _rows(cursor)
+
+
+# ---------------------------------------------------------------------------
+# Onboarding and member management (migration 0042)
+# ---------------------------------------------------------------------------
+def onboard_tenant(
+    admin_user_id: str,
+    *,
+    name: str,
+    slug: str,
+    timezone: str,
+    currency: str,
+    owner_user_id: str,
+    owner_email: str,
+    owner_full_name: str | None,
+    owner_invited: bool,
+    initial_plan_id: str | None = None,
+    contact_email: str | None = None,
+    contact_phone: str | None = None,
+    url: str | None = None,
+) -> str:
+    """Provision a tenant with its owner in ONE transaction; return the tenant id.
+
+    Reuses ``app.platform_provision_tenant`` (tenant, settings, owner membership, optional
+    trial subscription and its audit row) and adds the contact details, the owner's
+    directory entry and a ``tenant.onboarded`` audit event. Any failure rolls all of it
+    back, so a failed onboarding never leaves a tenant without its owner.
+    """
+    from psycopg.types.json import Jsonb  # noqa: PLC0415  (lazy optional dependency)
+
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_provision_tenant(%s, %s, %s, %s, %s, %s)",
+            (name, slug, timezone, currency, owner_user_id, initial_plan_id),
+        )
+        tenant_id = str(cursor.fetchone()[0])
+        if contact_email or contact_phone:
+            cursor.execute(
+                "select app.platform_set_tenant_contact(%s, %s, %s)",
+                (tenant_id, contact_email, contact_phone),
+            )
+        cursor.execute(
+            "select app.platform_upsert_user_directory(%s, %s, %s, %s)",
+            (owner_user_id, owner_email, owner_full_name, owner_invited),
+        )
+        cursor.execute(
+            "select app.platform_record_audit(%s, %s, %s, %s, %s)",
+            (tenant_id, "tenant.onboarded", "tenant", tenant_id,
+             Jsonb({"owner_user_id": owner_user_id, "owner_invited": owner_invited})),
+        )
+        return tenant_id
+
+
+def upsert_user_directory(
+    admin_user_id: str,
+    user_id: str,
+    email: str,
+    full_name: str | None = None,
+    invited: bool = False,
+    url: str | None = None,
+) -> None:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_upsert_user_directory(%s, %s, %s, %s)",
+            (user_id, email, full_name, invited),
+        )
+
+
+def list_members(
+    admin_user_id: str,
+    tenant_id: str | None = None,
+    role: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    url: str | None = None,
+) -> list[dict[str, Any]]:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select * from app.platform_list_members(%s, %s, %s, %s)",
+            (tenant_id, role, status, search),
+        )
+        return _rows(cursor)
+
+
+def add_member(
+    admin_user_id: str,
+    tenant_id: str,
+    user_id: str,
+    role: str,
+    status: str,
+    *,
+    email: str | None = None,
+    full_name: str | None = None,
+    invited: bool = False,
+    url: str | None = None,
+) -> str:
+    """Add a membership (and the user's directory entry, when known) in one transaction."""
+    with platform_transaction(admin_user_id, url) as cursor:
+        if email:
+            cursor.execute(
+                "select app.platform_upsert_user_directory(%s, %s, %s, %s)",
+                (user_id, email, full_name, invited),
+            )
+        cursor.execute(
+            "select app.platform_add_member(%s, %s, %s, %s)", (tenant_id, user_id, role, status)
+        )
+        return str(cursor.fetchone()[0])
+
+
+def update_member(
+    admin_user_id: str,
+    tenant_id: str,
+    membership_id: str,
+    role: str | None = None,
+    status: str | None = None,
+    url: str | None = None,
+) -> None:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute(
+            "select app.platform_update_member(%s, %s, %s, %s)",
+            (tenant_id, membership_id, role, status),
+        )
+
+
+def remove_member(
+    admin_user_id: str, tenant_id: str, membership_id: str, url: str | None = None
+) -> None:
+    with platform_transaction(admin_user_id, url) as cursor:
+        cursor.execute("select app.platform_remove_member(%s, %s)", (tenant_id, membership_id))

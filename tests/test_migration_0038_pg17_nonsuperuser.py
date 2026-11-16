@@ -504,7 +504,8 @@ class Migration0038NonSuperuserPg17Tests(unittest.TestCase):
     # ------------------------------------------------------- production bundle and reset
     BUNDLE_DATABASE = "saas_bundle"
     LAST_PRODUCTION_VERSION = "0037_quotation_briefs_and_deliveries.sql"
-    PLATFORM_TABLES = ("plans", "platform_admins", "reserved_phone_numbers", "saas_schema_migrations")
+    PLATFORM_TABLES = ("plans", "platform_admins", "platform_user_directory", "reserved_phone_numbers",
+                       "saas_schema_migrations")
 
     def _fresh_database(self, name: str) -> str:
         with self._connect(BOOTSTRAP, "postgres", autocommit=True) as conn:

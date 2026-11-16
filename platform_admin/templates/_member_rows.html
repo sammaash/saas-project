@@ -1,0 +1,35 @@
+{# One member row with its actions. Expects: m (member), roles, return_to, show_tenant. #}
+{% from "_macros.html" import csrf_field %}
+<tr>
+  {% if show_tenant %}<td><a href="{{ url_for('admin.tenant_members', tenant_id=m.tenant_id) }}">{{ m.tenant_name }}</a>
+    <br><span class="muted">{{ m.tenant_slug }} · {{ m.tenant_status }}</span></td>{% endif %}
+  <td>{% if m.email %}{{ m.full_name or '' }}<br>{{ m.email }}{% else %}<span class="muted">No Auth account on record</span>{% endif %}
+    <br><code class="muted">{{ m.user_id }}</code></td>
+  <td><span class="badge">{{ m.role }}</span></td>
+  <td><span class="badge {{ m.status }}">{{ m.status }}</span>{% if m.invited_at %}<br><span class="muted">invited {{ m.invited_at.strftime('%Y-%m-%d') }}</span>{% endif %}</td>
+  <td class="actions">
+    <form method="post" action="{{ url_for('admin.tenant_member_role', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
+      {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}">
+      <select name="role" aria-label="Role">{% for r in roles %}<option {{ 'selected' if r == m.role else '' }}>{{ r }}</option>{% endfor %}</select>
+      <button type="submit">Set role</button>
+    </form>
+    <form method="post" action="{{ url_for('admin.tenant_member_status', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
+      {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}">
+      {% if m.status == 'active' %}<input type="hidden" name="status" value="disabled"><button type="submit">Deactivate</button>
+      {% else %}<input type="hidden" name="status" value="active"><button type="submit">Activate</button>{% endif %}
+    </form>
+    {% if m.email %}
+    <form method="post" action="{{ url_for('admin.tenant_member_resend', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
+      {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}"><button type="submit">Resend invitation</button>
+    </form>
+    <form method="post" action="{{ url_for('admin.tenant_member_password_reset', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
+      {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}"><button type="submit">Send password reset</button>
+    </form>
+    {% endif %}
+    <form method="post" action="{{ url_for('admin.tenant_member_remove', tenant_id=m.tenant_id, membership_id=m.membership_id) }}" class="inline">
+      {{ csrf_field() }}<input type="hidden" name="return_to" value="{{ return_to }}">
+      <label class="inline"><input type="checkbox" name="confirm" value="revoke"> confirm</label>
+      <button type="submit" class="danger">Revoke access</button>
+    </form>
+  </td>
+</tr>

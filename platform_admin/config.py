@@ -88,6 +88,56 @@ def reject_service_role(anon_key: str) -> None:
         raise ConfigError("SUPABASE_ANON_KEY must be the public anon key, never a service_role/secret key.")
 
 
+def _jwt_claims(token: str) -> dict:
+    """Unverified claims of a JWT-shaped key (empty when the key is not a JWT)."""
+    pieces = token.split(".")
+    if len(pieces) != 3:
+        return {}
+    try:
+        padded = pieces[1] + "=" * (-len(pieces[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def validate_service_role_key(key: str, supabase_url: str, anon_key: str) -> str:
+    """Accept only a genuine server-side service key belonging to ``SUPABASE_URL``'s project.
+
+    The key is used solely for Supabase Auth administration (invitations, account lookup,
+    password setup) from server code; it is never rendered, logged or sent to a browser.
+    """
+    key = key.strip()
+    if key == anon_key.strip():
+        raise ConfigError("SUPABASE_SERVICE_ROLE_KEY must not be the anon key.")
+    if key.startswith("sb_secret_"):
+        return key
+    claims = _jwt_claims(key)
+    if claims.get("role") != "service_role":
+        raise ConfigError("SUPABASE_SERVICE_ROLE_KEY must be the project's service_role (secret) key.")
+    ref = claims.get("ref")
+    host = (urlsplit(supabase_url).hostname or "").lower()
+    if isinstance(ref, str) and host.endswith(".supabase.co") and not host.startswith(ref.lower() + "."):
+        raise ConfigError("SUPABASE_SERVICE_ROLE_KEY belongs to a different Supabase project than SUPABASE_URL.")
+    return key
+
+
+def validate_public_url(url: str, *, dev_mode: bool = False) -> str:
+    """The dashboard's public origin, used to build invitation and password-reset links.
+
+    Only a bare origin is accepted (no path, query, fragment or credentials), so a
+    misconfiguration can never point an invitation at another site or page.
+    """
+    parts = urlsplit(url.strip())
+    if parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/"):
+        raise ConfigError("PLATFORM_PUBLIC_URL must be a bare origin such as https://admin.example.com.")
+    if not parts.hostname:
+        raise ConfigError("PLATFORM_PUBLIC_URL must be an absolute URL.")
+    if parts.scheme == "https" or (dev_mode and parts.scheme == "http" and parts.hostname in LOOPBACK_HOSTS):
+        return f"{parts.scheme}://{parts.netloc}".lower()
+    raise ConfigError("PLATFORM_PUBLIC_URL must use https.")
+
+
 def _database_user(url: str) -> str | None:
     try:
         return urlsplit(url).username
@@ -285,6 +335,18 @@ class Settings:
     #: the isolation checks in :func:`_staging_guard`.
     environment: str = "production"
     startup_database_checks: bool = True
+    #: Server-only key for Supabase Auth administration. Optional: without it (or without
+    #: ``public_url``) invitations and account lookup are disabled, everything else works.
+    supabase_service_role_key: str | None = None
+    #: Public origin of this dashboard, for invitation and password-reset links.
+    public_url: str | None = None
+
+    @property
+    def auth_admin_configured(self) -> bool:
+        return bool(self.supabase_url and self.supabase_service_role_key and self.public_url)
+
+    def __repr__(self) -> str:  # pragma: no cover - keeps secrets out of logs and tracebacks
+        return f"Settings(environment={self.environment!r}, supabase_url={self.supabase_url!r})"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -334,6 +396,15 @@ class Settings:
         if not 0 <= trusted_proxies <= 5:
             raise ConfigError("PLATFORM_TRUSTED_PROXIES must be between 0 and 5.")
 
+        service_role_key = (environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip() or None
+        if service_role_key:
+            service_role_key = validate_service_role_key(
+                service_role_key, supabase_url, environ["SUPABASE_ANON_KEY"]
+            )
+        public_url = (environ.get("PLATFORM_PUBLIC_URL") or "").strip() or None
+        if public_url:
+            public_url = validate_public_url(public_url, dev_mode=dev_mode)
+
         return cls(
             secret_key=secret_key,
             supabase_url=supabase_url,
@@ -358,6 +429,8 @@ class Settings:
             ),
             environment=environment,
             startup_database_checks=startup_database_checks,
+            supabase_service_role_key=service_role_key,
+            public_url=public_url,
         )
 
 
@@ -397,6 +470,7 @@ REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.order_items", ()),
     ("public.order_payments", ()),
     ("public.handover_requests", ()),
+    ("public.platform_user_directory", ()),
 )
 
 

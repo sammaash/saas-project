@@ -32,6 +32,7 @@ from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
 from ..services import customers as customer_service
 from ..services import handover as handover_service
+from ..services import members as members_service
 from ..services import menu as menu_service
 from ..services import menu_simulator as menu_simulator_service
 from ..services import outbound_dispatch
@@ -2043,16 +2044,136 @@ def channel_status(tenant_id, channel_id):
 
 
 # ------------------------------------------------------------ members etc.
+# Onboarding and member management. Every route is platform-admin only; Supabase Auth
+# calls run server-side through context().auth_admin and the database enforces the rest
+# (membership belongs to the URL's tenant, final active owner, audit in the same transaction).
+@admin_bp.route("/tenants/onboard", methods=["GET", "POST"])
+@admin_required
+def tenant_onboard():
+    ctx = context()
+    plans = tenant_service.list_plans(ctx.settings, g.admin_id)
+    form = _form() if request.method == "POST" else {"owner_mode": "invite"}
+    if request.method == "POST":
+        try:
+            result = members_service.onboard(ctx.settings, ctx.auth_admin, g.admin_id, form)
+        except ServiceError as error:
+            flash(error.message, "error")
+            return render_template(
+                "tenant_onboard.html", plans=plans, form=form,
+                auth_admin_configured=ctx.settings.auth_admin_configured,
+            ), error.status
+        if result.invited:
+            flash(f"Tenant created as a draft. Invitation sent to {result.owner_email}; "
+                  "they become the active owner and set their password from the email.", "ok")
+        else:
+            flash(f"Tenant created as a draft with {result.owner_email} as its active owner.", "ok")
+        return redirect(url_for("admin.tenant_members", tenant_id=result.tenant_id))
+    return render_template(
+        "tenant_onboard.html", plans=plans, form=form,
+        auth_admin_configured=ctx.settings.auth_admin_configured,
+    )
+
+
+@admin_bp.get("/members")
+@admin_required
+def members():
+    settings = context().settings
+    filters = {key: request.args.get(key, "") for key in ("q", "tenant_id", "role", "status")}
+    try:
+        rows = members_service.list_members(settings, g.admin_id, filters)
+    except ServiceError as error:
+        flash(error.message, "error")
+        rows = []
+    tenants = tenant_service.list_tenants(settings, g.admin_id)
+    return render_template(
+        "members.html", members=rows, tenants=tenants, filters=filters,
+        roles=members_service.MEMBER_ROLES, statuses=members_service.MEMBER_STATUSES,
+    )
+
+
+def _members_return(tenant_id: str):
+    """Back to the page the action came from: the global list or the tenant's tab."""
+    if request.form.get("return_to") == "members":
+        return redirect(url_for("admin.members"))
+    return redirect(url_for("admin.tenant_members", tenant_id=tenant_id))
+
+
+def _member_act(tenant_id: str, action):
+    try:
+        flash(action(), "ok")
+    except ServiceError as error:
+        flash(error.message, "error")
+    return _members_return(tenant_id)
+
+
 @admin_bp.route("/tenants/<tenant_id>/members", methods=["GET", "POST"])
 @admin_required
 def tenant_members(tenant_id):
     tenant = _tenant(tenant_id)
-    settings = context().settings
+    ctx = context()
     if request.method == "POST":
-        return _act("admin.tenant_members", tenant["id"], "Member added.",
-                    lambda: tenant_config.add_member(settings, g.admin_id, tenant["id"], _form()))
-    members = tenant_config.list_members(settings, tenant["id"])
-    return render_template("tenant_members.html", tenant=tenant, members=members, tab="members")
+        return _member_act(tenant["id"], lambda: members_service.add_existing_member(
+            ctx.settings, ctx.auth_admin, g.admin_id, tenant["id"], _form()))
+    rows = members_service.list_members(ctx.settings, g.admin_id, {"tenant_id": tenant["id"]})
+    return render_template(
+        "tenant_members.html", tenant=tenant, members=rows, tab="members",
+        roles=members_service.MEMBER_ROLES,
+        auth_admin_configured=ctx.settings.auth_admin_configured,
+    )
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/invite")
+@admin_required
+def tenant_member_invite(tenant_id):
+    tenant = _tenant(tenant_id)
+    ctx = context()
+    return _member_act(tenant["id"], lambda: members_service.invite_member(
+        ctx.settings, ctx.auth_admin, g.admin_id, tenant["id"], _form()))
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/<membership_id>/role")
+@admin_required
+def tenant_member_role(tenant_id, membership_id):
+    tenant = _tenant(tenant_id)
+    return _member_act(tenant["id"], lambda: members_service.change_role(
+        context().settings, g.admin_id, tenant["id"], membership_id, request.form.get("role")))
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/<membership_id>/status")
+@admin_required
+def tenant_member_status(tenant_id, membership_id):
+    tenant = _tenant(tenant_id)
+    return _member_act(tenant["id"], lambda: members_service.set_status(
+        context().settings, g.admin_id, tenant["id"], membership_id, request.form.get("status")))
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/<membership_id>/remove")
+@admin_required
+def tenant_member_remove(tenant_id, membership_id):
+    tenant = _tenant(tenant_id)
+    if request.form.get("confirm") != "revoke":
+        flash("Tick the confirmation box to revoke access.", "error")
+        return _members_return(tenant["id"])
+    return _member_act(tenant["id"], lambda: members_service.remove(
+        context().settings, g.admin_id, tenant["id"], membership_id))
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/<membership_id>/resend-invite")
+@admin_required
+def tenant_member_resend(tenant_id, membership_id):
+    tenant = _tenant(tenant_id)
+    ctx = context()
+    return _member_act(tenant["id"], lambda: members_service.resend_invitation(
+        ctx.settings, ctx.auth_admin, g.admin_id, tenant["id"], membership_id))
+
+
+@admin_bp.post("/tenants/<tenant_id>/members/<membership_id>/password-reset")
+@admin_required
+def tenant_member_password_reset(tenant_id, membership_id):
+    tenant = _tenant(tenant_id)
+    ctx = context()
+    return _member_act(tenant["id"], lambda: members_service.send_password_reset(
+        ctx.settings, ctx.auth_admin, g.admin_id, tenant["id"], membership_id))
 
 
 @admin_bp.route("/tenants/<tenant_id>/subscription", methods=["GET", "POST"])

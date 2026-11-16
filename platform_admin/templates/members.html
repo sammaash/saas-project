@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Members - Platform Admin{% endblock %}
+{% block content %}
+<h1>Members</h1>
+<p class="muted">Every tenant membership. Add or invite people from a tenant's Members tab.
+A tenant always keeps at least one active owner.</p>
+<form method="get" class="card filters">
+  <label>Search name or email <input name="q" value="{{ filters.q }}" maxlength="200"></label>
+  <label>Tenant <select name="tenant_id"><option value="">All tenants</option>
+    {% for t in tenants %}<option value="{{ t.id }}" {{ 'selected' if filters.tenant_id == t.id|string else '' }}>{{ t.name }}</option>{% endfor %}</select></label>
+  <label>Role <select name="role"><option value="">Any</option>
+    {% for r in roles %}<option {{ 'selected' if filters.role == r else '' }}>{{ r }}</option>{% endfor %}</select></label>
+  <label>Status <select name="status"><option value="">Any</option>
+    {% for s in statuses %}<option {{ 'selected' if filters.status == s else '' }}>{{ s }}</option>{% endfor %}</select></label>
+  <button type="submit">Filter</button>
+</form>
+<table>
+  <tr><th>Tenant</th><th>Person</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+  {% for m in members %}{% with return_to='members', show_tenant=True %}{% include "_member_rows.html" %}{% endwith %}
+  {% else %}<tr><td colspan="5" class="muted">No members match.</td></tr>{% endfor %}
+</table>
+{% endblock %}
