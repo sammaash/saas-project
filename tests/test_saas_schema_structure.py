@@ -259,9 +259,14 @@ class PolicyCoverageTests(SaasDatabaseTestCase):
         for table in TABLES_WITH_TENANT_ID_COLUMN + ("tenants",):
             with self.subTest(table=table):
                 commands = policies.get(table, set())
-                self.assertIn("SELECT", commands, f"{table} has no SELECT policy")
+                # A `FOR ALL` policy applies to every command, so it covers both the read
+                # and the write requirement below.
+                effective = set(commands)
+                if "ALL" in effective:
+                    effective |= {"SELECT", "INSERT", "UPDATE", "DELETE"}
+                self.assertIn("SELECT", effective, f"{table} has no SELECT policy")
                 self.assertTrue(
-                    commands - {"SELECT"},
+                    effective - {"SELECT"},
                     f"{table} has a SELECT policy but no write policy at all",
                 )
 

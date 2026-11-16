@@ -92,6 +92,9 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("messages", "tenant_id"),
     ("handover_requests", "tenant_id"),
     ("tenant_order_sequences", "tenant_id"),
+    # Migration 0040. The encrypted credential vault is tenant-owned, but it is the one
+    # table NO application role may read directly -- see APP_BACKEND_INACCESSIBLE_TABLES.
+    ("channel_credentials", "tenant_id"),
 )
 
 # Tables that the `authenticated` dashboard role holds no grant on at all, so a dashboard
@@ -117,8 +120,17 @@ AUTHENTICATED_INACCESSIBLE_TABLES = frozenset(
         "handover_requests",
         "quotation_briefs",
         "quotation_deliveries",
+        # 0039 grants select/insert to app_backend only (staff inbox audit trail).
+        "conversation_control_events",
+        "channel_credentials",
     }
 )
+
+# Tables that `app_backend` also holds no grant on. `public.channel_credentials` is the only
+# member: the backend reads a credential exclusively through the SECURITY DEFINER accessor
+# `app.channel_credential(uuid)`, so a direct query is refused outright (42501), which is
+# stronger than RLS filtering it to zero rows; the isolation suite asserts the refusal.
+APP_BACKEND_INACCESSIBLE_TABLES = frozenset({"channel_credentials"})
 
 # Tables where FORCE ROW LEVEL SECURITY is deliberately NOT applied, because the
 # SECURITY DEFINER helpers in migration 0010 read them. The tests separately prove that

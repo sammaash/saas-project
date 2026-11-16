@@ -33,6 +33,7 @@ try:  # `tests` is a package when run as `python -m unittest tests.test_...`
         TENANT_ONE_STAFF_USER_ID,
         TENANT_SCOPED_TABLES,
         AUTHENTICATED_INACCESSIBLE_TABLES,
+        APP_BACKEND_INACCESSIBLE_TABLES,
         TENANT_TWO_ID,
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
@@ -55,6 +56,7 @@ except ImportError:  # ...and a plain directory under `discover -s tests`
         TENANT_ONE_STAFF_USER_ID,
         TENANT_SCOPED_TABLES,
         AUTHENTICATED_INACCESSIBLE_TABLES,
+        APP_BACKEND_INACCESSIBLE_TABLES,
         TENANT_TWO_ID,
         TENANT_TWO_NAME,
         TENANT_TWO_OWNER_USER_ID,
@@ -258,6 +260,12 @@ class TenantIsolationTests(SaasDatabaseTestCase):
             # ...and that every tenant table therefore returns zero rows.
             for table, _tenant_column in TENANT_SCOPED_TABLES:
                 with self.subTest(table=table, role="app_backend"):
+                    if table in APP_BACKEND_INACCESSIBLE_TABLES:
+                        # No grant at all: Postgres refuses the statement outright,
+                        # which is stronger than RLS returning zero rows.
+                        with self.assertRaises(_denied_error()):
+                            cursor.execute(f"select count(*) from public.{table}")
+                        continue
                     cursor.execute(f"select count(*) from public.{table}")
                     self.assertEqual(cursor.fetchone()[0], 0)
 

@@ -115,14 +115,6 @@ def parse_database_url(database_url: str) -> dict | None:
     }
 
 
-def is_local_target(url: str, environ: dict[str, str] | None = None) -> bool:
-    """True only when every possible connection target is loopback or a unix socket."""
-    hosts = database_hosts(url, environ)
-    if hosts is None:
-        return False
-    return all(host.lower() in LOOPBACK_HOSTS or host.startswith("/") for host in hosts)
-
-
 def database_hosts(url: str, environ: dict[str, str] | None = None) -> list[str] | None:
     """Every host libpq could connect to for ``url``; None when it cannot be determined."""
     environ = os.environ if environ is None else environ
@@ -569,3 +561,7 @@ def check_runtime_database_identity(conn, expected_database: str) -> bool:
         print(f"FAIL: Runtime database identity check error: {e}")
         print("Cannot verify database identity - blocking for safety")
         return False
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -27,7 +27,11 @@ as $$
      and tu.status = 'active'
 $$;
 
+-- The provisioner must hold CREATE on schema app to be made the owner of a function,
+-- and only while the change is made (see 0013/0020/0021/0023/0024/0040).
+grant create on schema app to saas_platform_provisioner;
 alter function app.my_active_tenants() owner to saas_platform_provisioner;
+revoke create on schema app from saas_platform_provisioner;
 revoke all on function app.my_active_tenants() from public;
 revoke execute on function app.my_active_tenants() from anon, authenticated;
 grant execute on function app.my_active_tenants() to app_backend;

@@ -611,3 +611,37 @@ class StagingTargetGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommandLineEntryPointTests(unittest.TestCase):
+    """`python db/run_migrations.py` must execute main(), not import the module and exit 0.
+
+    Regression: commit 68f1893 removed the ``__main__`` guard, so CI's migration step and every
+    documented operator command silently did nothing and reported success.
+    """
+
+    SCRIPT = Path(migration_runner.__file__).resolve()
+
+    def _run(self, *args: str):
+        import subprocess  # noqa: PLC0415
+
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SAAS_", "PG"))}
+        return subprocess.run(
+            [sys.executable, str(self.SCRIPT), *args],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+
+    def test_help_is_printed(self):
+        result = self._run("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--database-url", result.stdout)
+
+    def test_missing_target_is_an_error_not_a_silent_success(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("SAAS_DATABASE_URL", result.stderr)
+
+    def test_unapproved_target_is_refused_before_connecting(self):
+        result = self._run("--database-url", "postgresql://user@127.0.0.1:1/not_approved")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("not an approved loopback disposable database", result.stderr)

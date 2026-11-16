@@ -313,11 +313,13 @@ begin
   values (
     target_tenant, app.current_user_id(), 'platform', 'credential.stored',
     'channel_credential', new_id::text,
+    -- The fingerprint is deliberately absent: audit_log rows are readable by every active
+    -- tenant member, and a digest of the plaintext token (brute-forceable for low-entropy
+    -- kinds such as a 6-digit registration_pin) must never be shown to that audience.
     jsonb_build_object(
       'channel_id', p_channel_id,
       'kind', p_kind,
       'key_ref', p_key_ref,
-      'fingerprint', p_token_fingerprint,
       'expires_at', p_expires_at,
       'rotated_from', previous_id
     )
