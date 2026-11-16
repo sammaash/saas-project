@@ -1114,9 +1114,12 @@ class WhatsAppIntegrationSurfaceTests(unittest.TestCase):
         needs to be stored in the file at all.
         """
         config = REPO / ".vscode" / "mcp.json"
-        if not config.exists():
-            self.skipTest("no workspace MCP configuration in this checkout")
+        # The gitignore guarantee holds in every checkout, CI included. Only the content
+        # checks need a developer's local file; without one there is nothing that could
+        # carry a credential, so the test passes instead of skipping (CI forbids skips).
         self.assertIn(".vscode/", (REPO / ".gitignore").read_text(encoding="utf-8"))
+        if not config.exists():
+            return
         servers = json.loads(config.read_text(encoding="utf-8")).get("servers") or {}
         for name, server in servers.items():
             with self.subTest(server=name):
