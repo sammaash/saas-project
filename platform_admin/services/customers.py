@@ -14,6 +14,7 @@ idempotency backstop.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -250,7 +251,8 @@ def get_conversation(
             """
             select id, tenant_id, customer_id, channel_id,
                    provider_conversation_id, status, assigned_to,
-                   created_at, updated_at, last_message_at, closed_at
+                   created_at, updated_at, last_message_at, closed_at,
+                   ai_mode, needs_attention
             from public.conversations
             where id = %s
             """,
@@ -500,14 +502,25 @@ def add_staff_reply(
                 ("5s",),
             )
             cursor.execute(
-                "select ai_mode from public.conversations "
+                "select ai_mode, needs_attention from public.conversations "
                 "where id = %s and tenant_id = app.current_tenant_id() for update",
                 (conversation_id,),
             )
             row = cursor.fetchone()
             if row is None:
                 raise ServiceError("Conversation not found.", 404)
-            previous = row[0]
+            previous, attention = row[0], bool(row[1])
+            cursor.execute(
+                "update public.conversations set last_message_at = now() "
+                "where id = %s and tenant_id = app.current_tenant_id()",
+                (conversation_id,),
+            )
+            if attention:
+                # A staff reply answers the customer's request for a person: red, not
+                # orange. It never re-enables the AI.
+                conversation_control.clear_attention_locked(
+                    cursor, conversation_id, actor_user_id, "staff_reply"
+                )
             if previous != "human":
                 cursor.execute(
                     "update public.conversations set ai_mode = 'human', updated_at = now() "
@@ -716,6 +729,106 @@ def list_messages(
         return rows, total
 
 
+def latest_messages(
+    settings: Settings,
+    tenant_id: str,
+    conversation_id: str,
+    *,
+    limit: int = 50,
+    before: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """The newest ``limit`` messages (returned oldest first), plus an older-page cursor.
+
+    The inbox must always show the most recent messages: this reads the existing
+    ``(tenant_id, conversation_id, received_at, id)`` index backwards. ``before`` is
+    the opaque cursor of an earlier page (``<received_at iso>|<id>``); the returned
+    cursor is None when nothing older exists. Keyset paging, so new messages
+    arriving between page loads never shift or duplicate rows.
+    """
+    limit = max(1, min(int(limit), 200))
+    params: list[Any] = [conversation_id]
+    keyset = ""
+    if before:
+        stamp, _, row_id = before.partition("|")
+        if not stamp or not row_id:
+            raise ServiceError("Invalid message cursor.", 400)
+        keyset = " and (received_at, id) < (%s::timestamptz, %s::uuid)"
+        params.extend([stamp, row_id])
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        try:
+            cursor.execute(
+                f"""
+                select id, tenant_id, channel_id, conversation_id, direction, sender_type,
+                       provider_message_id, message_type, body_text, payload,
+                       provider_timestamp, received_at, delivery_status,
+                       error_code, error_message, created_at, updated_at
+                from public.messages
+                where conversation_id = %s and tenant_id = app.current_tenant_id()
+                {keyset}
+                order by received_at desc, id desc
+                limit %s
+                """,
+                [*params, limit + 1],
+            )
+        except Exception as error:  # noqa: BLE001
+            if getattr(error, "sqlstate", None) in ("22007", "22P02", "22008"):
+                raise ServiceError("Invalid message cursor.", 400) from error
+            raise
+        rows = [_row_to_dict(cursor, r) for r in cursor.fetchall()]
+    older = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        oldest = rows[-1]
+        stamp = oldest["received_at"]
+        stamp = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp)
+        older = f"{stamp}|{oldest['id']}"
+    rows.reverse()
+    return rows, older
+
+
+def inbox_signature(
+    settings: Settings, tenant_id: str, conversation_id: str | None = None
+) -> str:
+    """A cheap change marker for inbox polling (no message content).
+
+    Changes whenever any conversation's activity, mode or alert changes, or - for the
+    open conversation - whenever a message is added or its delivery status changes.
+    """
+    with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
+        cursor.execute(
+            """
+            select count(*),
+                   coalesce(max(greatest(last_message_at, updated_at)), 'epoch'::timestamptz),
+                   count(*) filter (where needs_attention)
+            from public.conversations
+            where tenant_id = app.current_tenant_id()
+            """
+        )
+        threads = cursor.fetchone()
+        parts = [str(value) for value in threads]
+        if conversation_id:
+            cursor.execute(
+                """
+                select count(*),
+                       coalesce(max(greatest(created_at, updated_at)), 'epoch'::timestamptz)
+                from public.messages
+                where conversation_id = %s and tenant_id = app.current_tenant_id()
+                """,
+                (conversation_id,),
+            )
+            parts.extend(str(value) for value in cursor.fetchone())
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+#: Inbox filters: all, orange (customer asked for a person), red (staff handling or
+#: paused), green (AI replying).
+INBOX_VIEWS = {
+    "attention": " and c.needs_attention",
+    "human": " and not c.needs_attention and c.ai_mode <> 'ai_active'",
+    "ai": " and not c.needs_attention and c.ai_mode = 'ai_active'",
+}
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -727,6 +840,7 @@ def inbox_threads(
     *,
     search: str | None = None,
     status: str | None = None,
+    view: str | None = None,
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -743,6 +857,8 @@ def inbox_threads(
     offset = (page - 1) * page_size
     if status is not None and status not in ("open", "closed", "archived"):
         raise ServiceError("Unknown conversation filter.", 400)
+    if view is not None and view not in INBOX_VIEWS:
+        raise ServiceError("Unknown conversation filter.", 400)
 
     with tenant_transaction(tenant_id, settings.app_database_url) as cursor:
         where = "where c.tenant_id = app.current_tenant_id()"
@@ -750,6 +866,8 @@ def inbox_threads(
         if status:
             where += " and c.status = %s"
             params.append(status)
+        if view:
+            where += INBOX_VIEWS[view]
         if search:
             like = f"%{search.lower()}%"
             where += """ and (
@@ -780,7 +898,7 @@ def inbox_threads(
         cursor.execute(
             f"""
             select c.id, c.status, c.assigned_to, c.last_message_at, c.closed_at,
-                   c.created_at,
+                   c.created_at, c.ai_mode, c.needs_attention,
                    cu.id as customer_id, cu.name as customer_name, cu.wa_id,
                    cu.phone_normalized, cu.email, cu.last_interaction_at,
                    preview.body_text as preview_text,
@@ -798,7 +916,9 @@ def inbox_threads(
                 limit 1
             ) preview on true
             {where}
-            order by coalesce(c.last_message_at, preview.received_at, c.created_at) desc
+            order by c.needs_attention desc,
+                     greatest(c.last_message_at, preview.received_at, c.created_at) desc,
+                     c.id
             limit %s offset %s
             """,
             [*params, page_size, offset],

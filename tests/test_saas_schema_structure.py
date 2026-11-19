@@ -52,6 +52,7 @@ PLATFORM_TABLES = (
     "quotation_lines",
     "quotation_briefs",
     "quotation_deliveries",
+    "quotation_documents",
     "whatsapp_webhook_events",
     "whatsapp_conversations",
 )

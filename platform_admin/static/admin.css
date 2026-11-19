@@ -22,6 +22,9 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; 
 .muted { color: #666; }
 .badge { padding: .1rem .5rem; border-radius: 99px; font-size: .75rem; background: #ddd; }
 .badge.active { background: #c7f0d2; } .badge.draft { background: #ffe8a3; } .badge.suspended, .badge.inactive { background: #f5c2c2; }
+/* Quotation lifecycle (tenant portal) */
+.badge.quote-generated { background: #e7ecf3; color: #2c3e50; } .badge.quote-sent { background: #c7f0d2; color: #1e5631; }
+.badge.quote-not_sent { background: #ffe8a3; color: #7a4b00; } .badge.quote-expired { background: #ddd; color: #555; }
 .tabs { display: flex; flex-wrap: wrap; gap: .25rem; border-bottom: 1px solid #ccc; margin-bottom: 1rem; }
 .tabs a { padding: .5rem .8rem; text-decoration: none; color: #333; }
 .tabs a.active { border-bottom: 2px solid #3b5bdb; font-weight: 600; }

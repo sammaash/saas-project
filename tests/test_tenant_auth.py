@@ -527,11 +527,11 @@ class DashboardReadTests(_TenantAppTestCase):
             "platform_admin.routes.tenant_dashboard.customers_service.get_conversation",
             return_value=conversation,
         ), patch(
-            "platform_admin.routes.tenant_dashboard.customers_service.list_messages",
+            "platform_admin.routes.tenant_dashboard.customers_service.latest_messages",
             return_value=(
                 [{"created_at": "2026-01-01", "direction": "inbound", "sender_type": "customer",
                   "body_text": "hello", "delivery_status": "received"}],
-                1,
+                None,
             ),
         ):
             thread = self.client.get(
@@ -567,7 +567,9 @@ class DashboardReadTests(_TenantAppTestCase):
             return_value=[
                 {"id": quotation_id, "quotation_number": "Q-0001", "customer_name": "C",
                  "issue_date": "2026-01-01", "expiry_date": None, "currency": "USD",
-                 "total": 10, "status": "issued"}
+                 "total": 10, "status": "issued", "customer_wa_id": None,
+                 "has_document": True, "delivery": {}, "lifecycle": "generated",
+                 "lifecycle_label": "Generated"}
             ],
         ):
             response = self.client.get(f"/t/{TENANT_A}/quotations")
@@ -588,6 +590,12 @@ class DashboardReadTests(_TenantAppTestCase):
         with self._member(), patch(
             "platform_admin.routes.tenant_dashboard.quotations_service.get_quotation",
             return_value=quotation,
+        ), patch(
+            "platform_admin.routes.tenant_dashboard.saas_quotations.delivery_overview",
+            return_value={},
+        ), patch(
+            "platform_admin.routes.tenant_dashboard.saas_quotations.list_deliveries",
+            return_value=[],
         ):
             response = self.client.get(f"/t/{TENANT_A}/quotations/{quotation_id}")
         self.assertEqual(response.status_code, 200)

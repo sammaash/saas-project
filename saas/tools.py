@@ -968,8 +968,12 @@ class UpdateQuotationBriefTool:
             },
         )
 
-def default_tool_registry() -> ToolRegistry:
-    """A registry with every built-in tool, ready to wire into an engine."""
+def default_tool_registry(*, include_quotation_tools: bool = True) -> ToolRegistry:
+    """A registry with the built-in tools, ready to wire into an engine.
+
+    ``include_quotation_tools=False`` is what the customer-facing engine uses: since
+    Stage 3 quotations are issued only by the deterministic webhook workflow.
+    """
     registry = ToolRegistry()
     registry.register(GetCatalogueTool())
     registry.register(GetBusinessRulesTool())
@@ -980,9 +984,10 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(ConfirmOrderTool())
     registry.register(GetOrderStatusTool())
     registry.register(GetPaymentStatusTool())
-    registry.register(UpdateQuotationBriefTool())
-    registry.register(RequestQuoteTool())
-    registry.register(RequestQuotationPdfTool())
+    if include_quotation_tools:
+        registry.register(UpdateQuotationBriefTool())
+        registry.register(RequestQuoteTool())
+        registry.register(RequestQuotationPdfTool())
     return registry
 
 

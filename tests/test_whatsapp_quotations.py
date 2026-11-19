@@ -564,49 +564,60 @@ class BotEngineQuotationTests(WhatsAppQuotationTestCase):
         )
         return response, provider
 
-    def test_the_prompt_advertises_quotations_only_when_the_gate_is_on(self):
-        _, enabled = self._respond(["Hello"], enabled=True)
-        self.assertIn("QUOTATION PROTOCOL", enabled.prompts[0])
-        self.assertIn("request_quote", enabled.prompts[0])
+    # Stage 3: quotations are a deterministic platform workflow. The model is never
+    # offered the quotation tools, so it cannot half-run a quotation (the production
+    # failure: invented argument shapes, rejected calls, budget exhausted).
+    def test_the_prompt_never_offers_quotation_tools(self):
+        for enabled in (True, False):
+            _, provider = self._respond(["Hello"], enabled=enabled)
+            prompt = provider.prompts[0]
+            self.assertNotIn("QUOTATION PROTOCOL", prompt)
+            self.assertNotIn("request_quote", prompt)
+            self.assertNotIn("update_quotation_brief", prompt)
+            self.assertIn("PRICING RULES", prompt)
+            self.assertIn("Delivery charges are calculated separately", prompt)
 
-        _, disabled = self._respond(["Hello"], enabled=False)
-        self.assertNotIn("QUOTATION PROTOCOL", disabled.prompts[0])
-
-    def test_a_free_text_request_collects_then_issues_a_quotation(self):
+    def test_a_model_quotation_tool_call_is_refused_and_writes_nothing(self):
         response, _ = self._respond(
             [
                 'TOOL_CALL: {"name": "update_quotation_brief", "arguments": '
                 '{"items": [{"product_name": "Vanilla", "weight_kg": 2, "quantity": 2}]}}',
                 'TOOL_CALL: {"name": "request_quote", "arguments": {"use_brief": true}}',
-                "Your quotation is ready.",
+                "Vanilla is one of our cakes.",
             ]
         )
-        self.assertIsNotNone(response.quotation)
-        self.assertEqual(response.quotation["total"], "8400.00")
-        self.assertFalse(response.quotation_failed)
-        self.assertEqual(response.text, "Your quotation is ready.")
-
-    def test_a_custom_request_is_handed_to_staff_and_never_priced(self):
-        response, _ = self._respond(
-            [
-                'TOOL_CALL: {"name": "update_quotation_brief", "arguments": '
-                '{"items": [{"product_name": "Sculpted dragon cake", "quantity": 1}]}}',
-                'TOOL_CALL: {"name": "request_quote", "arguments": {"use_brief": true}}',
-                "Our team will prepare your quote.",
-            ]
-        )
-        self.assertTrue(response.quotation_failed)
         self.assertIsNone(response.quotation)
-        self.assertIsNotNone(response.handover)
-        rows = self._execute(
-            "select count(*) from public.handover_requests where tenant_id = %s "
-            "and wa_id = %s",
-            (TENANT_ONE_ID, WA_ONE),
+        self.assertFalse(response.quotation_failed)
+        self.assertEqual(response.text, "Vanilla is one of our cakes.")
+        self.assertEqual(
+            self._execute(
+                "select count(*) from public.quotations where tenant_id = %s "
+                "and customer_wa_id = %s", (TENANT_ONE_ID, WA_ONE),
+            )[0][0],
+            0,
         )
-        self.assertEqual(rows[0][0], 1)
+        self.assertEqual(
+            self._execute(
+                "select count(*) from public.quotation_briefs where conversation_id = %s",
+                (self.conversation_one,),
+            )[0][0],
+            0,
+        )
 
-    def test_the_pdf_tool_surfaces_the_persisted_quotation(self):
-        quotation = self._quotation("wamid.pdf-tool-1")
+    def test_repeated_tool_calls_never_reach_the_customer(self):
+        """Regression for the 2026-11-16 production incident (raw TOOL_CALL sent)."""
+        from saas import output_safety
+
+        call = ('TOOL_CALL: {"name":"update_quotation_brief","arguments":'
+                '{"product":"Chocolate cake","size":"1 kg each","quantity":2}}')
+        response, _ = self._respond([call] * 8)
+        self.assertEqual(response.text, output_safety.FALLBACK_TEXT)
+        self.assertEqual(response.output_blocked, "tool_budget_exhausted")
+        self.assertNotIn("TOOL_CALL", response.text)
+        self.assertIsNone(response.quotation)
+
+    def test_the_pdf_tool_is_not_available_to_the_model(self):
+        self._quotation("wamid.pdf-tool-1")
         response, _ = self._respond(
             [
                 'TOOL_CALL: {"name": "request_quotation_pdf", "arguments": {}}',
@@ -614,9 +625,9 @@ class BotEngineQuotationTests(WhatsAppQuotationTestCase):
             ],
             message_id="wamid.pdf-tool-2",
         )
-        self.assertIsNotNone(response.quotation_pdf)
-        self.assertEqual(response.quotation_pdf["id"], quotation["id"])
-
+        self.assertIsNone(response.quotation_pdf)
+        # "I've sent your quotation" is not true and is not sent either.
+        self.assertNotEqual(response.text, "I've sent your quotation.")
 
 
 class QuotationDocumentDeliveryTests(WhatsAppQuotationTestCase):

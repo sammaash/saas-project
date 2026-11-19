@@ -14,8 +14,14 @@ from platform_admin.services import customers as customer_service
 from platform_admin.services import outbound_dispatch
 
 
+def fake_state(settings, tenant_id, conversation_id):
+    """Mock-style tests run with AI active; the gate itself is tested separately."""
+    return ("ai_active", False)
+
+
 def fake_dispatch(
-    settings, *, tenant_id, conversation_id, message_row_id, sender_type, send
+    settings, *, tenant_id, conversation_id, message_row_id, sender_type, send,
+    notice=False,
 ):
     try:
         wamid = send()

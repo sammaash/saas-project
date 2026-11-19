@@ -1,27 +1,85 @@
 {% extends "tenant/base.html" %}
+{% from "_macros.html" import csrf_field %}
 {% block title %}{{ quotation.quotation_number }} - Tenant Portal{% endblock %}
 {% block content %}
-<h1>{{ quotation.quotation_number }} <span class="badge">{{ quotation.status }}</span></h1>
-<p class="muted">{{ quotation.customer_name }}{% if quotation.customer_contact %} · {{ quotation.customer_contact }}{% endif %}</p>
+<h1>{{ quotation.quotation_number }} <span class="badge quote-{{ lifecycle }}">{{ lifecycle_label }}</span></h1>
+<p class="muted">
+  {{ quotation.customer_name }}
+  {% if quotation.customer_wa_id %} · WhatsApp {{ quotation.customer_wa_id }}{% endif %}
+  {% if quotation.customer_contact %} · {{ quotation.customer_contact }}{% endif %}
+</p>
+<p>
+  <a class="button" href="{{ url_for('tenant_dashboard.quotation_pdf', tenant_id=g.tenant_id, quotation_id=quotation.id) }}" target="_blank" rel="noopener">View PDF</a>
+  <a class="button" href="{{ url_for('tenant_dashboard.quotation_pdf', tenant_id=g.tenant_id, quotation_id=quotation.id, download=1) }}">Download PDF</a>
+</p>
 <div class="card">
-  <p>Issued {{ quotation.issue_date }} · Expires {{ quotation.expiry_date or '—' }}</p>
+  <p>Issued {{ quotation.issue_date }} · Valid until {{ quotation.expiry_date }}</p>
   <table>
-    <thead><tr><th>SKU</th><th>Description</th><th>Qty</th><th>Unit price</th><th>Subtotal</th></tr></thead>
+    <thead><tr><th>Item</th><th>Qty</th><th>Unit price</th><th>Amount</th></tr></thead>
     <tbody>
       {% for line in quotation.lines %}
       <tr>
-        <td>{{ line.sku or '—' }}</td>
         <td>{{ line.description }}</td>
         <td>{{ line.quantity }}</td>
-        <td>{{ line.unit_price }}</td>
-        <td>{{ line.subtotal }}</td>
+        <td>{{ quotation.currency }} {{ '{:,.2f}'.format(line.unit_price) }}</td>
+        <td>{{ quotation.currency }} {{ '{:,.2f}'.format(line.subtotal) }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
-  <p>Subtotal: {{ quotation.subtotal }} {{ quotation.currency }} ·
-     Tax: {{ quotation.tax_amount }} · <strong>Total: {{ quotation.total }} {{ quotation.currency }}</strong></p>
+  <p>Subtotal: {{ quotation.currency }} {{ '{:,.2f}'.format(quotation.subtotal) }}
+     {% if quotation.tax_amount is not none %} · Tax: {{ quotation.currency }} {{ '{:,.2f}'.format(quotation.tax_amount) }}{% endif %}
+     · <strong>Total: {{ quotation.currency }} {{ '{:,.2f}'.format(quotation.total) }}</strong></p>
+  <p class="muted">Delivery charges are calculated separately based on the delivery location.</p>
   {% if quotation.terms %}<p class="muted">{{ quotation.terms }}</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>WhatsApp sending</h2>
+  {% if not attempts %}
+    <p class="muted">No send has been attempted for this quotation.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Attempt</th><th>Result</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for attempt in attempts %}
+      <tr>
+        <td>{{ loop.revindex }}</td>
+        <td>
+          {% if attempt.delivery_status == 'sent' %}Sent
+          {% elif attempt.delivery_status == 'uncertain' %}Not sent (outcome unknown)
+          {% elif attempt.delivery_status == 'pending' %}Not sent (interrupted)
+          {% else %}Not sent{% endif %}
+        </td>
+        <td class="muted">
+          {% if attempt.delivery_status == 'sent' and delivery.receipt and attempt.provider_message_id == delivery.provider_message_id %}WhatsApp reports: {{ delivery.receipt }}
+          {% elif attempt.error_code == 'sending_disabled' %}Sending is disabled in this environment
+          {% elif attempt.error_code == 'ai_reply_suppressed' %}Not sent because the AI was paused for this customer
+          {% elif attempt.error_code == 'pdf_render_failed' %}The PDF could not be produced
+          {% elif attempt.error_code == 'channel_unavailable' %}The WhatsApp number is not set up for sending
+          {% elif attempt.delivery_status == 'uncertain' %}WhatsApp did not confirm the send (no reply or timeout)
+          {% elif attempt.delivery_status == 'pending' %}The send was interrupted before WhatsApp answered
+          {% elif attempt.error_code and attempt.error_code.isdigit() %}WhatsApp rejected the message (WhatsApp error {{ attempt.error_code }})
+          {% elif attempt.error_code %}The message could not be sent ({{ attempt.error_code }}){% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if can_resend %}
+    {% if sending_enabled %}
+    <form method="post" action="{{ url_for('tenant_dashboard.quotation_resend', tenant_id=g.tenant_id, quotation_id=quotation.id) }}">
+      {{ csrf_field() }}
+      <input type="hidden" name="resend_key" value="{{ resend_key }}">
+      <button type="submit">Resend PDF on WhatsApp</button>
+    </form>
+    {% else %}
+    <p class="muted">Sending is disabled in this environment.</p>
+    {% endif %}
+  {% elif delivery.latest_status == 'uncertain' and delivery.delivery_status != 'sent' %}
+    <p class="muted">WhatsApp did not confirm the last send, so it is not resent automatically. Check with the customer before sending it again.</p>
+  {% endif %}
 </div>
 <p><a href="{{ url_for('tenant_dashboard.quotations', tenant_id=g.tenant_id) }}">Back to quotations</a></p>
 {% endblock %}

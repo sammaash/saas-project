@@ -35,6 +35,10 @@ MAX_SELECTIONS = 50
 MAX_BRIEF_ITEMS = 20
 BRIEF_STATUSES = ("collecting", "ready", "quoted", "handed_over")
 DELIVERY_STATUSES = ("pending", "sent", "failed", "uncertain")
+#: Delivery is never priced by the platform (approved Stage 3 decision Q1).
+DELIVERY_NOTE = "Delivery charges are calculated separately based on the delivery location."
+#: A request still being collected is picked up again only while it is this fresh.
+BRIEF_MAX_AGE_HOURS = 24
 
 #: A customer asking for the document rather than a new price. Deliberately narrow:
 #: "how much is..." must reach the pricing flow, not the PDF sender.
@@ -179,7 +183,11 @@ def _fetch_quotation(
                q.issue_date, q.expiry_date, q.currency, q.subtotal, q.tax_rate,
                q.tax_amount, q.total, q.tax_treatment, q.terms, q.status,
                q.source, q.customer_wa_id, q.idempotency_key, q.created_by_user_id,
-               t.name as business_name
+               q.created_at, t.name as business_name,
+               (select c.display_phone_number from public.tenant_channels c
+                 where c.tenant_id = q.tenant_id and c.display_phone_number is not null
+                 order by c.is_default desc, c.created_at
+                 limit 1) as business_phone
         from public.quotations q
         join public.tenants t on t.id = q.tenant_id
         where q.id = %s and q.tenant_id = app.current_tenant_id()
@@ -271,6 +279,25 @@ def _existing_by_idempotency(
     if row is None:
         return None
     return str(row[0]), (str(row[1]) if row[1] is not None else None)
+
+
+def _unused_number(cursor: Any, issue_date: date, attempts: int = 5) -> str:
+    """A ``Q-YYYYMMDD-XXXXXXXX`` reference not yet used by this tenant.
+
+    The random suffix makes a collision very unlikely; checking first means one never
+    surfaces as a unique-violation error to the customer. (The unique constraint
+    ``quotations_number_unique`` remains the final guard.)
+    """
+    for _ in range(attempts):
+        number = f"Q-{issue_date:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
+        cursor.execute(
+            "select 1 from public.quotations where tenant_id = app.current_tenant_id() "
+            "and quotation_number = %s",
+            (number,),
+        )
+        if cursor.fetchone() is None:
+            return number
+    raise QuotationError("A unique quotation reference could not be allocated.")
 
 
 def _system_audit(cursor: Any, quotation: dict[str, Any]) -> None:
@@ -430,7 +457,7 @@ def create_quotation(
         )
         total = subtotal + (tax_amount or Decimal("0.00"))
         quotation_id = str(uuid.uuid4())
-        quotation_number = f"Q-{issue_date:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
+        quotation_number = _unused_number(cursor, issue_date)
         cursor.execute(
             """
             insert into public.quotations
@@ -736,8 +763,14 @@ def _merge_brief(
         "items": [dict(item) for item in _brief_items(existing)],
         "notes": (existing or {}).get("notes") if isinstance(existing, Mapping) else None,
     }
+    if isinstance(existing, Mapping) and existing.get("customer_name"):
+        current["customer_name"] = existing.get("customer_name")
     if patch.get("replace") is True:
         current["items"] = []
+    if patch.get("customer_name") is not None:
+        current["customer_name"] = _text(
+            patch.get("customer_name"), "Customer name", max_length=200, required=True
+        )
     if "notes" in patch:
         current["notes"] = _text(
             patch.get("notes"), "Notes", max_length=1000, required=False
@@ -1239,6 +1272,7 @@ def format_customer_summary(quotation: Mapping[str, Any]) -> str:
     parts.append(f"Total: {currency} {_money_text(quotation.get('total'))}")
     if quotation.get("expiry_date"):
         parts.append(f"Valid until: {quotation['expiry_date']}")
+    parts.append(DELIVERY_NOTE)
     if quotation.get("terms"):
         parts.append(str(quotation["terms"]))
     parts.append("This quotation does not reserve stock or create an order.")
@@ -1255,3 +1289,201 @@ def fallback_customer_summary(quotation: Mapping[str, Any]) -> str:
         "Please ask our team if you need the full details."
     )
 
+
+# ---------------------------------------------------------------------------
+# Stored quotation documents (migration 0044) and the dashboard delivery view
+# ---------------------------------------------------------------------------
+def active_brief(
+    settings: Any, tenant_id: str, conversation_id: str | None
+) -> dict[str, Any] | None:
+    """The conversation's request while it is still being collected and recent."""
+    if not conversation_id:
+        return None
+    with tenant_transaction(tenant_id, _database_url(settings)) as cursor:
+        cursor.execute(
+            """
+            select id, conversation_id, customer_wa_id, status, brief,
+                   missing_fields, created_at, updated_at
+            from public.quotation_briefs
+            where tenant_id = app.current_tenant_id() and conversation_id = %s
+              and status in ('collecting', 'ready')
+              and updated_at > now() - make_interval(hours => %s)
+            """,
+            (str(conversation_id), BRIEF_MAX_AGE_HOURS),
+        )
+        row = cursor.fetchone()
+        return _brief_row(cursor, row) if row is not None else None
+
+
+def save_brief(
+    settings: Any,
+    tenant_id: str,
+    conversation_id: str,
+    customer_wa_id: str | None,
+    brief: Mapping[str, Any],
+    *,
+    status: str,
+    missing: Sequence[str],
+) -> dict[str, Any]:
+    """Persist a request exactly as the deterministic flow computed it."""
+    if status not in BRIEF_STATUSES:
+        raise QuotationError("Unsupported quotation request status.")
+    from psycopg.types.json import Jsonb  # noqa: PLC0415
+
+    with tenant_transaction(tenant_id, _database_url(settings)) as cursor:
+        cursor.execute(
+            """
+            insert into public.quotation_briefs
+                (tenant_id, conversation_id, customer_wa_id, status, brief,
+                 missing_fields)
+            values (app.current_tenant_id(), %s, %s, %s, %s, %s)
+            on conflict (tenant_id, conversation_id) do update
+              set status = excluded.status,
+                  brief = excluded.brief,
+                  missing_fields = excluded.missing_fields,
+                  customer_wa_id = coalesce(
+                      excluded.customer_wa_id, public.quotation_briefs.customer_wa_id
+                  )
+            returning id, conversation_id, customer_wa_id, status, brief,
+                      missing_fields, created_at, updated_at
+            """,
+            (
+                str(conversation_id),
+                _text(customer_wa_id, "WhatsApp identity", max_length=200, required=False),
+                status,
+                Jsonb(dict(brief)),
+                list(missing),
+            ),
+        )
+        return _brief_row(cursor, cursor.fetchone())
+
+
+def store_document(
+    settings: Any, tenant_id: str, quotation_id: str, content: bytes
+) -> dict[str, Any]:
+    """Store the quotation's PDF once. A second call returns the first document.
+
+    Documents are immutable (0044): the insert is ``on conflict do nothing`` and the
+    stored bytes are returned, so a retry can never replace what the customer was sent.
+    """
+    import hashlib  # noqa: PLC0415
+
+    if not isinstance(content, (bytes, bytearray)) or not bytes(content).startswith(b"%PDF-"):
+        raise QuotationError("The quotation document is not a PDF.")
+    data = bytes(content)
+    digest = hashlib.sha256(data).hexdigest()
+    with tenant_transaction(tenant_id, _database_url(settings)) as cursor:
+        cursor.execute(
+            """
+            insert into public.quotation_documents
+                (quotation_id, tenant_id, content, size_bytes, sha256)
+            values (%s, app.current_tenant_id(), %s, %s, %s)
+            on conflict (quotation_id) do nothing
+            """,
+            (str(quotation_id), data, len(data), digest),
+        )
+        cursor.execute(
+            "select content, sha256, size_bytes, created_at from public.quotation_documents "
+            "where quotation_id = %s and tenant_id = app.current_tenant_id()",
+            (str(quotation_id),),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise QuotationError("The quotation document could not be stored.")
+    return {
+        "content": bytes(row[0]),
+        "sha256": row[1],
+        "size_bytes": row[2],
+        "created_at": row[3],
+    }
+
+
+def load_document(settings: Any, tenant_id: str, quotation_id: str) -> bytes | None:
+    """The stored PDF for this tenant's quotation, or None if none was stored."""
+    try:
+        quotation_id = str(uuid.UUID(str(quotation_id).strip()))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    with tenant_transaction(tenant_id, _database_url(settings)) as cursor:
+        cursor.execute(
+            "select content from public.quotation_documents "
+            "where quotation_id = %s and tenant_id = app.current_tenant_id()",
+            (quotation_id,),
+        )
+        row = cursor.fetchone()
+    return bytes(row[0]) if row is not None else None
+
+
+#: Dashboard lifecycle (approved Stage 3 decision Q4): Generated / Sent / Not sent /
+#: Expired. "Sent" requires a WhatsApp message id; nothing else is ever shown as sent.
+LIFECYCLE_LABELS = {
+    "generated": "Generated",
+    "sent": "Sent",
+    "not_sent": "Not sent",
+    "expired": "Expired",
+}
+
+
+def lifecycle_status(*, expiry_date: Any, delivery_status: str | None) -> str:
+    if expiry_date is not None and expiry_date < date.today():
+        return "expired"
+    if delivery_status == "sent":
+        return "sent"
+    if delivery_status in ("failed", "uncertain", "pending"):
+        return "not_sent"
+    return "generated"
+
+
+def delivery_overview(
+    settings: Any, tenant_id: str, quotation_ids: Sequence[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Per quotation: the latest delivery attempt and WhatsApp's own receipt for it.
+
+    ``delivery_status`` is ``sent`` when any attempt was confirmed by WhatsApp (a
+    provider message id exists); a later failed resend never hides an earlier confirmed
+    send. ``receipt`` is the delivered/read/failed status Meta reported for that message.
+    """
+    ids = [str(value) for value in quotation_ids] if quotation_ids else None
+    with tenant_transaction(tenant_id, _database_url(settings)) as cursor:
+        cursor.execute(
+            """
+            with ranked as (
+              select d.*,
+                     row_number() over (partition by d.quotation_id
+                                        order by d.created_at desc, d.id desc) as latest_rank,
+                     row_number() over (partition by d.quotation_id
+                                        order by (d.delivery_status = 'sent') desc,
+                                                 d.created_at desc, d.id desc) as sent_rank,
+                     count(*) over (partition by d.quotation_id) as attempts
+              from public.quotation_deliveries d
+              where d.tenant_id = app.current_tenant_id()
+                and (%s::uuid[] is null or d.quotation_id = any(%s::uuid[]))
+            )
+            select l.quotation_id, l.id, l.delivery_status, l.error_code, l.updated_at,
+                   l.attempts, s.delivery_status, s.provider_message_id, m.delivery_status
+            from ranked l
+            join ranked s on s.quotation_id = l.quotation_id and s.sent_rank = 1
+            left join public.messages m
+              on m.tenant_id = app.current_tenant_id()
+             and s.provider_message_id is not null
+             and m.provider_message_id = s.provider_message_id
+            where l.latest_rank = 1
+            """,
+            (ids, ids),
+        )
+        rows = cursor.fetchall()
+    overview: dict[str, dict[str, Any]] = {}
+    for (quotation_id, delivery_id, latest, error_code, updated_at, attempts,
+         best, wamid, receipt) in rows:
+        sent = best == "sent"
+        overview[str(quotation_id)] = {
+            "delivery_id": str(delivery_id),
+            "delivery_status": "sent" if sent else latest,
+            "latest_status": latest,
+            "error_code": error_code,
+            "provider_message_id": wamid if sent else None,
+            "updated_at": updated_at,
+            "receipt": receipt if sent else None,
+            "attempts": int(attempts),
+        }
+    return overview

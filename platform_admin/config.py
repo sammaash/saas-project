@@ -448,7 +448,7 @@ def verify_database_roles(settings: Settings) -> None:
 # (0006 tenant_settings, 0017 product_variants, 0026 catalogue imports + catalogue_version +
 # quotations, 0028 whatsapp webhook tables, 0031 product_variants fields, 0032 orders and
 # payments, 0033 customers/conversations/messages, 0034 handover_requests, 0037 quotation
-# briefs and deliveries).
+# briefs and deliveries, 0044 stored quotation documents).
 # Note: this contract can only name tables and columns. Objects a migration creates beside
 # them -- indexes, triggers, policies -- are covered by the structural tests instead.
 REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -458,6 +458,7 @@ REQUIRED_SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.quotation_lines", ()),
     ("public.quotation_briefs", ()),
     ("public.quotation_deliveries", ()),
+    ("public.quotation_documents", ()),
     ("public.catalogue_import_batches", ()),
     ("public.whatsapp_webhook_events", ()),
     ("public.whatsapp_conversations", ()),

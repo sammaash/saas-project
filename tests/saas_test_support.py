@@ -81,6 +81,7 @@ TENANT_SCOPED_TABLES: tuple[tuple[str, str], ...] = (
     ("quotation_lines", "tenant_id"),
     ("quotation_briefs", "tenant_id"),
     ("quotation_deliveries", "tenant_id"),
+    ("quotation_documents", "tenant_id"),
     ("whatsapp_webhook_events", "tenant_id"),
     ("whatsapp_conversations", "tenant_id"),
     ("orders", "tenant_id"),
@@ -120,6 +121,8 @@ AUTHENTICATED_INACCESSIBLE_TABLES = frozenset(
         "handover_requests",
         "quotation_briefs",
         "quotation_deliveries",
+        # 0044: stored PDFs are served by the backend after its own membership check.
+        "quotation_documents",
         # 0039 grants select/insert to app_backend only (staff inbox audit trail).
         "conversation_control_events",
         "channel_credentials",

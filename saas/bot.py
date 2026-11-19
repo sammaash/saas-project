@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol, Sequence
 
 from .catalogue import CatalogueService
-from .quotations import brief_prompt_text, quotations_enabled
+from . import output_safety
 from .tenant_admin import tenant_admin
 from . import tools as _tools
 
@@ -108,6 +108,9 @@ class BotResponse:
     #: Set when the customer asked for a quotation PDF and one exists. The host sends
     #: the document from the persisted quotation and its saved line snapshots.
     quotation_pdf: dict[str, Any] | None = None
+    #: Why the model's own text was withheld (``saas.output_safety``); ``text`` then holds
+    #: the platform fallback. None when the model's text passed the customer-output gate.
+    output_blocked: str | None = None
 
 
 class BotResponseProvider(Protocol):
@@ -487,7 +490,10 @@ class BotResponseEngine:
             "place orders, reserve inventory, charge or request payment, call tools, or perform "
             "any external action. Explain that such actions are disabled in test mode when asked."
             if safe_test_mode
-            else "Return a customer-facing text response. External actions are handled elsewhere."
+            else "Return a customer-facing text response. External actions are handled elsewhere. "
+            "Never say that you will check, confirm, find out or get back to the customer "
+            "later: nothing happens after your reply. Answer now from the data you have, ask "
+            "the customer for what you need, or record a staff handover."
         )
         handover = (
             ""
@@ -509,27 +515,21 @@ class BotResponseEngine:
                 "team could not be notified automatically."
             )
         )
-        quotation = (
+        # Quotations are a deterministic platform workflow (Stage 3); the model never
+        # runs them. It answers price questions from the catalogue only.
+        pricing = (
             ""
-            if (
-                safe_test_mode
-                or not send_enabled
-                or not quotations_enabled(context.settings.get("configuration"))
-            )
+            if safe_test_mode
             else (
-                "\n\nQUOTATION PROTOCOL\n"
-                "Customers may ask for a quotation at any time, whether they chose the "
-                "menu or asked spontaneously. Use update_quotation_brief to record what "
-                "they want (product, size/weight, quantity); ask only for the details the "
-                "tool reports as missing, one question at a time. Corrections ('make it "
-                "2kg', 'two of them') update the same request. When the tool reports that "
-                "nothing is missing, call request_quote with use_brief=true. Never state, "
-                "estimate or recalculate a price, subtotal, tax or total yourself: only the "
-                "numbers returned by request_quote may be shown. If request_quote reports "
-                "needs_staff, say a team member will prepare the quote instead of guessing. "
-                "If the customer asks for a PDF or document copy of a quotation they "
-                "already received, call request_quotation_pdf; the platform sends the file, "
-                "so never claim to attach it without that tool."
+                "\n\nPRICING RULES\n"
+                "Answer an ordinary price question only with the catalogue price in the "
+                "tenant data. Never invent, estimate, discount or recalculate a price, and "
+                "never add tax or delivery charges yourself. Delivery charges are "
+                "calculated separately based on the delivery location: never calculate or "
+                "estimate one. Never agree to a discount or special price. If the customer "
+                "wants a formal quotation document, tell them they can ask for a quote "
+                "(for example: \"quote for 2 vanilla cakes, 1kg each\"). Never say that you "
+                "are preparing, sending or finalising a quotation, order or document."
             )
         )
         tenant_data = BotResponseEngine._without_empty(
@@ -551,7 +551,7 @@ class BotResponseEngine:
             "available; describe MADE_TO_ORDER items clearly and do not invent a lead time. "
             "Follow the saved persona and business rules where they "
             "do not conflict with safety. "
-            f"{safety}{handover}{quotation}{brief_prompt_text(brief)}"
+            f"{safety}{handover}{pricing}"
             "\n\nTENANT DATA (JSON):\n"
             f"{json.dumps(tenant_data, ensure_ascii=True, sort_keys=True, default=str, separators=(',', ':'))}"
         )
@@ -595,7 +595,9 @@ class BotResponseEngine:
         request_processing_ms = (time.perf_counter() - processing_started) * 1_000
 
         # Build the conversation message list that will grow with tool-result turns.
-        registry = _tools.default_tool_registry()
+        # Quotation tools are not offered to the model: quotations are issued only by the
+        # deterministic webhook flow (platform_admin.services.quotation_flow).
+        registry = _tools.default_tool_registry(include_quotation_tools=False)
         tenant_id_str = str(context.tenant.get("id"))
         customer_key = customer_key or context.tenant.get("whatsapp_wa_id") or context.tenant.get(
             "id"
@@ -608,7 +610,7 @@ class BotResponseEngine:
             safe_test_mode=safe_test_mode,
             conversation_id=str(conversation_id) if conversation_id else None,
             customer_name=str(customer_name) if customer_name else None,
-            quotations_enabled=quotations_enabled(context.settings.get("configuration")),
+            quotations_enabled=False,
             send_enabled=bool(send_enabled),
             # Only what a human needs to read a handover: the last few short turns.
             context_turns=tuple(
@@ -628,6 +630,7 @@ class BotResponseEngine:
 
         tool_call_rounds = 0
         final_text = ""
+        budget_exhausted = False
         handover: dict[str, Any] | None = None
         handover_failed = False
         quotation: dict[str, Any] | None = None
@@ -662,7 +665,9 @@ class BotResponseEngine:
                         handover_failed = False
                     elif not entry.get("ok"):
                         handover_failed = True
-                if entry.get("tool") == "request_quote":
+                # Quotation bookkeeping only when the tool is actually offered (it is
+                # not, since Stage 3); an "Unknown tool" refusal is not a failed quote.
+                if entry.get("tool") == "request_quote" and registry.get("request_quote"):
                     payload = entry.get("data") if isinstance(entry.get("data"), dict) else {}
                     if entry.get("ok") and isinstance(payload.get("quotation"), dict):
                         quotation = payload["quotation"]
@@ -701,7 +706,11 @@ class BotResponseEngine:
                         quotation_failed = True
                     else:
                         quotation_failed = True
-                if entry.get("tool") == "request_quotation_pdf" and entry.get("ok"):
+                if (
+                    entry.get("tool") == "request_quotation_pdf"
+                    and entry.get("ok")
+                    and registry.get("request_quotation_pdf")
+                ):
                     payload = entry.get("data") if isinstance(entry.get("data"), dict) else {}
                     if isinstance(payload.get("quotation"), dict):
                         quotation_pdf = payload["quotation"]
@@ -723,8 +732,29 @@ class BotResponseEngine:
                 }
             )
         else:
-            # Exhausted the tool-call budget; return whatever the last model text was.
-            final_text = text.strip()[:MAX_RESPONSE_LENGTH] if text else ""
+            # Exhausted the tool-call budget. The last model text is a tool call, not an
+            # answer: it must never reach the customer (production incident 2026-11-16).
+            final_text = ""
+            budget_exhausted = True
+
+        # Customer-facing output gate (all tenants, all tool workflows). Only a handover
+        # that was actually recorded makes "the team will follow up" true; a failed one
+        # does not (the host answers it with its own apology).
+        output_blocked: str | None = None
+        if budget_exhausted:
+            final_text, output_blocked = output_safety.FALLBACK_TEXT, "tool_budget_exhausted"
+        else:
+            final_text, output_blocked = output_safety.safe_customer_text(
+                final_text, allow_promises=bool(handover)
+            )
+        if output_blocked:
+            logger.warning(
+                "Customer output blocked tenant=%s channel=%s reason=%s tool_call_rounds=%d",
+                tenant_id_str,
+                request.channel,
+                output_blocked,
+                tool_call_rounds,
+            )
 
         response_started = time.perf_counter()
         response = BotResponse(
@@ -735,6 +765,7 @@ class BotResponseEngine:
             quotation=quotation,
             quotation_failed=quotation_failed,
             quotation_pdf=quotation_pdf,
+            output_blocked=output_blocked,
         )
         response_processing_ms = (time.perf_counter() - response_started) * 1_000
         logger.info(

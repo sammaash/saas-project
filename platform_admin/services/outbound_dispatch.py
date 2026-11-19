@@ -113,15 +113,23 @@ def dispatch_reply(
     message_row_id: str | None,
     sender_type: str,
     send: Callable[[], str],
+    notice: bool = False,
 ) -> DispatchOutcome:
     """Run the dispatch critical section for one recorded outbound intent.
 
     ``send`` performs the provider call and returns the provider message id
     (wamid). It is invoked while the conversation row lock is held, only after the
-    mode recheck passed. ``message_row_id`` may be None when no correlated row was
+    mode recheck passed. ``notice=True`` marks the platform-owned acknowledgement of
+    a customer's own request for a person: it is sent in any mode (the request has
+    just paused automation), still under the lock. Nothing model-written may use it.
+    ``message_row_id`` may be None when no correlated row was
     recorded: the send is still gated and locked, only the row finalisation is
     skipped.
     """
+
+    # Set once the provider accepted the message, so a later finalisation or commit
+    # failure can still report the wamid instead of losing it with the rollback.
+    accepted: dict[str, str] = {}
 
     def _body(cursor: Any) -> DispatchOutcome:
         cursor.execute(
@@ -138,7 +146,7 @@ def dispatch_reply(
             if row is None:
                 raise ServiceError("Conversation not found.", 404)
             mode = row[0]
-        if sender_type != "staff" and mode not in (None, "ai_active"):
+        if sender_type != "staff" and not notice and mode not in (None, "ai_active"):
             _mark_suppressed(cursor, conversation_id, message_row_id, mode)
             return DispatchOutcome(
                 "suppressed",
@@ -147,6 +155,7 @@ def dispatch_reply(
             )
         try:
             wamid = send()
+            accepted["wamid"] = wamid
         except Exception as error:  # noqa: BLE001 - finalise whatever the provider said
             code, message, ambiguous = _failure_fields(error)
             if message_row_id:
@@ -177,6 +186,22 @@ def dispatch_reply(
     except ServiceError:
         raise
     except Exception as error:  # noqa: BLE001
+        if accepted.get("wamid"):
+            # The customer HAS the message; only our record of it was lost. Never resend.
+            # Log the reconciliation keys and hand the wamid to the caller.
+            logger.error(
+                "UNRECORDED OUTBOUND: provider accepted the message but finalisation "
+                "failed tenant=%s conversation=%s row=%s wamid=%s error=%s",
+                tenant_id,
+                conversation_id,
+                message_row_id,
+                accepted["wamid"],
+                type(error).__name__,
+            )
+            try:
+                error.sent_wamid = accepted["wamid"]  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - exceptions without __dict__
+                pass
         if _missing_0039(error):
             # Fail closed: without migration 0039 there is no ai_mode to enforce, so
             # NO automated customer-facing send may happen at all. The startup schema

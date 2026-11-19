@@ -94,7 +94,7 @@ class ControlUnitTests(unittest.TestCase):
         }
         for (previous, new), event in cases.items():
             with self.subTest(transition=f"{previous}->{new}"):
-                cursor = _StubCursor([{"columns": ("ai_mode",), "rows": [(previous,)]}])
+                cursor = _StubCursor([{"columns": ("ai_mode", "needs_attention"), "rows": [(previous, False)]}])
                 result = self._set_mode(cursor, new)
                 self.assertEqual(result, "changed")
                 inserts = [p for sql, p in cursor.executed if "insert" in sql]
@@ -103,7 +103,7 @@ class ControlUnitTests(unittest.TestCase):
                 self.assertIn(previous, str(inserts[0]))
 
     def test_same_mode_is_an_idempotent_noop_without_event(self):
-        cursor = _StubCursor([{"columns": ("ai_mode",), "rows": [("paused",)]}])
+        cursor = _StubCursor([{"columns": ("ai_mode", "needs_attention"), "rows": [("paused", False)]}])
         result = self._set_mode(cursor, "paused")
         self.assertEqual(result, "unchanged")
         self.assertFalse(any("insert" in sql for sql, _ in cursor.executed))
@@ -112,7 +112,7 @@ class ControlUnitTests(unittest.TestCase):
         )
 
     def test_human_to_paused_is_rejected(self):
-        cursor = _StubCursor([{"columns": ("ai_mode",), "rows": [("human",)]}])
+        cursor = _StubCursor([{"columns": ("ai_mode", "needs_attention"), "rows": [("human", False)]}])
         with self.assertRaises(ServiceError) as raised:
             self._set_mode(cursor, "paused")
         self.assertEqual(raised.exception.status, 409)
@@ -139,13 +139,13 @@ class ControlUnitTests(unittest.TestCase):
 
     def test_user_events_carry_the_actor_system_events_do_not(self):
         actor = str(uuid.uuid4())
-        cursor = _StubCursor([{"columns": ("ai_mode",), "rows": [("ai_active",)]}])
+        cursor = _StubCursor([{"columns": ("ai_mode", "needs_attention"), "rows": [("ai_active", False)]}])
         self._set_mode(cursor, "paused", actor_user_id=actor)
         params = [p for sql, p in cursor.executed if "insert" in sql][0]
         self.assertIn(actor, str(params))
         self.assertIn("'user'", str(params).replace('"', "'"))
 
-        cursor = _StubCursor([{"columns": ("ai_mode",), "rows": [("ai_active",)]}])
+        cursor = _StubCursor([{"columns": ("ai_mode", "needs_attention"), "rows": [("ai_active", False)]}])
         self._set_mode(cursor, "paused", actor_user_id=None)
         params = [p for sql, p in cursor.executed if "insert" in sql][0]
         self.assertIn("None", str(params))  # NULL actor, system event

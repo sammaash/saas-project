@@ -2,23 +2,37 @@
 {% block title %}Quotations - Tenant Portal{% endblock %}
 {% block content %}
 <h1>Quotations</h1>
+<p class="muted">Quotations requested on WhatsApp appear here automatically. Prices are copied from the catalogue when each quotation is issued and never change afterwards.</p>
 <div class="card">
   <table>
-    <thead><tr><th>Number</th><th>Customer</th><th>Issued</th><th>Expires</th><th>Total</th><th>Status</th></tr></thead>
+    <thead>
+      <tr>
+        <th>Reference</th><th>Customer</th><th>WhatsApp</th><th>Issued</th>
+        <th>Total</th><th>Status</th><th>PDF</th>
+      </tr>
+    </thead>
     <tbody>
       {% for row in rows %}
       <tr>
         <td><a href="{{ url_for('tenant_dashboard.quotation_detail', tenant_id=g.tenant_id, quotation_id=row.id) }}">{{ row.quotation_number }}</a></td>
         <td>{{ row.customer_name }}</td>
+        <td>{{ row.customer_wa_id or row.customer_contact or '—' }}</td>
         <td>{{ row.issue_date }}</td>
-        <td>{{ row.expiry_date or '—' }}</td>
-        <td>{{ row.total }} {{ row.currency }}</td>
-        <td><span class="badge">{{ row.status }}</span></td>
+        <td>{{ row.currency }} {{ '{:,.2f}'.format(row.total) }}</td>
+        <td>
+          <span class="badge quote-{{ row.lifecycle }}">{{ row.lifecycle_label }}</span>
+          {% if row.delivery.receipt in ('delivered', 'read') %}<span class="muted"> · {{ row.delivery.receipt|capitalize }}</span>{% endif %}
+        </td>
+        <td>
+          <a href="{{ url_for('tenant_dashboard.quotation_pdf', tenant_id=g.tenant_id, quotation_id=row.id) }}" target="_blank" rel="noopener">View</a>
+          · <a href="{{ url_for('tenant_dashboard.quotation_pdf', tenant_id=g.tenant_id, quotation_id=row.id, download=1) }}">Download</a>
+        </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted">No quotations yet.</td></tr>
+      <tr><td colspan="7" class="muted">No quotations yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
+<p class="muted"><strong>Generated</strong>: created, no send attempted yet. <strong>Sent</strong>: WhatsApp confirmed the PDF was sent. <strong>Not sent</strong>: sending failed, was disabled, or its outcome is unknown. <strong>Expired</strong>: past its valid-until date.</p>
 {% endblock %}

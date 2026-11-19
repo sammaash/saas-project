@@ -16,9 +16,9 @@ from contextlib import ExitStack, nullcontext
 from unittest.mock import MagicMock, patch
 
 try:
-    from .webhook_dispatch_support import fake_dispatch
+    from .webhook_dispatch_support import fake_dispatch, fake_state
 except ImportError:  # discovery inside the tests directory
-    from webhook_dispatch_support import fake_dispatch  # type: ignore[no-redef]
+    from webhook_dispatch_support import fake_dispatch, fake_state  # type: ignore[no-redef]
 
 from platform_admin.app import create_app
 from platform_admin.config import Settings
@@ -817,6 +817,7 @@ class StaffAssistanceDispatchTests(unittest.TestCase):
 
 
 @patch("platform_admin.routes.outbound_dispatch.dispatch_reply", new=fake_dispatch)
+@patch("platform_admin.routes.conversation_control.get_state", new=fake_state)
 class WebhookMenuRouteTests(unittest.TestCase):
     """End-to-end routing with every persistence and send call patched."""
 

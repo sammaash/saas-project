@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import io
+import re
 import time
 import uuid
 from datetime import datetime
@@ -31,17 +32,21 @@ from ..services import catalogue_import as catalogue_import_service
 from ..services import bot_config as bot_config_service
 from ..services import channels as channel_service
 from ..services import customers as customer_service
+from ..services import conversation_control
 from ..services import handover as handover_service
+from ..services import human_request as human_request_service
 from ..services import members as members_service
 from ..services import menu as menu_service
 from ..services import menu_simulator as menu_simulator_service
 from ..services import outbound_dispatch
 from ..services import playground as playground_service
+from ..services import quotation_flow
 from ..services import quotations as quotation_service
 from ..services import tenant_config
 from ..services import tenants as tenant_service
 from ..services import whatsapp as whatsapp_service
 from ..services.validation import ServiceError
+from saas import quotation_intent
 from saas.bot import BotResponseEngine, ConversationTurn, TenantBotContextLoader
 from saas import quotations as saas_quotations
 
@@ -286,6 +291,7 @@ def _dispatch_menu_reply(
         message_row_id=str(outbox_row["id"]) if (outbox_row or {}).get("id") else None,
         sender_type="assistant",
         send=_send,
+        notice=bool(getattr(menu_reply, "notice", False)),
     )
     if outcome.kind == "suppressed":
         whatsapp_service.update_event(
@@ -332,12 +338,22 @@ def _deliver_quotation_pdf(
     quotation: dict,
     inbound_message_id: str,
     caption: str | None = None,
+    pdf: bytes | None = None,
+    idempotency_key: str | None = None,
+    sender_type: str = "assistant",
+    phone_number_id: str | None = None,
 ) -> dict:
     """Send a persisted quotation as a WhatsApp document.
 
     The delivery row is claimed **before** anything is uploaded or sent. A replay
     therefore finds the existing row: a ``sent`` or ``uncertain`` attempt is never
     repeated, and only a definite ``failed`` attempt is retried.
+
+    The document is the stored PDF (migration 0044), rendered from the quotation
+    snapshot once; a document message row is recorded before the send so the inbox
+    shows it and Meta's delivered/read/failed receipts reach it. ``sent`` is recorded
+    only with the WhatsApp message id. With sending disabled nothing is uploaded and the
+    attempt is recorded as ``failed / sending_disabled`` (shown as "Not sent").
     """
     quotation_id = str(quotation.get("id"))
     try:
@@ -348,9 +364,8 @@ def _deliver_quotation_pdf(
             conversation_id=str(conversation["id"]) if conversation else None,
             channel_id=channel_id,
             customer_wa_id=customer_key,
-            idempotency_key=saas_quotations.delivery_key(
-                quotation_id, inbound_message_id
-            ),
+            idempotency_key=idempotency_key
+            or saas_quotations.delivery_key(quotation_id, inbound_message_id),
         )
     except Exception as error:  # noqa: BLE001 - never fail the webhook on bookkeeping
         logger.error(
@@ -364,30 +379,56 @@ def _deliver_quotation_pdf(
 
     delivery_id = str(claim["row"]["id"])
     filename = f"{quotation.get('quotation_number') or 'quotation'}.pdf"
-    try:
-        # Built from the persisted quotation and its saved line snapshots only.
-        pdf = quotation_service.quotation_pdf(quotation)
-    except Exception as error:  # noqa: BLE001
-        logger.error(
-            "Quotation PDF rendering failed tenant=%s error=%s",
-            tenant_id,
-            type(error).__name__,
-        )
+    # The webhook's resolved channel carries no phone number id (the inbound event
+    # does); a tenant_channels row (portal resend) carries it as a column.
+    phone_id = phone_number_id or (channel or {}).get("phone_number_id")
+    if not phone_id:
         saas_quotations.finish_delivery(
             settings,
             tenant_id,
             delivery_id,
             status="failed",
-            error_code="pdf_render_failed",
-            error_message=f"PDF rendering failed ({type(error).__name__})",
+            error_code="channel_unavailable",
+            error_message="No WhatsApp phone number id for this channel.",
         )
-        return {"outcome": "failed", "error": "pdf_render_failed"}
+        return {"outcome": "failed", "error": "channel_unavailable"}
+    if pdf is None:
+        try:
+            # Built from the persisted quotation and its saved line snapshots only, and
+            # stored once: a later download returns exactly these bytes.
+            pdf = quotation_service.store_pdf(settings, tenant_id, quotation)
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "Quotation PDF rendering failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            saas_quotations.finish_delivery(
+                settings,
+                tenant_id,
+                delivery_id,
+                status="failed",
+                error_code="pdf_render_failed",
+                error_message=f"PDF rendering failed ({type(error).__name__})",
+            )
+            return {"outcome": "failed", "error": "pdf_render_failed"}
+
+    if not settings.whatsapp_send_enabled:
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="failed",
+            error_code="sending_disabled",
+            error_message="WhatsApp sending is disabled in this environment.",
+        )
+        return {"outcome": "failed", "error": "sending_disabled"}
 
     media_id = None
     try:
         media_id = whatsapp_service.upload_media(
             settings,
-            phone_number_id=channel["phone_number_id"],
+            phone_number_id=phone_id,
             tenant_id=tenant_id,
             credentials_ref=channel.get("credentials_ref"),
             filename=filename,
@@ -426,11 +467,37 @@ def _deliver_quotation_pdf(
         logger.exception("Quotation media upload failed tenant=%s", tenant_id)
         return {"outcome": "uncertain"}
 
+    document_payload = {
+        "document": {"filename": filename, "media_id": media_id},
+        "quotation_id": quotation_id,
+        "quotation_number": quotation.get("quotation_number"),
+    }
+    document_row = None
+    if conversation:
+        try:
+            document_row = customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                str(conversation["id"]),
+                direction="outbound",
+                sender_type=sender_type,
+                message_type="document",
+                body_text=filename,
+                payload=document_payload,
+            )
+        except Exception as error:  # noqa: BLE001 - recorded after the send instead
+            logger.error(
+                "Quotation document intent not recorded tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+
     def _send_document() -> str:
         try:
             return whatsapp_service.send_document(
                 settings,
-                phone_number_id=channel["phone_number_id"],
+                phone_number_id=phone_id,
                 tenant_id=tenant_id,
                 credentials_ref=channel.get("credentials_ref"),
                 recipient=customer_key,
@@ -450,16 +517,49 @@ def _deliver_quotation_pdf(
                 "document_send_exception", type(error).__name__, ambiguous=True
             ) from error
 
-    # The document send is an automated customer-facing send: it runs through the
-    # dispatch boundary (conversation lock + AI-mode recheck) like every other.
-    outcome = outbound_dispatch.dispatch_reply(
-        settings,
-        tenant_id=tenant_id,
-        conversation_id=str(conversation["id"]) if conversation else None,
-        message_row_id=None,
-        sender_type="assistant",
-        send=_send_document,
-    )
+    # The document send is a customer-facing send: it runs through the dispatch
+    # boundary (conversation lock + AI-mode recheck) like every other. A staff resend
+    # (sender_type="staff") is allowed while the AI is paused, like a staff reply.
+    try:
+        outcome = outbound_dispatch.dispatch_reply(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=str(conversation["id"]) if conversation else None,
+            message_row_id=str(document_row["id"]) if (document_row or {}).get("id") else None,
+            sender_type=sender_type,
+            send=_send_document,
+        )
+    except Exception as error:  # noqa: BLE001
+        wamid = getattr(error, "sent_wamid", None)
+        if not wamid:
+            # Raised before the provider call (busy conversation, lost connection): the
+            # send callback converts every provider failure into an outcome, so no
+            # document reached WhatsApp. A definite, retryable failure.
+            saas_quotations.finish_delivery(
+                settings,
+                tenant_id,
+                delivery_id,
+                status="failed",
+                media_id=media_id,
+                error_code="document_dispatch_error",
+                error_message=type(error).__name__,
+            )
+            logger.error(
+                "Quotation document dispatch failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            return {"outcome": "failed", "error": "document_dispatch_error"}
+        # WhatsApp accepted it; only our record failed. Record the wamid on the ledger.
+        saas_quotations.finish_delivery(
+            settings,
+            tenant_id,
+            delivery_id,
+            status="sent",
+            media_id=media_id,
+            provider_message_id=wamid,
+        )
+        return {"outcome": "sent", "wamid": wamid, "media_id": media_id, "recorded": False}
     if outcome.kind == "suppressed":
         saas_quotations.finish_delivery(
             settings,
@@ -502,12 +602,14 @@ def _deliver_quotation_pdf(
         )
     except Exception as error:  # noqa: BLE001 - the document already reached Meta
         logger.error(
-            "Quotation delivery persistence failed tenant=%s wamid=%s error=%s",
+            "UNRECORDED OUTBOUND: quotation document delivery persistence failed "
+            "tenant=%s delivery=%s wamid=%s error=%s",
             tenant_id,
+            delivery_id,
             wamid,
             type(error).__name__,
         )
-    if conversation:
+    if conversation and document_row is None:
         try:
             customer_service.save_message(
                 settings,
@@ -515,17 +617,18 @@ def _deliver_quotation_pdf(
                 channel_id,
                 str(conversation["id"]),
                 direction="outbound",
-                sender_type="assistant",
+                sender_type=sender_type,
                 provider_message_id=wamid,
                 message_type="document",
                 body_text=filename,
-                payload={"document": {"filename": filename, "media_id": media_id}},
+                payload=document_payload,
                 delivery_status="sent",
             )
         except Exception as error:  # noqa: BLE001 - the document already reached Meta
             logger.error(
-                "Quotation document history failed tenant=%s error=%s",
+                "Quotation document history failed tenant=%s wamid=%s error=%s",
                 tenant_id,
+                wamid,
                 type(error).__name__,
             )
     return {"outcome": "sent", "wamid": wamid, "media_id": media_id}
@@ -542,6 +645,647 @@ def whatsapp_verify():
         return "Forbidden", 403
     challenge = request.args.get("hub.challenge")
     return challenge if challenge else ("Bad Request", 400)
+
+
+def _touch_conversation(settings, tenant_id: str, conversation: dict | None) -> None:
+    if not conversation:
+        return
+    try:
+        customer_service.update_conversation_activity(
+            settings, tenant_id, str(conversation["id"])
+        )
+    except Exception as error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Conversation activity refresh failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
+
+def _automation_state(settings, tenant_id: str, conversation: dict | None):
+    """``(ai_mode, needs_attention)`` for the gate; ``("unavailable", False)`` on error.
+
+    No conversation row (persistence failed) keeps the pre-existing behaviour: the
+    dispatch boundary has nothing to lock either, so ``("ai_active", False)``.
+    """
+    if not conversation:
+        return "ai_active", False
+    try:
+        state = conversation_control.get_state(settings, tenant_id, str(conversation["id"]))
+    except Exception as error:  # noqa: BLE001 - fail closed below
+        logger.error(
+            "Conversation state read failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+        return "unavailable", False
+    return state if state is not None else ("unavailable", False)
+
+
+def _skip_automation(
+    settings,
+    *,
+    tenant_id: str,
+    conversation: dict | None,
+    message_id: str,
+    mode: str,
+    human_asked: bool,
+):
+    """AI is not active here: no model call, no tools, no menu, no automated reply.
+
+    The inbound message is already stored. A fresh request for a person still raises
+    the orange alert so staff notice it; nothing is sent to the customer.
+    """
+    if conversation and human_asked:
+        try:
+            conversation_control.request_human(
+                settings,
+                tenant_id=tenant_id,
+                conversation_id=str(conversation["id"]),
+                source="customer_message",
+            )
+        except Exception as error:  # noqa: BLE001 - the skip itself must still happen
+            logger.error(
+                "Human request flag failed tenant=%s error=%s", tenant_id, type(error).__name__
+            )
+    if conversation and mode != "unavailable":
+        try:
+            conversation_control.record_generation_skipped(
+                settings,
+                tenant_id=tenant_id,
+                conversation_id=str(conversation["id"]),
+                mode=mode,
+                message_id=message_id,
+            )
+        except Exception as error:  # noqa: BLE001 - audit gap is logged, not fatal
+            logger.error(
+                "Suppression audit failed tenant=%s error=%s", tenant_id, type(error).__name__
+            )
+    whatsapp_service.update_event(
+        settings,
+        tenant_id,
+        message_id,
+        "failed",
+        "ai_reply_suppressed" if mode != "unavailable" else "ai_state_unavailable",
+    )
+    return jsonify(ok=True, suppressed=True, stage="before_generation")
+
+
+def _handle_human_request(
+    settings,
+    *,
+    tenant_id: str,
+    channel: dict,
+    channel_id: str,
+    phone_number_id: str,
+    conversation: dict,
+    customer: dict | None,
+    customer_key: str,
+    message_id: str,
+    source: str = "customer_message",
+    requested_product: str | None = None,
+    acknowledgement: str | None = None,
+    ack_kind: str = "human_request_ack",
+):
+    """The customer asked for a person while AI was active.
+
+    Also used for discount / special-pricing requests (``source="discount_request"``):
+    those are human-handled too, so the AI is paused for this conversation exactly the
+    same way and staff take over the negotiation.
+
+    Order matters: pause + orange alert FIRST (under the dispatch lock), so no AI
+    reply already in flight for this customer can start sending afterwards. Then the
+    durable handover record and staff notification, then one platform-worded
+    acknowledgement sent as a ``notice`` (the only automated send allowed while paused).
+    """
+    conversation_id = str(conversation["id"])
+    try:
+        conversation_control.request_human(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            source=source,
+        )
+    except Exception as error:  # noqa: BLE001 - the dispatch recheck still guards sends
+        logger.error(
+            "Human request flag failed tenant=%s error=%s", tenant_id, type(error).__name__
+        )
+    try:
+        document = menu_service.load_document(settings, tenant_id) or {}
+        handover_service.request_staff_assistance(
+            settings,
+            tenant_id=tenant_id,
+            channel=channel,
+            phone_number_id=phone_number_id,
+            customer_key=customer_key,
+            customer=customer,
+            conversation=conversation,
+            message_id=message_id,
+            settings_document=document,
+            business_name=str(document.get("business_name") or "our team"),
+            source=source,
+            requested_product=requested_product,
+        )
+    except Exception as error:  # noqa: BLE001 - the inbox alert is already raised
+        logger.error(
+            "Staff notification for human request failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+    text = acknowledgement or human_request_service.ACKNOWLEDGEMENT
+    try:
+        outbox_row = customer_service.save_message(
+            settings,
+            tenant_id,
+            channel_id,
+            conversation_id,
+            direction="outbound",
+            sender_type="system",
+            message_type="text",
+            body_text=text,
+            payload={"text": text, "kind": ack_kind},
+            reply_to_provider_message_id=message_id,
+        )
+    except customer_service.DuplicateReplyError:
+        existing = customer_service.find_outbound_reply(
+            settings, tenant_id, channel_id, message_id
+        )
+        already_sent = (existing or {}).get("provider_message_id")
+        if already_sent:
+            whatsapp_service.update_event(
+                settings, tenant_id, message_id, "processed",
+                response_message_id=str(already_sent),
+            )
+            return jsonify(ok=True, human_requested=True, duplicate_reply=True)
+        whatsapp_service.update_event(
+            settings, tenant_id, message_id, "failed", "ambiguous_send"
+        )
+        return jsonify(ok=True, human_requested=True, ambiguous=True)
+    except Exception as error:  # noqa: BLE001 - still acknowledge, as the AI path does
+        # The intent row could not be written. Duplicate sends stay impossible (the
+        # inbound id is already claimed, so a redelivery is dropped), and the send below
+        # is still gated and locked. The row is written after the send instead.
+        logger.error(
+            "Human-request acknowledgement intent not recorded tenant=%s message_id=%s "
+            "error=%s",
+            tenant_id,
+            message_id,
+            type(error).__name__,
+        )
+        outbox_row = None
+    _touch_conversation(settings, tenant_id, conversation)
+    try:
+        outcome = outbound_dispatch.dispatch_reply(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            message_row_id=str(outbox_row["id"]) if (outbox_row or {}).get("id") else None,
+            sender_type="system",
+            notice=True,
+            send=lambda: whatsapp_service.send_text(
+                settings,
+                phone_number_id=phone_number_id,
+                tenant_id=tenant_id,
+                credentials_ref=channel.get("credentials_ref"),
+                recipient=customer_key,
+                text=text,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001
+        wamid = getattr(error, "sent_wamid", None)
+        if not wamid:
+            raise
+        # Sent, but the row could not be finalised (already logged by the boundary).
+        # Keep the wamid on the event for reconciliation; a redelivery is dropped by
+        # the claim, so this can never produce a second acknowledgement.
+        whatsapp_service.update_event(
+            settings, tenant_id, message_id, "failed", "ack_sent_unrecorded",
+            response_message_id=wamid,
+        )
+        return jsonify(ok=True, human_requested=True, delivery="sent", recorded=False)
+    if outcome.kind == "sent":
+        recorded = outbox_row is not None
+        if not recorded:
+            # Post-send persistence, exactly like the AI path's pre-0035 fallback.
+            try:
+                customer_service.save_message(
+                    settings,
+                    tenant_id,
+                    channel_id,
+                    conversation_id,
+                    direction="outbound",
+                    sender_type="system",
+                    provider_message_id=outcome.wamid,
+                    message_type="text",
+                    body_text=text,
+                    payload={"text": text, "kind": ack_kind},
+                    delivery_status="sent",
+                )
+                recorded = True
+            except Exception as error:  # noqa: BLE001 - reported below, never hidden
+                logger.error(
+                    "UNRECORDED OUTBOUND: human-request acknowledgement was sent but its "
+                    "message row could not be saved tenant=%s inbound=%s wamid=%s error=%s",
+                    tenant_id,
+                    message_id,
+                    outcome.wamid,
+                    type(error).__name__,
+                )
+        # The wamid is kept on the webhook event either way: that is the reconciliation
+        # key for an acknowledgement whose message row is missing.
+        whatsapp_service.update_event(
+            settings,
+            tenant_id,
+            message_id,
+            "processed",
+            None if recorded else "ack_sent_unrecorded",
+            response_message_id=outcome.wamid,
+        )
+        return jsonify(ok=True, human_requested=True, delivery="sent", recorded=recorded)
+    whatsapp_service.update_event(
+        settings,
+        tenant_id,
+        message_id,
+        "failed",
+        "ambiguous_send" if outcome.kind == "unknown" else (outcome.error_code or "send_failed"),
+    )
+    return jsonify(
+        ok=True,
+        human_requested=True,
+        delivery="uncertain" if outcome.kind == "unknown" else "failed",
+    )
+
+
+DISCOUNT_ACKNOWLEDGEMENT = (
+    "Thanks for asking. Pricing changes are handled by our team, so I've passed your "
+    "request to them. A member of our team will reply here as soon as they can."
+)
+DELIVERY_LOCATION_QUESTION = (
+    "Delivery charges are calculated separately based on the delivery location. Where "
+    "would you like your order delivered? Please send the area or estate name."
+)
+STAFF_HANDOVER_FAILED_TEXT = (
+    "Sorry, I couldn't pass your request to our team automatically. Please reply "
+    "\"talk to a person\" and a member of our team will take over."
+)
+_LOCATION_RE = re.compile(
+    r"\b(?:to|in|at|around|near)\s+([A-Za-z][A-Za-z'\- ]{1,40}?)"
+    r"\s*(?=[?.!,]|$|\s+(?:please|pls|today|tomorrow|area|estate)\b)",
+    re.I,
+)
+_NOT_A_PLACE = re.compile(r"^(?:my|our|your|me|us|the|a|an|this|that|there|here|you)\b", re.I)
+
+
+def _delivery_location(text: str) -> str | None:
+    match = _LOCATION_RE.search(text or "")
+    if not match:
+        return None
+    place = match.group(1).strip(" '-")
+    if not place or _NOT_A_PLACE.match(place):
+        return None
+    return place[:80]
+
+
+def _send_platform_text(
+    settings,
+    *,
+    tenant_id: str,
+    channel: dict,
+    channel_id: str,
+    phone_number_id: str,
+    conversation: dict,
+    customer_key: str,
+    message_id: str,
+    text: str,
+    kind: str,
+) -> dict:
+    """Send one platform-worded reply to this inbound message (intent row first).
+
+    Same guarantees as the AI path: the reply row is unique per inbound message, the
+    send runs inside the dispatch boundary (Stage 2 pause recheck), and a reply whose
+    outcome is unknown is never resent. Returns ``{"state", "wamid"}``.
+    """
+    conversation_id = str(conversation["id"])
+    payload = {"text": text, "kind": kind}
+    try:
+        outbox_row = customer_service.save_message(
+            settings,
+            tenant_id,
+            channel_id,
+            conversation_id,
+            direction="outbound",
+            sender_type="assistant",
+            message_type="text",
+            body_text=text,
+            payload=payload,
+            reply_to_provider_message_id=message_id,
+        )
+    except customer_service.DuplicateReplyError:
+        existing = customer_service.find_outbound_reply(
+            settings, tenant_id, channel_id, message_id
+        )
+        already = (existing or {}).get("provider_message_id")
+        return {"state": "duplicate" if already else "ambiguous", "wamid": already}
+    except Exception as error:  # noqa: BLE001 - recorded after the send instead
+        logger.error(
+            "Platform reply intent not recorded tenant=%s message_id=%s error=%s",
+            tenant_id,
+            message_id,
+            type(error).__name__,
+        )
+        outbox_row = None
+    try:
+        outcome = outbound_dispatch.dispatch_reply(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            message_row_id=str(outbox_row["id"]) if (outbox_row or {}).get("id") else None,
+            sender_type="assistant",
+            send=lambda: whatsapp_service.send_text(
+                settings,
+                phone_number_id=phone_number_id,
+                tenant_id=tenant_id,
+                credentials_ref=channel.get("credentials_ref"),
+                recipient=customer_key,
+                text=text,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001
+        wamid = getattr(error, "sent_wamid", None)
+        if not wamid:
+            logger.error(
+                "Platform reply dispatch failed tenant=%s error=%s",
+                tenant_id,
+                type(error).__name__,
+            )
+            return {"state": "failed", "wamid": None, "error_code": "dispatch_error"}
+        return {"state": "sent_unrecorded", "wamid": wamid}
+    if outcome.kind == "sent" and outbox_row is None:
+        try:
+            customer_service.save_message(
+                settings,
+                tenant_id,
+                channel_id,
+                conversation_id,
+                direction="outbound",
+                sender_type="assistant",
+                provider_message_id=outcome.wamid,
+                message_type="text",
+                body_text=text,
+                payload=payload,
+                delivery_status="sent",
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "UNRECORDED OUTBOUND: platform reply was sent but its message row could "
+                "not be saved tenant=%s inbound=%s wamid=%s error=%s",
+                tenant_id,
+                message_id,
+                outcome.wamid,
+                type(error).__name__,
+            )
+            return {"state": "sent_unrecorded", "wamid": outcome.wamid}
+    return {
+        "state": outcome.kind,
+        "wamid": outcome.wamid,
+        "error_code": outcome.error_code,
+    }
+
+
+def _record_platform_turn(
+    settings, *, tenant_id: str, customer_key: str, message_id: str, customer_text: str,
+    reply_text: str, sent: dict,
+) -> None:
+    """Keep the AI's short history in step, and close the webhook event truthfully."""
+    try:
+        history = whatsapp_service.conversation_history(settings, tenant_id, customer_key)
+        history.extend(
+            [
+                {"role": "user", "text": customer_text[:1000]},
+                {"role": "assistant", "text": reply_text[:1000]},
+            ]
+        )
+        whatsapp_service.save_conversation(settings, tenant_id, customer_key, history)
+    except Exception as error:  # noqa: BLE001 - history is context only
+        logger.error(
+            "Conversation history save failed tenant=%s error=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+    state = sent.get("state")
+    if state in ("sent", "duplicate"):
+        whatsapp_service.update_event(
+            settings, tenant_id, message_id, "processed",
+            response_message_id=sent.get("wamid"),
+        )
+    elif state == "sent_unrecorded":
+        whatsapp_service.update_event(
+            settings, tenant_id, message_id, "failed", "reply_sent_unrecorded",
+            response_message_id=sent.get("wamid"),
+        )
+    elif state == "suppressed":
+        whatsapp_service.update_event(
+            settings, tenant_id, message_id, "failed", "ai_reply_suppressed"
+        )
+    else:
+        whatsapp_service.update_event(
+            settings,
+            tenant_id,
+            message_id,
+            "failed",
+            "ambiguous_send"
+            if state in ("unknown", "ambiguous")
+            else str(sent.get("error_code") or "send_failed")[:40],
+        )
+
+
+def _staff_handover(
+    settings, *, tenant_id: str, channel: dict, phone_number_id: str, customer_key: str,
+    customer: dict | None, conversation: dict, message_id: str, source: str,
+    request: str, reason: str, details: dict,
+) -> bool:
+    """A product handover (quotation or delivery). The AI is NOT paused for these."""
+    try:
+        document = menu_service.load_document(settings, tenant_id) or {}
+        handover_service.request_staff_assistance(
+            settings,
+            tenant_id=tenant_id,
+            channel=channel,
+            phone_number_id=phone_number_id,
+            customer_key=customer_key,
+            customer=customer,
+            conversation=conversation,
+            message_id=message_id,
+            settings_document=document,
+            business_name=str(document.get("business_name") or "our team"),
+            source=source,
+            requested_product=request[:200],
+            reason=reason,
+            details=details,
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - reply honestly instead
+        logger.error(
+            "Staff handover failed tenant=%s source=%s error=%s",
+            tenant_id,
+            source,
+            type(error).__name__,
+        )
+        return False
+
+
+def _quotation_or_delivery_turn(
+    settings,
+    *,
+    tenant_id: str,
+    channel: dict,
+    channel_id: str,
+    phone_number_id: str,
+    conversation: dict,
+    customer: dict | None,
+    customer_key: str,
+    message_id: str,
+    text: str,
+    profile_name: str | None,
+):
+    """Stage 3: explicit quotation requests and delivery enquiries, handled
+    deterministically for tenants that enabled quotations. None = let the AI answer.
+
+    Ordinary price questions ("how much is a 1kg cake?") are NOT handled here: they
+    reach the AI, which answers from the catalogue and never creates a quotation.
+    """
+    conversation_id = str(conversation["id"])
+    # Decide cheaply whether this message can belong here at all, so an ordinary
+    # message never reads the tenant settings (it goes straight to the AI).
+    brief = quotation_flow.has_active_request(settings, tenant_id, conversation_id)
+    quote_turn = quotation_flow.applies(text, brief)
+    delivery_enquiry = quotation_intent.is_delivery_enquiry(text)
+    awaiting_location = False
+    if not quote_turn and not delivery_enquiry:
+        if quotation_intent.classify(text) is not None or len(text) > 120:
+            return None
+        try:
+            history = whatsapp_service.conversation_history(settings, tenant_id, customer_key)
+        except Exception:  # noqa: BLE001
+            history = []
+        last = next(
+            (item for item in reversed(history or [])
+             if isinstance(item, dict) and item.get("role") == "assistant"),
+            None,
+        )
+        awaiting_location = bool(last) and str(last.get("text") or "").strip() == (
+            DELIVERY_LOCATION_QUESTION
+        )
+        if not awaiting_location:
+            return None
+    try:
+        document = menu_service.load_document(settings, tenant_id) or {}
+    except Exception as error:  # noqa: BLE001 - fall through to the AI path
+        logger.error(
+            "Quotation settings read failed tenant=%s error=%s", tenant_id, type(error).__name__
+        )
+        return None
+    configuration = document.get("configuration") or {}
+    if not saas_quotations.quotations_enabled(configuration):
+        return None
+    common = dict(
+        tenant_id=tenant_id, channel=channel, channel_id=channel_id,
+        phone_number_id=phone_number_id, conversation=conversation,
+        customer_key=customer_key, message_id=message_id,
+    )
+
+    if quote_turn:
+        step = quotation_flow.run(
+            settings,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            customer_key=customer_key,
+            customer_name=(customer or {}).get("name") or profile_name,
+            message_id=message_id,
+            text=text,
+            provider=context().bot_provider,
+            brief=brief,
+        )
+        if step is not None:
+            reply = step.text
+            if step.kind == "staff":
+                if not _staff_handover(
+                    settings, tenant_id=tenant_id, channel=channel,
+                    phone_number_id=phone_number_id, customer_key=customer_key,
+                    customer=customer, conversation=conversation, message_id=message_id,
+                    source="quotation_flow", request=step.request or text[:150],
+                    reason=step.reason or "custom_order", details=step.details,
+                ):
+                    reply = STAFF_HANDOVER_FAILED_TEXT
+            sent = _send_platform_text(settings, text=reply, kind=f"quotation_{step.kind}",
+                                       **common)
+            delivery = None
+            if step.kind == "quotation" and step.quotation:
+                try:
+                    delivery = _deliver_quotation_pdf(
+                        settings,
+                        tenant_id=tenant_id,
+                        channel=channel,
+                        channel_id=channel_id,
+                        conversation=conversation,
+                        customer_key=customer_key,
+                        quotation=step.quotation,
+                        inbound_message_id=message_id,
+                        pdf=step.pdf,
+                        caption=f"Quotation {step.quotation.get('quotation_number')}",
+                        phone_number_id=phone_number_id,
+                    )
+                except Exception as error:  # noqa: BLE001 - recorded on the ledger
+                    logger.error(
+                        "Quotation document delivery failed tenant=%s error=%s",
+                        tenant_id,
+                        type(error).__name__,
+                    )
+                    delivery = {"outcome": "failed"}
+            _record_platform_turn(
+                settings, tenant_id=tenant_id, customer_key=customer_key,
+                message_id=message_id, customer_text=text, reply_text=reply, sent=sent,
+            )
+            return jsonify(
+                ok=True,
+                quotation_step=step.kind,
+                quotation_number=(step.quotation or {}).get("quotation_number"),
+                reply=sent.get("state"),
+                document=(delivery or {}).get("outcome"),
+            )
+
+    if configuration.get("delivery_available") is False:
+        return None
+    if not delivery_enquiry and not awaiting_location:
+        return None
+    location = (
+        text.strip().strip(".!?")[:80] if awaiting_location else _delivery_location(text)
+    )
+    if not location:
+        reply = DELIVERY_LOCATION_QUESTION
+        kind = "delivery_question"
+    else:
+        handed = _staff_handover(
+            settings, tenant_id=tenant_id, channel=channel, phone_number_id=phone_number_id,
+            customer_key=customer_key, customer=customer, conversation=conversation,
+            message_id=message_id, source="delivery_enquiry",
+            request=f"Delivery charge to {location}", reason="custom_order",
+            details={"location": location},
+        )
+        reply = (
+            "Thanks. Delivery charges are calculated separately based on the delivery "
+            f"location. I've passed \"{location}\" to our team and they will confirm the "
+            "delivery charge with you here."
+            if handed
+            else STAFF_HANDOVER_FAILED_TEXT
+        )
+        kind = "delivery_handover"
+    sent = _send_platform_text(settings, text=reply, kind=kind, **common)
+    _record_platform_turn(
+        settings, tenant_id=tenant_id, customer_key=customer_key, message_id=message_id,
+        customer_text=text, reply_text=reply, sent=sent,
+    )
+    return jsonify(ok=True, delivery_step=kind, reply=sent.get("state"))
 
 
 @whatsapp_bp.post("/webhooks/whatsapp")
@@ -625,6 +1369,19 @@ def whatsapp_webhook():
                 type(error).__name__,
             )
 
+        _touch_conversation(settings, tenant_id, conversation)
+        mode, _attention = _automation_state(settings, tenant_id, conversation)
+        if mode != "ai_active":
+            return _skip_automation(
+                settings,
+                tenant_id=tenant_id,
+                conversation=conversation,
+                message_id=event["message_id"],
+                mode=mode,
+                human_asked=bool(
+                    parsed.selection is not None and parsed.selection.step == "staff"
+                ),
+            )
         ctx = menu_service.MenuContext(
             settings=settings,
             tenant_id=tenant_id,
@@ -723,6 +1480,55 @@ def whatsapp_webhook():
             "Customer/conversation/inbound persistence failed tenant=%s error=%s",
             tenant_id,
             type(error).__name__,
+        )
+    _touch_conversation(settings, tenant_id, conversation)
+
+    # --- per-conversation AI control, decided BEFORE any automated work ---------
+    # Paused / human-handled conversations get no model call, no tools, no menu and
+    # no automated reply. The dispatch boundary rechecks the mode under the row lock
+    # immediately before any send, which covers turns already in flight.
+    human_asked = human_request_service.is_human_request(event["text"])
+    mode, _attention = _automation_state(settings, tenant_id, conversation)
+    if mode != "ai_active":
+        return _skip_automation(
+            settings,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            message_id=event["message_id"],
+            mode=mode,
+            human_asked=human_asked,
+        )
+    if human_asked and conversation:
+        return _handle_human_request(
+            settings,
+            tenant_id=tenant_id,
+            channel=channel,
+            channel_id=channel_id,
+            phone_number_id=event["phone_number_id"],
+            conversation=conversation,
+            customer=customer,
+            customer_key=customer_key,
+            message_id=event["message_id"],
+        )
+    # Discounts, special pricing and price negotiation are human decisions (approved
+    # Stage 3 decision Q2): pause the AI for this conversation and hand over to staff.
+    if conversation and quotation_intent.is_discount_request(event["text"]):
+        return _handle_human_request(
+            settings,
+            tenant_id=tenant_id,
+            channel=channel,
+            channel_id=channel_id,
+            phone_number_id=event["phone_number_id"],
+            conversation=conversation,
+            customer=customer,
+            customer_key=customer_key,
+            message_id=event["message_id"],
+            source="discount_request",
+            requested_product=(
+                "Discount or special pricing requested: " + event["text"][:150]
+            ),
+            acknowledgement=DISCOUNT_ACKNOWLEDGEMENT,
+            ack_kind="discount_request_ack",
         )
 
     # Explicit menu commands: "menu", "order <number>", a legacy option name, or a
@@ -826,6 +1632,7 @@ def whatsapp_webhook():
                     customer_key=customer_key,
                     quotation=quotation,
                     inbound_message_id=event["message_id"],
+                    phone_number_id=event["phone_number_id"],
                 )
                 if delivery["outcome"] in {"sent", "already"}:
                     whatsapp_service.update_event(
@@ -850,6 +1657,25 @@ def whatsapp_webhook():
                     quotation_pdf=True,
                     delivery=delivery["outcome"],
                 )
+
+    # Deterministic quotation workflow and delivery enquiries (Stage 3). Each returns a
+    # response when it handled the message, or None to let the AI answer it.
+    if conversation:
+        handled = _quotation_or_delivery_turn(
+            settings,
+            tenant_id=tenant_id,
+            channel=channel,
+            channel_id=channel_id,
+            phone_number_id=event["phone_number_id"],
+            conversation=conversation,
+            customer=customer,
+            customer_key=customer_key,
+            message_id=event["message_id"],
+            text=event["text"],
+            profile_name=event.get("profile_name"),
+        )
+        if handled is not None:
+            return handled
 
     try:
         history = whatsapp_service.conversation_history(
@@ -891,6 +1717,7 @@ def whatsapp_webhook():
             send_enabled=settings.whatsapp_send_enabled,
             brief=brief,
         )
+        handover_outcome: dict = {}
         # A turn that needs a human handover is answered with wording the platform owns,
         # chosen from whether the staff notification actually succeeded. Handover trouble
         # must never silence the bot, so it falls back to the honest apology instead.
@@ -907,6 +1734,7 @@ def whatsapp_webhook():
                 customer_message=event["text"],
                 bot_response=response,
                 history=history,
+                outcome=handover_outcome,
             )
         except Exception as error:  # noqa: BLE001 - never silence the bot
             logger.error(
@@ -929,6 +1757,16 @@ def whatsapp_webhook():
             reply_text = QUOTATION_FAILED_TEXT
         else:
             reply_text = response.text
+        blocked = getattr(response, "output_blocked", None)
+        if isinstance(blocked, str) and blocked and not handover_reply:
+            # The engine already replaced the unsafe text with the platform fallback.
+            logger.warning(
+                "AI OUTPUT BLOCKED tenant=%s conversation=%s inbound=%s reason=%s",
+                tenant_id,
+                (conversation or {}).get("id"),
+                event["message_id"],
+                blocked,
+            )
 
         # Record the intent to reply BEFORE sending. The partial unique index on
         # (tenant_id, channel_id, reply_to_provider_message_id) is what makes a second
@@ -996,12 +1834,35 @@ def whatsapp_webhook():
                     tenant_id,
                     type(error).__name__,
                 )
+        # The model recorded the customer's own request for a person: stop AI for
+        # this conversation now, then send the platform-worded confirmation as the
+        # one notice allowed after the pause.
+        human_notice = bool(
+            handover_reply
+            and conversation
+            and handover_outcome.get("reason") == "customer_request"
+        )
+        if human_notice:
+            try:
+                conversation_control.request_human(
+                    settings,
+                    tenant_id=tenant_id,
+                    conversation_id=str(conversation["id"]),
+                    source="ai_handover_tool",
+                )
+            except Exception as error:  # noqa: BLE001 - reply still goes out
+                logger.error(
+                    "Human request flag failed tenant=%s error=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
         outcome = outbound_dispatch.dispatch_reply(
             settings,
             tenant_id=tenant_id,
             conversation_id=str(conversation["id"]) if conversation else None,
             message_row_id=str(outbox_row["id"]) if outbox_row else None,
             sender_type="assistant",
+            notice=human_notice,
             send=lambda: whatsapp_service.send_text(
                 settings,
                 phone_number_id=event["phone_number_id"],
@@ -1067,6 +1928,7 @@ def whatsapp_webhook():
                     customer_key=customer_key,
                     quotation=response.quotation_pdf,
                     inbound_message_id=event["message_id"],
+                    phone_number_id=event["phone_number_id"],
                 )
             except Exception as error:  # noqa: BLE001 - the text reply already went out
                 logger.error(
@@ -1993,15 +2855,19 @@ def quotation_detail(tenant_id, quotation_id):
 @admin_required
 def quotation_download(tenant_id, quotation_id):
     tenant = _tenant(tenant_id)
-    quotation = quotation_service.get_quotation(
+    # The stored, immutable document (0044); rendered and stored on first access for
+    # quotations issued before it existed.
+    quotation, pdf = quotation_service.document_for(
         context().settings, tenant["id"], quotation_id
     )
-    return send_file(
-        io.BytesIO(quotation_service.quotation_pdf(quotation)),
+    response = send_file(
+        io.BytesIO(pdf),
         mimetype="application/pdf",
         as_attachment=True,
         download_name=f"{quotation['quotation_number']}.pdf",
     )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 # ----------------------------------------------------------------- whatsapp

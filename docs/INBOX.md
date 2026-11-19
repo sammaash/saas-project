@@ -17,6 +17,53 @@ no demo fixtures are used anywhere.
 - Customer profile drawer and lead-qualification presentation card.
 - Authorization: `member_required` per request; cross-tenant conversation ids → 404.
 
+## Portal redesign Stage 2 (2026-11-19): retrieval, handover, pre-generation gate
+
+No schema change: everything uses migration 0039 (`ai_mode`, `needs_attention`,
+`conversation_control_events`).
+
+**Conversation states** (`conversation_control.indicator`):
+
+| Colour | Meaning | Stored as |
+|---|---|---|
+| Green | AI active | `ai_mode = ai_active`, no alert |
+| Orange | Customer asked for a person | `needs_attention = true` (normally with `ai_mode = paused`) |
+| Red | A person is handling it | `ai_mode in (paused, human)`, no alert |
+
+**Transitions:**
+- Customer asks for a person (deterministic phrase check before any model call, the menu's
+  "Talk to staff", or the model's `request_staff_handover` with reason `customer_request`):
+  `request_human` takes the conversation row lock, sets `ai_active -> paused` and raises the
+  alert (system events `ai_paused`, `needs_attention_set`). A durable `handover_requests` row is
+  created and staff are notified. The customer gets one platform-worded acknowledgement, sent
+  through `dispatch_reply(notice=True)`: the only automated send allowed while paused.
+- Staff reply: `human`, alert cleared (`needs_attention_cleared`, source `staff_reply`). It never
+  re-enables AI.
+- Take over: `human`, alert cleared.
+- Resume AI: `ai_active`, alert cleared. The form must carry `confirm=yes`; the UI shows a
+  confirmation step first.
+- Product handovers (unlisted product, custom order) do NOT pause AI.
+
+**Pre-generation gate (webhook):** after the inbound message is stored and the conversation
+touched, the webhook reads `(ai_mode, needs_attention)`. If the mode is not `ai_active`:
+- no menu, no quotation PDF, no model call, no tools, no reply;
+- a system `ai_reply_suppressed` event is recorded (metadata `stage = before_generation`);
+- the webhook event is marked `failed / ai_reply_suppressed`.
+
+A state read error fails closed (`ai_state_unavailable`). The lock-and-recheck in
+`outbound_dispatch` stays as the second guard for turns already in flight when staff take over.
+Retries and redeliveries are covered by the existing claim table and the unique reply-to index.
+
+**Retrieval:** the inbox shows the newest 50 messages (`customers.latest_messages`, read
+backwards on the existing index, displayed oldest first). "Load earlier messages" uses a keyset
+cursor (`received_at|id`). Times are shown in the tenant's timezone. Threads are ordered orange
+first, then by latest activity, and can be filtered by colour (`view=attention|human|ai`).
+
+**Refresh:** `static/inbox.js` polls `GET /t/<tenant>/inbox/updates` every 10 s while the tab is
+visible. The endpoint is member-only and returns only a change marker, never message content.
+The page reloads on change unless a reply is being typed or the Resume confirmation is open; in
+those cases it shows a "New activity" link instead.
+
 ## Implemented in Phase 2 (local; migration 0039 not yet applied)
 
 - **Persistent AI control** — `conversations.ai_mode` (`ai_active`/`paused`/`human`) and

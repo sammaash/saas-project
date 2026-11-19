@@ -110,6 +110,22 @@ def _first_provider_error(errors: Any) -> tuple[str | None, str | None]:
 
 
 
+def _profile_name(contacts: Any, sender: str) -> str | None:
+    """The sender's WhatsApp profile name from the webhook ``contacts`` block, if any."""
+    if not isinstance(contacts, list):
+        return None
+    for contact in contacts:
+        if not isinstance(contact, dict) or contact.get("wa_id") not in (None, sender):
+            continue
+        profile = contact.get("profile")
+        name = profile.get("name") if isinstance(profile, dict) else None
+        if isinstance(name, str):
+            cleaned = " ".join(name.split())[:200]
+            if cleaned and "\x00" not in cleaned:
+                return cleaned
+    return None
+
+
 def parse_event(payload: Any) -> dict[str, str] | None:
     """The first actionable inbound message, typed, or None.
 
@@ -158,6 +174,9 @@ def parse_event(payload: Any) -> dict[str, str] | None:
                     "message_id": message_id,
                     "customer_key": sender,
                 }
+                profile_name = _profile_name(value.get("contacts"), sender)
+                if profile_name:
+                    base["profile_name"] = profile_name
                 text = message.get("text")
                 body = text.get("body") if isinstance(text, dict) else None
                 if isinstance(body, str) and body.strip():

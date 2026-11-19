@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import copy
+import dataclasses
 import re
 import time
 import unicodedata
@@ -39,6 +40,7 @@ from saas import quotations as quotation_service
 from saas.tenant_admin import tenant_admin
 
 from ..config import Settings
+from . import conversation_control
 from . import handover as handover_service
 
 logger = logging.getLogger("platform_admin.menu")
@@ -229,6 +231,9 @@ class MenuReply:
     buttons: tuple[dict[str, str], ...] = ()
     button_text: str = "Choose"
     sections: tuple[dict[str, Any], ...] = ()
+    #: Platform-owned acknowledgement of a request for a person: sent even though
+    #: that request has just paused automation (``outbound_dispatch`` ``notice``).
+    notice: bool = False
 
 
 @dataclass(frozen=True)
@@ -1481,10 +1486,24 @@ def _staff(ctx: MenuContext) -> MenuReply:
         return _text(
             "I couldn't arrange staff assistance just now. Please try again shortly."
         )
-    return _buttons(
-        text,
-        [{"id": make_action("main"), "title": "Main menu"}],
-        header="Talk to Staff",
-    )
+    # Stop AI for this customer and raise the orange inbox alert BEFORE the reply is
+    # dispatched; the reply itself goes out as the one permitted notice.
+    try:
+        conversation_control.request_human(
+            ctx.settings,
+            tenant_id=ctx.tenant_id,
+            conversation_id=str(ctx.conversation["id"]),
+            source="whatsapp_menu",
+        )
+    except Exception:  # noqa: BLE001 - the staff record exists; keep answering
+        logger.exception("Menu human-request flag failed for tenant %s", ctx.tenant_id)
+        return _buttons(
+            text,
+            [{"id": make_action("main"), "title": "Main menu"}],
+            header="Talk to Staff",
+        )
+    # Plain text, no "Main menu" button: menu taps are not answered while a person
+    # owns the conversation, so offering one would mislead.
+    return dataclasses.replace(_text(text), notice=True)
 
 

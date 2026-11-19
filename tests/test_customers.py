@@ -21,9 +21,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 try:
-    from .webhook_dispatch_support import fake_dispatch
+    from .webhook_dispatch_support import fake_dispatch, fake_state
 except ImportError:  # discovery inside the tests directory
-    from webhook_dispatch_support import fake_dispatch  # type: ignore[no-redef]
+    from webhook_dispatch_support import fake_dispatch, fake_state  # type: ignore[no-redef]
 
 from platform_admin.app import create_app
 from platform_admin.config import REQUIRED_SCHEMA, Settings
@@ -150,6 +150,7 @@ class RequiredSchemaContractTests(unittest.TestCase):
 
 
 @patch("platform_admin.routes.outbound_dispatch.dispatch_reply", new=fake_dispatch)
+@patch("platform_admin.routes.conversation_control.get_state", new=fake_state)
 class WebhookCustomerPersistenceTests(unittest.TestCase):
     """The webhook resolves/creates customer + conversation and persists messages."""
 
@@ -216,7 +217,9 @@ class WebhookCustomerPersistenceTests(unittest.TestCase):
         self.assertNotIn("delivery_status", outbound.kwargs)
         mark_sent.assert_called_once()
         self.assertEqual(mark_sent.call_args.args[-1], "wamid.reply-1")
-        touch.assert_called_once()
+        # Touched when the inbound arrives (inbox order even while AI is paused) and
+        # again after the reply is sent.
+        self.assertEqual(touch.call_count, 2)
 
     @patch("platform_admin.routes.customer_service.get_or_create_customer")
     @patch("platform_admin.routes.whatsapp_service.update_event")

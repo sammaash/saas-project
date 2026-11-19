@@ -84,6 +84,16 @@ class _InboxTestCase(unittest.TestCase):
         )
         self._no_db.start()
         self.addCleanup(self._no_db.stop)
+        for target, value in (
+            ("platform_admin.routes.tenant_dashboard.customers_service.inbox_signature", "sig0"),
+            (
+                "platform_admin.routes.tenant_dashboard.tenants_service.get_profile",
+                {"tenant": {}, "settings": {"timezone": "Africa/Nairobi"}},
+            ),
+        ):
+            stub = patch(target, return_value=value)
+            stub.start()
+            self.addCleanup(stub.stop)
         self.app = create_app(_settings(), authenticator=_AcceptAll())
         self.client = self.app.test_client()
         with self.client.session_transaction() as session:
@@ -131,8 +141,8 @@ class _InboxTestCase(unittest.TestCase):
             "platform_admin.routes.tenant_dashboard.customers_service.get_customer",
             return_value=customer,
         ), patch(
-            "platform_admin.routes.tenant_dashboard.customers_service.list_messages",
-            return_value=(messages, len(messages)),
+            "platform_admin.routes.tenant_dashboard.customers_service.latest_messages",
+            return_value=(messages, None),
         ):
             return self.client.get(f"/t/{TENANT_A}/inbox/{CONV_A}")
 
@@ -290,8 +300,8 @@ class PrototypeSafetyTests(_InboxTestCase):
             "platform_admin.routes.tenant_dashboard.customers_service.get_customer",
             return_value=None,
         ), patch(
-            "platform_admin.routes.tenant_dashboard.customers_service.list_messages",
-            return_value=([], 0),
+            "platform_admin.routes.tenant_dashboard.customers_service.latest_messages",
+            return_value=([], None),
         ):
             response = client.get(f"/t/{TENANT_A}/inbox/{CONV_A}")
         body = response.get_data(as_text=True)

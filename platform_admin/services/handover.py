@@ -328,6 +328,10 @@ def request_staff_assistance(
     message_id: str,
     settings_document: dict[str, Any],
     business_name: str = "our team",
+    source: str = "whatsapp_menu",
+    requested_product: str | None = None,
+    reason: str = "customer_request",
+    details: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Record and deliver a "Talk to Staff" request from the menu.
 
@@ -338,10 +342,19 @@ def request_staff_assistance(
     record, _created = handover_store.create_request(
         tenant_id,
         wa_id=customer_key,
-        requested_product="Staff assistance requested from the WhatsApp menu",
-        dedupe_key=f"menu:{message_id}",
-        reason="customer_request",
-        details={"source": "whatsapp_menu"},
+        requested_product=requested_product
+        or (
+            "Staff assistance requested from the WhatsApp menu"
+            if source == "whatsapp_menu"
+            else "Customer asked to speak to a person"
+        ),
+        dedupe_key=(
+            f"{'menu' if source == 'whatsapp_menu' else 'human'}:{message_id}"
+            if source in ("whatsapp_menu", "customer_message")
+            else f"{source}:{message_id}"
+        ),
+        reason=reason,
+        details={"source": source, **(details or {})},
         customer_id=str(customer["id"]) if customer and customer.get("id") else None,
         conversation_id=(
             str(conversation["id"]) if conversation and conversation.get("id") else None
@@ -413,6 +426,7 @@ def handle_turn(
     customer_message: str,
     bot_response: Any,
     history: list[dict[str, Any]] | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> str | None:
     """Complete any handover this turn needs and return the customer-facing text.
 
@@ -465,6 +479,8 @@ def handle_turn(
     else:
         return None
 
+    if outcome is not None:
+        outcome["reason"] = str(record.get("reason") or "")
     product = (
         None
         if str(record.get("reason") or "") == "customer_request"

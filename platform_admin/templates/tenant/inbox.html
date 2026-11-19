@@ -3,13 +3,28 @@
 {% block styles %}<link rel="stylesheet" href="{{ url_for('static', filename='inbox.css') }}">{% endblock %}
 {% block content %}
 {% from "_macros.html" import csrf_field %}
+<div id="inbox-root"
+     data-updates-url="{{ url_for('tenant_dashboard.inbox_updates', tenant_id=g.tenant_id, c=selected.id if selected else None) }}"
+     data-signature="{{ signature }}">
 <h1>Inbox</h1>
 <p class="muted">{{ total }} conversation{{ '' if total == 1 else 's' }}</p>
 
+<p class="inbox-legend" aria-label="Conversation colours">
+  <span class="dot dot-green" aria-hidden="true"></span> {{ indicator_labels.green }}
+  <span class="dot dot-orange" aria-hidden="true"></span> {{ indicator_labels.orange }}
+  <span class="dot dot-red" aria-hidden="true"></span> {{ indicator_labels.red }}
+</p>
+
 <form method="get" class="inbox-filters">
   <input type="search" name="q" value="{{ search or '' }}" placeholder="Search name, number or message" aria-label="Search conversations">
+  <select name="view" aria-label="Filter by who is handling">
+    <option value="" {{ 'selected' if not view }}>All conversations</option>
+    <option value="attention" {{ 'selected' if view == 'attention' }}>Asked for a person</option>
+    <option value="human" {{ 'selected' if view == 'human' }}>Human handling</option>
+    <option value="ai" {{ 'selected' if view == 'ai' }}>AI active</option>
+  </select>
   <select name="status" aria-label="Filter by status">
-    <option value="" {{ 'selected' if not status }}>All</option>
+    <option value="" {{ 'selected' if not status }}>Any status</option>
     <option value="open" {{ 'selected' if status == 'open' }}>Open</option>
     <option value="closed" {{ 'selected' if status == 'closed' }}>Closed</option>
     <option value="archived" {{ 'selected' if status == 'archived' }}>Archived</option>
@@ -17,48 +32,76 @@
   <button type="submit">Filter</button>
 </form>
 
+<p class="inbox-refresh" id="inbox-refresh" hidden>
+  New activity. <a href="">Refresh</a>
+</p>
+
 <div class="inbox-shell{% if selected %} has-selection{% endif %}">
   <section class="inbox-list" aria-label="Conversations">
     {% for thread in threads %}
-    <a class="thread{{ ' active' if selected and selected.id == thread.id }}"
-       href="{{ url_for('tenant_dashboard.inbox_conversation', tenant_id=g.tenant_id, conversation_id=thread.id, q=search, status=status) }}">
+    <a class="thread ind-{{ thread.indicator }}{{ ' active' if selected and selected.id == thread.id }}"
+       href="{{ url_for('tenant_dashboard.inbox_conversation', tenant_id=g.tenant_id, conversation_id=thread.id, q=search, status=status, view=view) }}">
       <span class="thread-top">
-        <span class="thread-name">{{ thread.customer_name or thread.wa_id }}</span>
-        <span class="thread-time">{{ thread.preview_at or thread.last_message_at or thread.created_at }}</span>
+        <span class="thread-name">
+          <span class="dot dot-{{ thread.indicator }}" role="img" aria-label="{{ indicator_labels[thread.indicator] }}" title="{{ indicator_labels[thread.indicator] }}"></span>
+          {{ thread.customer_name or thread.wa_id }}
+        </span>
+        <span class="thread-time">{{ fmt_time(thread.preview_at or thread.last_message_at or thread.created_at) }}</span>
       </span>
+      {% if thread.customer_name %}<span class="thread-number">{{ thread.wa_id }}</span>{% endif %}
       <span class="thread-preview">{{ thread.preview_text or 'No messages yet' }}</span>
       <span class="thread-meta">
+        {% if thread.indicator == 'orange' %}<span class="badge ind-badge-orange">Asked for a person</span>{% endif %}
         <span class="badge">{{ thread.status }}</span>
         {% if thread.preview_sender == 'assistant' %}<span class="badge active">AI</span>
         {% elif thread.preview_sender == 'staff' %}<span class="badge">staff</span>
         {% elif thread.preview_sender == 'customer' %}<span class="badge">customer</span>{% endif %}
-        {% if thread.assigned_to %}<span class="badge">assigned</span>{% endif %}
       </span>
     </a>
     {% else %}
     <div class="card">
-      <p class="muted">No conversations{{ ' match this filter' if search or status }} yet.</p>
+      <p class="muted">No conversations{{ ' match this filter' if search or status or view }} yet.</p>
     </div>
     {% endfor %}
+    {% if total > page * page_size or page > 1 %}
+    <nav class="inbox-pager" aria-label="Conversation pages">
+      {% if page > 1 %}<a href="{{ url_for('tenant_dashboard.inbox', tenant_id=g.tenant_id, q=search, status=status, view=view, page=page - 1) }}">&larr; Newer</a>{% endif %}
+      {% if total > page * page_size %}<a href="{{ url_for('tenant_dashboard.inbox', tenant_id=g.tenant_id, q=search, status=status, view=view, page=page + 1) }}">Older &rarr;</a>{% endif %}
+    </nav>
+    {% endif %}
   </section>
 
   <section class="inbox-chat" aria-label="Conversation">
     {% if selected %}
-    <a class="inbox-back" href="{{ url_for('tenant_dashboard.inbox', tenant_id=g.tenant_id, q=search, status=status) }}">&larr; All conversations</a>
-    <div class="chat-header">
+    {% set mode = selected.ai_mode or 'ai_active' %}
+    <a class="inbox-back" href="{{ url_for('tenant_dashboard.inbox', tenant_id=g.tenant_id, q=search, status=status, view=view) }}">&larr; All conversations</a>
+    <div class="chat-header ind-{{ indicator }}">
       <div>
         <strong>{{ customer.name if customer and customer.name else (customer.wa_id if customer else 'Customer') }}</strong>
         <div class="muted">{{ customer.wa_id if customer else '' }}</div>
       </div>
       <div class="chat-flags">
+        <span class="state-pill state-{{ indicator }}">
+          <span class="dot dot-{{ indicator }}" aria-hidden="true"></span>{{ indicator_labels[indicator] }}
+        </span>
         <span class="badge">{{ selected.status }}</span>
-        <span class="badge {{ 'active' if (selected.ai_mode or 'ai_active') == 'ai_active' else 'draft' }}">
-          AI: {{ selected.ai_mode or 'ai_active' }}</span>
-        {% if selected.needs_attention %}<span class="badge draft">needs attention</span>{% endif %}
       </div>
     </div>
 
-    <div class="msg-stream">
+    {% if indicator == 'orange' %}
+    <p class="state-banner state-orange">This customer asked to speak to a person. The AI has stopped replying to them.
+      Reply below (you take over), or resume the AI if it should continue.</p>
+    {% elif indicator == 'red' %}
+    <p class="state-banner state-red">A person is handling this conversation. The AI will not reply to this customer until you resume it.</p>
+    {% endif %}
+
+    <div class="msg-stream" id="msg-stream">
+      {% if older %}
+      <a class="load-earlier" href="{{ url_for('tenant_dashboard.inbox_conversation', tenant_id=g.tenant_id, conversation_id=selected.id, q=search, status=status, view=view, before=older) }}">Load earlier messages</a>
+      {% endif %}
+      {% if before %}
+      <a class="load-earlier" href="{{ url_for('tenant_dashboard.inbox_conversation', tenant_id=g.tenant_id, conversation_id=selected.id, q=search, status=status, view=view) }}">Jump to latest messages</a>
+      {% endif %}
       {% for message in messages %}
       <div class="msg {{ message.direction }} sender-{{ message.sender_type }}">
         <span class="msg-sender">
@@ -70,7 +113,8 @@
         </span>
         <div class="msg-body">{{ message.body_text or '(' ~ (message.message_type or 'non-text') ~ ' message)' }}</div>
         <div class="msg-meta">
-          {{ message.received_at or message.created_at }}
+          {{ fmt_time(message.received_at or message.created_at) }}
+          {%- if message.direction == 'outbound' %}
           {%- if message.provider_message_id %}
             · <span class="msg-state sent">{{ (message.delivery_status or 'sent') }}</span>
           {%- elif message.error_code == 'ai_reply_suppressed' %}
@@ -82,6 +126,7 @@
           {%- else %}
             · <span class="msg-state unknown">Outcome unknown — pending reconciliation</span>
           {%- endif %}
+          {%- endif %}
         </div>
       </div>
       {% else %}
@@ -89,48 +134,15 @@
       {% endfor %}
     </div>
 
-    <div class="conv-controls">
-      <h3>Conversation control</h3>
-      <p class="muted">Current mode:
-        <strong>{{ selected.ai_mode or 'ai_active' }}</strong>
-        {% if selected.needs_attention %}<span class="badge draft">needs attention</span>{% endif %}
-      </p>
-      <div class="conv-buttons">
-        {% if (selected.ai_mode or 'ai_active') != 'paused' %}
-        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
-          {{ csrf_field() }}<input type="hidden" name="mode" value="paused">
-          <button type="submit">Pause AI</button>
-        </form>
-        {% endif %}
-        {% if (selected.ai_mode or 'ai_active') != 'human' %}
-        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
-          {{ csrf_field() }}<input type="hidden" name="mode" value="human">
-          <button type="submit">Take over as human</button>
-        </form>
-        {% endif %}
-        {% if (selected.ai_mode or 'ai_active') != 'ai_active' %}
-        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
-          {{ csrf_field() }}<input type="hidden" name="mode" value="ai_active">
-          <button type="submit">Resume AI</button>
-        </form>
-        {% endif %}
-        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_attention', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
-          {{ csrf_field() }}<input type="hidden" name="value" value="{{ '0' if selected.needs_attention else '1' }}">
-          <button type="submit">{{ 'Unmark' if selected.needs_attention else 'Mark' }} needs attention</button>
-        </form>
-      </div>
-    </div>
-
     <div class="composer">
       {% if sending_enabled %}
       <form method="post" action="{{ url_for('tenant_dashboard.inbox_reply', tenant_id=g.tenant_id, conversation_id=selected.id) }}">
         {{ csrf_field() }}
         <label class="sr-only" for="composer-input">Message</label>
-        <textarea id="composer-input" name="text" maxlength="4096" required placeholder="Reply as staff..."></textarea>
+        <textarea id="composer-input" name="text" maxlength="4096" required placeholder="Reply on WhatsApp as staff..."></textarea>
         <button type="submit">Send</button>
       </form>
-      <p class="muted">Sending a reply takes human ownership of this conversation
-        (AI stays off until you resume it).</p>
+      <p class="muted">Sending a reply takes over this conversation. The AI stays off for this customer until you resume it.</p>
       {% else %}
       <span class="eyebrow">prototype</span>
       <label class="sr-only" for="composer-input">Message</label>
@@ -139,6 +151,39 @@
       <p class="muted">The send path will use the existing gated adapter
         (<code>whatsapp.send_text</code>, hard-disabled while <code>WHATSAPP_SEND_ENABLED=0</code>).
         No message is sent or simulated from this screen.</p>
+      {% endif %}
+    </div>
+
+    <div class="conv-controls">
+      <h3>AI for this customer</h3>
+      <div class="conv-buttons">
+        {% if mode == 'ai_active' %}
+        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
+          {{ csrf_field() }}<input type="hidden" name="mode" value="paused">
+          <button type="submit">Pause AI</button>
+        </form>
+        {% endif %}
+        {% if mode != 'human' or selected.needs_attention %}
+        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
+          {{ csrf_field() }}<input type="hidden" name="mode" value="human">
+          <button type="submit">Take over as human</button>
+        </form>
+        {% endif %}
+        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_attention', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="inline">
+          {{ csrf_field() }}<input type="hidden" name="value" value="{{ '0' if selected.needs_attention else '1' }}">
+          <button type="submit" class="secondary">{{ 'Unmark' if selected.needs_attention else 'Mark' }} needs attention</button>
+        </form>
+      </div>
+      {% if mode != 'ai_active' %}
+      <details class="resume-ai">
+        <summary class="resume-ai-button">Resume AI</summary>
+        <form method="post" action="{{ url_for('tenant_dashboard.inbox_set_mode', tenant_id=g.tenant_id, conversation_id=selected.id) }}" class="resume-confirm">
+          {{ csrf_field() }}<input type="hidden" name="mode" value="ai_active"><input type="hidden" name="confirm" value="yes">
+          <p>Resume the AI for this customer? It will answer their next message automatically.
+            Replying as staff never does this — only this button does.</p>
+          <button type="submit">Yes, resume AI</button>
+        </form>
+      </details>
       {% endif %}
     </div>
 
@@ -152,7 +197,7 @@
             <tr><th>WhatsApp</th><td>{{ customer.wa_id if customer else '—' }}</td></tr>
             <tr><th>Phone</th><td>{{ (customer.phone_normalized or '—') if customer else '—' }}</td></tr>
             <tr><th>Email</th><td>{{ (customer.email or '—') if customer else '—' }}</td></tr>
-            <tr><th>Last interaction</th><td>{{ (customer.last_interaction_at or '—') if customer else '—' }}</td></tr>
+            <tr><th>Last interaction</th><td>{{ fmt_time(customer.last_interaction_at) if customer and customer.last_interaction_at else '—' }}</td></tr>
           </tbody>
         </table>
       </div>
@@ -178,4 +223,6 @@
     {% endif %}
   </section>
 </div>
+</div>
+<script src="{{ url_for('static', filename='inbox.js') }}" defer></script>
 {% endblock %}
