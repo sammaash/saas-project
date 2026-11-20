@@ -599,6 +599,9 @@ class BotResponseEngine:
         # deterministic webhook flow (platform_admin.services.quotation_flow).
         registry = _tools.default_tool_registry(include_quotation_tools=False)
         tenant_id_str = str(context.tenant.get("id"))
+        # Only an identity the caller supplied is a customer identity; the fallbacks below
+        # keep staff/playground drafts working and must never authorise order access.
+        verified_customer_wa_id = str(customer_key).strip() if customer_key else None
         customer_key = customer_key or context.tenant.get("whatsapp_wa_id") or context.tenant.get(
             "id"
         )
@@ -610,6 +613,7 @@ class BotResponseEngine:
             safe_test_mode=safe_test_mode,
             conversation_id=str(conversation_id) if conversation_id else None,
             customer_name=str(customer_name) if customer_name else None,
+            customer_wa_id=verified_customer_wa_id or None,
             quotations_enabled=False,
             send_enabled=bool(send_enabled),
             # Only what a human needs to read a handover: the last few short turns.

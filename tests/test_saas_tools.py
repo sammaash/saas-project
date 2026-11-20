@@ -204,6 +204,11 @@ class _FakeAdmin:
         self.calls.append("get_order_by_number")
         return self.data.get("order")
 
+    def get_order_by_number_for_whatsapp(self, order_number, wa_id):
+        self.calls.append("get_order_by_number_for_whatsapp")
+        owner = self.data.get("order_owner")
+        return None if owner and owner != wa_id else self.data.get("order")
+
     def get_order_payment_status(self, order_id):
         self.calls.append("get_order_payment_status")
         return self.data.get("payment_status", {})
@@ -464,7 +469,8 @@ class GetOrderStatusToolTests(unittest.TestCase):
         with patch("saas.tools.tenant_admin", return_value=fake):
             tool = GetOrderStatusTool()
             result = tool.execute(
-                ToolContext("tenant-a"), {"order_number": "ORD-0001"}
+                ToolContext("tenant-a", customer_wa_id="wa-1"),
+                {"order_number": "ORD-0001"},
             )
         self.assertTrue(result.ok)
         self.assertEqual(result.data["order_number"], "ORD-0001")
