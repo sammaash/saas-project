@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
+
+from . import interpretation, variant_resolver
 
 DISCOUNT = "discount"
 QUOTE = "quote"
@@ -65,18 +66,11 @@ _PRICE_RE = re.compile(
     re.I,
 )
 
-_WEIGHT_RE = re.compile(
-    r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:kg|kgs|kilo|kilos|kilograms?|kilogrammes?)\b", re.I
-)
-_HALF_KG_RE = re.compile(r"\bhalf\s+(?:a\s+)?(?:kg|kilo)\b", re.I)
 _EACH_RE = re.compile(r"\b(?:each|both|all\s+of\s+them|every\s+one)\b", re.I)
 
-_NUMBER_WORDS = {
-    "a": 1, "an": 1, "one": 1, "single": 1, "two": 2, "couple": 2, "pair": 2, "three": 3,
-    "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "dozen": 12, "moja": 1, "mbili": 2, "tatu": 3, "nne": 4,
-    "tano": 5,
-}
+# Shared grammar (S2, D8): sizes in either order and number words live in
+# saas.interpretation; this module keeps its matcher and delegates to it.
+_NUMBER_WORDS = interpretation.NUMBER_WORDS
 _QUANTITY_TOKEN = r"(\d{1,4}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
 _QUANTITY_BEFORE_RE = re.compile(
     r"(?:^|[\s,(])" + _QUANTITY_TOKEN + r"\s+(?:x\s+)?(?:(?:of\s+)?(?:the\s+)?)$", re.I
@@ -175,23 +169,15 @@ def _quantity_value(token: str | None) -> int | None:
 
 
 def _weight_value(text: str) -> tuple[int | None, bool]:
-    """(whole-kilogram weight, unreadable) from the first size mention in ``text``."""
-    if _HALF_KG_RE.search(text):
-        return None, True
-    match = _WEIGHT_RE.search(text)
-    if not match:
-        return None, False
-    try:
-        value = Decimal(match.group(1))
-    except InvalidOperation:
-        return None, True
-    if value != value.to_integral_value() or not 1 <= value <= 1000:
-        return None, True
-    return int(value), False
+    """(whole-kilogram weight, unreadable) from the first size mention in ``text``.
+
+    "2 kg", "two kilos", "kilo 2" (S2, D8); "half a kilo" is unreadable.
+    """
+    return interpretation.size_value(text)
 
 
 def _strip_weights(text: str) -> str:
-    return _WEIGHT_RE.sub(" ", text)
+    return interpretation.strip_sizes(text)
 
 
 def _quantity_near(segment: str, start: int) -> int | None:
@@ -246,6 +232,9 @@ def match_items(text: str, products: Sequence[Mapping[str, Any]]) -> MatchResult
         for position, product in found:
             if len(found) == 1:
                 quantity = _quantity_near(normalized, position)
+                if quantity is None:
+                    # "Change the Vanilla quantity to two" (S2, D8).
+                    quantity = interpretation.correction_quantity(normalized)
             else:
                 # Several products in one clause: only a number written directly before
                 # each name counts ("2 vanilla 1 chocolate").
@@ -269,6 +258,9 @@ def match_items(text: str, products: Sequence[Mapping[str, Any]]) -> MatchResult
                 pieces = _QUANTITY_PIECES_RE.search(_strip_weights(segment))
                 if pieces and result.loose_quantity is None:
                     result.loose_quantity = _quantity_value(pieces.group(1))
+                elif result.loose_quantity is None:
+                    # "Change the quantity to two" / "qty 3" (S2, D8).
+                    result.loose_quantity = interpretation.correction_quantity(segment)
 
     # One product named and a size/quantity given elsewhere in the message
     # ("2 chocolate cakes, 1kg each") belongs to that product.
@@ -324,8 +316,7 @@ def extraction_prompt(products: Sequence[Mapping[str, Any]]) -> str:
     for product in products:
         options = []
         for variant in product.get("variants") or []:
-            attributes = variant.get("attributes") if isinstance(variant, Mapping) else None
-            weight = (attributes or {}).get("weight_kg") if isinstance(attributes, Mapping) else None
+            weight = variant_resolver.size_label(variant_resolver.variant_size_kg(variant))
             options.append(f"{weight}kg" if weight is not None else str(variant.get("name")))
         catalogue.append({"product_name": product.get("name"), "options": options})
     return EXTRACTION_SYSTEM_PROMPT + "CATALOGUE: " + json.dumps(catalogue, ensure_ascii=True)

@@ -174,11 +174,13 @@ class BotResponseEngineTests(unittest.TestCase):
         ):
             self.assertNotIn(omitted, prompt)
 
-    def test_history_is_limited_to_four_recent_trimmed_turns(self):
+    def test_history_is_limited_to_recent_trimmed_turns(self):
+        # Phase 1 S2 (decision DP-4): window 4 -> 12 turns, plus a 6,000-character
+        # total cap. Each turn is still trimmed to 1,000 characters; the oldest go first.
         provider = CapturingProvider()
         history = [
-            ConversationTurn("user" if index % 2 == 0 else "assistant", f"{index}-" + "x" * 1_200)
-            for index in range(6)
+            ConversationTurn("user" if index % 2 == 0 else "assistant", f"{index:02d}-" + "x" * 1_200)
+            for index in range(14)
         ]
         BotResponseEngine(FakeLoader(_context()), provider).respond(
             "tenant-a",
@@ -188,7 +190,9 @@ class BotResponseEngineTests(unittest.TestCase):
             safe_test_mode=True,
         )
         cleaned = provider.requests[0].history
-        self.assertEqual([turn.text[:2] for turn in cleaned], ["2-", "3-", "4-", "5-"])
+        self.assertEqual(
+            [turn.text[:3] for turn in cleaned], ["08-", "09-", "10-", "11-", "12-", "13-"]
+        )
         self.assertTrue(all(len(turn.text) == 1_000 for turn in cleaned))
 
     def test_timing_logs_contain_only_aggregate_metadata(self):

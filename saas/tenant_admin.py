@@ -15,6 +15,7 @@ import contextlib
 from decimal import Decimal
 from typing import Any, Iterator
 
+from . import variant_resolver
 from .tenant_context import tenant_transaction
 
 SETTINGS_JSON_COLUMNS = ("business_rules", "bot_persona", "business_hours", "configuration")
@@ -186,17 +187,9 @@ class TenantAdmin:
         best: dict[str, Any] | None = None
 
         for variant in variants:
-            attributes = variant.get("attributes") or {}
-            variant_weight = attributes.get("weight_kg")
-            if variant_weight is None:
-                # Try parsing weight from the variant name (e.g. "5 kg", "5kg").
-                variant_name = str(variant.get("name", ""))
-                import re as _re
-
-                match = _re.search(r"(\d+)\s*kg\b", variant_name, _re.I)
-                if match:
-                    variant_weight = int(match.group(1))
-            if variant_weight is not None and int(variant_weight) == weight_kg_int:
+            # Shared size reader (S2, D11): attributes.weight_kg, else the size in the
+            # variant name -- the same reader quotation pricing uses.
+            if variant_resolver.matches_weight(variant, weight_kg_int):
                 product = next(
                     (p for p in products if str(p["id"]) == str(variant["product_id"])),
                     None,

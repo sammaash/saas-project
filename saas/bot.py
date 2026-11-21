@@ -20,10 +20,15 @@ from typing import Any, NoReturn, Protocol, Sequence
 from .catalogue import CatalogueService
 from . import output_safety
 from .tenant_admin import tenant_admin
+from . import tool_policy
 from . import tools as _tools
 
-MAX_HISTORY_TURNS = 4
+# Conversation window sent to the model (S2, D7; decision DP-4: shared for all tenants,
+# bounded, token cost monitored). The newest turns are kept; the oldest are dropped
+# first when the total exceeds MAX_HISTORY_CHARS.
+MAX_HISTORY_TURNS = 12
 MAX_HISTORY_TURN_LENGTH = 1_000
+MAX_HISTORY_CHARS = 6_000
 MAX_RESPONSE_LENGTH = 8_000
 _SENSITIVE_KEY_PARTS = (
     "access_key",
@@ -425,6 +430,40 @@ class BotResponseEngine:
         self._provider = provider
 
     @staticmethod
+    def _execute_permitted(
+        registry: Any,
+        tool_context: Any,
+        calls: Sequence[tuple[str, dict[str, Any]]],
+        *,
+        mode: str,
+        identity: str | None,
+    ) -> list[dict[str, Any]]:
+        """Run only the calls ``tool_policy`` allows, in order (S2, D12).
+
+        A refused call is never executed: it is logged (tool name and reason only,
+        never arguments or customer text) and the model receives a refusal result.
+        No turn is in an ``order`` workflow before engine v2 (later stages).
+        """
+        results: list[dict[str, Any]] = []
+        for name, arguments in calls:
+            decision = tool_policy.decide(name, workflow=None, mode=mode, identity=identity)
+            if not decision.allowed:
+                logger.warning(
+                    "TOOL REFUSED tenant=%s tool=%s reason=%s mode=%s",
+                    getattr(tool_context, "tenant_id", None),
+                    str(name)[:64],
+                    decision.reason,
+                    mode,
+                )
+                results.append(
+                    {"tool": name, "ok": False, "error": tool_policy.REFUSAL_TEXT,
+                     "refused": decision.reason}
+                )
+                continue
+            results.extend(_tools.execute_tool_calls(registry, tool_context, [(name, arguments)]))
+        return results
+
+    @staticmethod
     def _history(turns: Sequence[ConversationTurn]) -> tuple[ConversationTurn, ...]:
         cleaned: list[ConversationTurn] = []
         for turn in turns[-MAX_HISTORY_TURNS:]:
@@ -433,6 +472,10 @@ class BotResponseEngine:
             text = turn.text.strip()
             if text:
                 cleaned.append(ConversationTurn(turn.role, text[:MAX_HISTORY_TURN_LENGTH]))
+        # Total character cap: drop the oldest turns first, always keep the newest.
+        total = sum(len(turn.text) for turn in cleaned)
+        while len(cleaned) > 1 and total > MAX_HISTORY_CHARS:
+            total -= len(cleaned.pop(0).text)
         return tuple(cleaned)
 
     @staticmethod
@@ -661,7 +704,13 @@ class BotResponseEngine:
                 break
 
             tool_call_rounds += 1
-            results = _tools.execute_tool_calls(registry, tool_context, calls)
+            results = self._execute_permitted(
+                registry,
+                tool_context,
+                calls,
+                mode="playground" if safe_test_mode else "live",
+                identity=verified_customer_wa_id or None,
+            )
             for entry in results:
                 if entry.get("tool") == "request_staff_handover":
                     if entry.get("ok") and isinstance(entry.get("data"), dict):

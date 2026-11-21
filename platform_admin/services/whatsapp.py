@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from saas.bot import MAX_HISTORY_TURNS
 from saas.db import connect
 from saas.tenant_context import tenant_transaction
 
@@ -362,7 +363,8 @@ def save_conversation(
             on conflict (tenant_id, customer_key) do update
             set history = excluded.history, updated_at = now()
             """,
-            (customer_key, Jsonb(history[-8:])),
+            # Store the same window the model receives (S2, D7): 12 turns.
+            (customer_key, Jsonb(history[-MAX_HISTORY_TURNS:])),
         )
 
 

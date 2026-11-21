@@ -26,6 +26,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import variant_resolver
 from .tenant_context import tenant_transaction
 
 MONEY = Decimal("0.01")
@@ -578,16 +579,12 @@ def _match_product(
 
 
 def _weight_of(variant: Mapping[str, Any]) -> str | None:
-    attributes = variant.get("attributes")
-    if not isinstance(attributes, Mapping):
-        return None
-    raw = attributes.get("weight_kg")
-    if raw is None:
-        return None
-    try:
-        return str(int(Decimal(str(raw))))
-    except (InvalidOperation, TypeError, ValueError):
-        return str(raw)
+    """The variant's size as text ("2", "1.5"), read by the shared resolver (S2, D11).
+
+    Same reader as order pricing: ``attributes.weight_kg`` first, then the size
+    written in the variant name ("1 kg").
+    """
+    return variant_resolver.size_label(variant_resolver.variant_size_kg(variant))
 
 
 def _match_variant(
