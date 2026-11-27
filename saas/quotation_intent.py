@@ -379,10 +379,29 @@ def mentions_unknown_item(text: str) -> bool:
     stripped = _QUOTE_RE.sub(" ", text or "")
     stripped = re.sub(
         r"\b(?:hi|hello|hey|please|pls|kindly|can|could|would|i|me|my|you|we|us|get|"
-        r"give|send|want|need|like|to|for|a|an|the|some|of|and|is|it|do|have|make|"
-        r"prepare|request|new|habari|tafadhali|naomba)\b",
+        r"give|send|want|wanted|need|needed|like|to|for|a|an|the|some|of|and|is|it|do|"
+        r"have|make|prepare|request|new|habari|tafadhali|naomba)\b",
+        " ",
+        stripped,
+        flags=re.I,
+    )
+    # Audit fix D4: follow-up fragments ("Just one, get me a quote", "3 such cakes") are
+    # counts and references to the request already discussed, not unknown products.
+    stripped = re.sub(
+        r"\b(?:just|only|such|same|those|these|them|that|this|again|another|more|"
+        r"each|cakes?|items?|pieces?|ones?|actually|thanks|thank|ok|okay|yes|now|also|"
+        + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")\b",
         " ",
         stripped,
         flags=re.I,
     )
     return len(re.findall(r"[A-Za-z]{3,}", stripped)) > 0
+
+
+def is_fragment(text: str) -> bool:
+    """True when ``text`` names nothing beyond counts, references and request words.
+
+    Used to drop "unlisted" entries that are really fragments of a follow-up message, so
+    "Just one, get me a quote" is never handed to staff as a product (Audit fix D4).
+    """
+    return not mentions_unknown_item(text)

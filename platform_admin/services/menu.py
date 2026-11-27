@@ -1234,7 +1234,7 @@ def _request_quote(ctx: MenuContext) -> MenuReply:
             "our team will help."
         )
     try:
-        quotation_service.start_brief(
+        started = quotation_service.start_brief(
             ctx.settings, ctx.tenant_id, str(ctx.conversation["id"]), ctx.wa_id
         )
     except Exception:  # noqa: BLE001 - a storage failure must not look like success
@@ -1243,12 +1243,26 @@ def _request_quote(ctx: MenuContext) -> MenuReply:
             "I couldn't start a quotation just now. Please reply STAFF and our team "
             "will help."
         )
-    text = (
-        "Sure — tell me what you'd like a quotation for. Include the item, the size "
-        "or option, and how many. For example: 2 vanilla cakes, 2kg each.\n\n"
-        "You can also just describe it in your own words; I'll ask if anything is "
-        "missing. The price comes from our saved catalogue."
-    )
+    if isinstance(started, dict) and started.get("resumed") is True:
+        # Audit fix D9: the open request is kept; say what we already have.
+        items = [i for i in ((started.get("brief") or {}).get("items") or [])
+                 if isinstance(i, dict) and i.get("product_name")]
+        summary = ", ".join(
+            f"{i['quantity']} x {i['product_name']}" if i.get("quantity")
+            else str(i["product_name"])
+            for i in items[:10]
+        )
+        text = (
+            f"Your quotation request is still open ({summary}). Tell me anything you'd "
+            "like to add or change, or answer my last question, and I'll prepare it."
+        )
+    else:
+        text = (
+            "Sure — tell me what you'd like a quotation for. Include the item, the size "
+            "or option, and how many. For example: 2 vanilla cakes, 2kg each.\n\n"
+            "You can also just describe it in your own words; I'll ask if anything is "
+            "missing. The price comes from our saved catalogue."
+        )
     return _buttons(
         text,
         [

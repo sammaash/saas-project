@@ -136,3 +136,47 @@ def correction_quantity(text: str) -> int | None:
         if match:
             return count_value(match.group(1))
     return None
+
+
+# Quotation audit fixes (defects D2-D10) -------------------------------------------------------------
+#: Wording that marks a message as replacing part of the open request (D2, D8).
+_CORRECTION_WORDS_RE = re.compile(
+    r"\b(?:change|switch|actually|instead|make\s+it|make\s+that|rather|not\s+that|"
+    r"no[,.]?\s+(?:i\s+meant|i\s+want|make)|i\s+meant)\b",
+    re.I,
+)
+#: A message that is only a number ("1", "two"): the answer to whatever was just asked.
+_BARE_NUMBER_RE = re.compile(
+    r"^\s*(?:option\s+|number\s+|no\.?\s*)?(\d{1,4}|" + _alternation(_COUNT_WORDS)
+    + r")\s*[.!]?\s*$",
+    re.I,
+)
+_REFERENTIAL_QUANTITY_RES = (
+    re.compile(r"\b(?:just|only)\s+" + _COUNT_TOKEN + r"\b(?!\s*" + _UNIT + r"\b)", re.I),
+    re.compile(
+        r"\b" + _COUNT_TOKEN + r"\s+(?:more\s+)?(?:such|of\s+(?:those|these|them|the\s+same)|"
+        r"(?:of\s+)?the\s+same)\b",
+        re.I,
+    ),
+)
+
+
+def is_correction(text: str) -> bool:
+    """True when the customer is replacing something ("actually make it Vanilla")."""
+    return bool(_CORRECTION_WORDS_RE.search(text or ""))
+
+
+def bare_number(text: str) -> int | None:
+    """The number when the whole message is just a number ("1", "option 2", "two")."""
+    match = _BARE_NUMBER_RE.match(text or "")
+    return count_value(match.group(1)) if match else None
+
+
+def referential_quantity(text: str) -> int | None:
+    """A count that refers to the open request: "just one" -> 1, "3 such cakes" -> 3."""
+    value = strip_sizes(text)
+    for pattern in _REFERENTIAL_QUANTITY_RES:
+        match = pattern.search(value)
+        if match:
+            return count_value(match.group(1))
+    return None

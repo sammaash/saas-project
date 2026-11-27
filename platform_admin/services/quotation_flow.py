@@ -24,9 +24,11 @@ Nothing here states a price that ``create_quotation`` did not compute.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from saas import interpretation
 from saas import quotation_intent as intent
 from saas import quotations as saas_quotations
 from saas.catalogue import CatalogueService
@@ -41,6 +43,11 @@ UNAVAILABLE_TEXT = (
     "or reply \"talk to a person\" and a member of our team will help."
 )
 NAME_QUESTION = "Thanks. What name should I put on the quotation?"
+#: Wording that adds to the request rather than replacing ("actually add a Vanilla too").
+#: A bare "and" is deliberately absent: "and" joining two products already yields two
+#: matched items (no replacement is attempted), while "make it Vanilla and 2 kg" adds a
+#: detail to the one replacement product [review R1-F1].
+_ADDITION_RE = re.compile(r"\b(?:add|also|too|plus|as\s+well|another|extra)\b", re.I)
 
 
 @dataclass
@@ -73,14 +80,35 @@ def _variants_text(product: Mapping[str, Any]) -> str:
     return ", ".join(options[:-1]) + " or " + options[-1]
 
 
+#: Room for the product list in the first question (Audit fix D10). WhatsApp allows 4096
+#: characters per text; the list stops well short of that and says how many it left out.
+_LISTING_BUDGET = 1500
+
+
+def _product_listing(products: Sequence[Mapping[str, Any]]) -> str:
+    """Every active product name (D10); the whole returned text is at most
+    ``_LISTING_BUDGET`` characters, including its prefix and "and N more" suffix
+    [review R1-F2]."""
+    names = [str(p.get("name")) for p in products if p.get("name")]
+
+    def render(count: int) -> str:
+        rest = len(names) - count
+        more = f" and {rest} more" if rest else ""
+        return " We can quote for: " + ", ".join(names[:count]) + more + "."
+
+    count = len(names)
+    while count > 0 and len(render(count)) > _LISTING_BUDGET:
+        count -= 1
+    return render(count) if count else ""
+
+
 def _question(evaluation: Mapping[str, Any], items: Sequence[Mapping[str, Any]],
               products: Sequence[Mapping[str, Any]]) -> str:
     """One deterministic question for the FIRST missing detail."""
     missing = list(evaluation.get("missing") or [])
     if not missing or missing == ["items"]:
-        names = [str(p.get("name")) for p in products[:8] if p.get("name")]
-        listing = (" We can quote for: " + ", ".join(names) + ".") if names else ""
-        return "Which product would you like a quotation for, and how many?" + listing
+        return ("Which product would you like a quotation for, and how many?"
+                + _product_listing(products))
     first = missing[0]
     index = int(first.split("[", 1)[1].split("]", 1)[0]) - 1 if "[" in first else 0
     resolved = (evaluation.get("items") or [])[index] if index < len(
@@ -129,6 +157,117 @@ def _apply_loose(items: list[dict[str, Any]], evaluation: Mapping[str, Any] | No
     return applied
 
 
+def _pending(evaluation: Mapping[str, Any] | None) -> tuple[int, str] | None:
+    """``(item index, field)`` of the question the customer was last asked, if any.
+
+    ``_question`` always asks about the first missing detail, so that is the pending one.
+    """
+    missing = list((evaluation or {}).get("missing") or [])
+    if not missing or "[" not in missing[0]:
+        return None
+    first = missing[0]
+    try:
+        index = int(first.split("[", 1)[1].split("]", 1)[0]) - 1
+    except ValueError:
+        return None
+    return index, first.rsplit(".", 1)[-1]
+
+
+def _answer_pending_option(items: list[dict[str, Any]], evaluation: Mapping[str, Any] | None,
+                           number: int | None) -> bool:
+    """Audit fix D3: a bare number answers a pending size/option question.
+
+    After "Which option of Black Forest would you like: 1 kg, 2 kg or 3 kg?", the reply
+    "1" means that size (or the first option), not "change the quantity to 1". A number
+    that equals one of the offered sizes selects it; otherwise a number within the list
+    selects that position. Anything else is left to the quantity reading as before.
+    """
+    pending = _pending(evaluation)
+    if number is None or pending is None:
+        return False
+    index, field_name = pending
+    if field_name not in ("weight_kg", "variant") or not 0 <= index < len(items):
+        return False
+    resolved = list((evaluation or {}).get("items") or [])
+    product = (resolved[index] or {}).get("product") if index < len(resolved) else None
+    variants = [v for v in (product or {}).get("variants") or [] if isinstance(v, dict)]
+    if not variants:
+        return False
+    sizes = [saas_quotations._weight_of(v) for v in variants]  # noqa: SLF001
+    item = items[index]
+    if str(number) in sizes:
+        item["weight_kg"] = number
+        item["variant"] = None
+        return True
+    if 1 <= number <= len(variants):
+        size = sizes[number - 1]
+        if size is not None and size.isdigit():
+            item["weight_kg"] = int(size)
+            item["variant"] = None
+        else:
+            item["weight_kg"] = None
+            item["variant"] = str(variants[number - 1].get("name") or "")[:100] or None
+        return item["weight_kg"] is not None or item["variant"] is not None
+    return False
+
+
+def _replace_single(items: list[dict[str, Any]], new: Mapping[str, Any]) -> bool:
+    """Audit fix D2: "Actually make it Vanilla" replaces the one open item.
+
+    Only when exactly one item is open and the customer names exactly one different
+    product in correction wording. The quantity and size carry over unless the message
+    states new ones; a chosen option does not (it belonged to the old product).
+    """
+    if len(items) != 1:
+        return False
+    old = items[0]
+    if (saas_quotations._normalize_name(old.get("product_name"))  # noqa: SLF001
+            == saas_quotations._normalize_name(new.get("product_name"))):  # noqa: SLF001
+        return False
+    items[0] = {
+        "product_name": new.get("product_name"),
+        "weight_kg": new.get("weight_kg") if new.get("weight_kg") is not None
+        else old.get("weight_kg"),
+        "quantity": new.get("quantity") if new.get("quantity") is not None
+        else old.get("quantity"),
+        "variant": new.get("variant"),
+    }
+    return True
+
+
+def _recent_items(settings: Settings, tenant_id: str,
+                  conversation_id: str) -> list[dict[str, Any]]:
+    """Items of this conversation's latest request if it was recent (Audit fix D4).
+
+    Used only when the customer refers back to it ("3 such cakes") with no request open.
+    """
+    try:
+        row = saas_quotations.load_brief(settings, tenant_id, conversation_id)
+    except Exception as error:  # noqa: BLE001 - context is optional
+        logger.info("Quotation request lookup failed tenant=%s error=%s",
+                    tenant_id, type(error).__name__)
+        return []
+    if not row:
+        return []
+    updated = row.get("updated_at")
+    if updated is not None:
+        from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+
+        if updated < datetime.now(timezone.utc) - timedelta(
+                hours=saas_quotations.BRIEF_MAX_AGE_HOURS):
+            return []
+    items = []
+    for item in (row.get("brief") or {}).get("items") or []:
+        if isinstance(item, dict) and item.get("product_name") and (
+                item.get("weight_kg") is not None or item.get("variant")
+                or item.get("quantity") is not None):
+            items.append({"product_name": item.get("product_name"),
+                          "weight_kg": item.get("weight_kg"),
+                          "quantity": item.get("quantity"),
+                          "variant": item.get("variant")})
+    return items
+
+
 def _merge(items: list[dict[str, Any]], found: Sequence[Mapping[str, Any]]) -> None:
     for new in found:
         target = next(
@@ -146,13 +285,29 @@ def _merge(items: list[dict[str, Any]], found: Sequence[Mapping[str, Any]]) -> N
                 target[key] = new.get(key)
 
 
-def _extract(provider: Any, text: str, products: Sequence[Mapping[str, Any]]):
-    """The single strict extraction call. None on any failure (then we ask)."""
+def _extract(provider: Any, text: str, products: Sequence[Mapping[str, Any]],
+             open_items: Sequence[Mapping[str, Any]] = ()):
+    """The single strict extraction call. None on any failure (then we ask).
+
+    Audit fix D4: the request collected so far is given to the call, so a follow-up such
+    as "just one" or "such cakes" can be read against it instead of in isolation.
+    """
     if provider is None:
         return None
+    import json  # noqa: PLC0415
+
     from saas.bot import BotResponseRequest  # noqa: PLC0415
 
     system = intent.extraction_prompt(products)
+    if open_items:
+        summary = [{k: i.get(k) for k in ("product_name", "weight_kg", "quantity", "variant")}
+                   for i in open_items[:10]]
+        system += (
+            "\nOPEN REQUEST (already collected in this conversation; a follow-up message "
+            "usually changes or completes it, and words such as 'one', 'such' or 'them' "
+            "refer to it -- never put them in \"unlisted\"): "
+            + json.dumps(summary, ensure_ascii=True)
+        )
     try:
         raw = provider.generate(
             BotResponseRequest(
@@ -223,26 +378,57 @@ def run(
 
     match = intent.match_items(text, products)
     progressed = False
+
+    # Audit fix D4: "I wanted a quotation of 3 such cakes" with no request open refers to
+    # the request just quoted; start from its items instead of from nothing.
+    if (not items and not match.items
+            and interpretation.referential_quantity(text) is not None):
+        items = _recent_items(settings, tenant_id, conversation_id)
+        if items:
+            try:
+                previous = saas_quotations.evaluate_brief(settings, tenant_id,
+                                                          {"items": items})
+            except saas_quotations.QuotationError:
+                previous = None
+
     if awaiting_name and not match.has_details:
         typed = intent.looks_like_name(text, products)
         if typed:
             typed_name = typed
             progressed = True
+
+    # Audit fix D3: a bare number answers the pending size/option question.
+    if (not match.items and match.loose_weight_kg is None
+            and _answer_pending_option(items, previous, interpretation.bare_number(text))):
+        match.loose_quantity = None
+        progressed = True
+
     if match.items:
-        _merge(items, match.items)
+        # Audit fix D2: a correction naming one new product replaces the open item.
+        if not (len(match.items) == 1 and interpretation.is_correction(text)
+                and not _ADDITION_RE.search(text)
+                and _replace_single(items, match.items[0])):
+            _merge(items, match.items)
         progressed = True
     if _apply_loose(items, previous, weight=match.loose_weight_kg,
                     quantity=match.loose_quantity, each=match.applies_to_each):
         progressed = True
+    # Audit fix D4: "Just one" / "3 such cakes" changes the quantity of the one open item.
+    if (not match.items and match.loose_quantity is None and len(items) == 1):
+        referential = interpretation.referential_quantity(text)
+        if referential is not None:
+            items[0]["quantity"] = referential
+            progressed = True
 
     unlisted: list[str] = []
     if explicit and not match.items and intent.mentions_unknown_item(text):
-        extraction = _extract(provider, text, products)
+        extraction = _extract(provider, text, products, items)
         if extraction is not None:
             if extraction.items:
                 _merge(items, extraction.items)
                 progressed = True
-            unlisted = extraction.unlisted
+            # Audit fix D4: a fragment of the message is never an unlisted product.
+            unlisted = [u for u in extraction.unlisted if not intent.is_fragment(u)]
 
     if not explicit and not progressed:
         # Not about the open request: let the AI answer; the request stays open.
@@ -250,12 +436,22 @@ def run(
 
     if unlisted:
         request = ", ".join(unlisted)[:200]
+        # Audit fix D5: the valid part of the request stays open (resumable) while staff
+        # handle the unlisted part; with nothing valid it is closed as before.
+        resumable = bool(items)
+        missing: list[str] = []
+        if resumable:
+            try:
+                missing = list(saas_quotations.evaluate_brief(
+                    settings, tenant_id, {"items": items}).get("missing") or [])
+            except saas_quotations.QuotationError:
+                missing = ["items"]
         try:
             saas_quotations.save_brief(
                 settings, tenant_id, conversation_id, customer_key,
-                {"items": items + [{"product_name": u} for u in unlisted],
+                {"items": items if resumable else [{"product_name": u} for u in unlisted],
                  **({"customer_name": typed_name} if typed_name else {})},
-                status="handed_over", missing=[],
+                status="collecting" if resumable else "handed_over", missing=missing,
             )
         except Exception as error:  # noqa: BLE001 - the handover itself still happens
             logger.error("Quotation request save failed tenant=%s error=%s",

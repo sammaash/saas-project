@@ -937,7 +937,13 @@ def start_brief(
     conversation_id: str,
     customer_wa_id: str | None,
 ) -> dict[str, Any]:
-    """Start (or restart) a quotation request for this conversation."""
+    """Start a quotation request for this conversation.
+
+    Audit fix D9: an open request (collecting/ready, recent, with at least one item) is
+    kept, never wiped, so typing "Quotation" or tapping the menu option mid-request
+    does not lose what the customer already said. The returned row then carries
+    ``resumed = True``. A finished, stale or empty request is restarted as before.
+    """
     if not conversation_id:
         raise QuotationError("A conversation is required to collect a quotation.")
     from psycopg.types.json import Jsonb  # noqa: PLC0415
@@ -956,6 +962,13 @@ def start_brief(
                   customer_wa_id = coalesce(
                       excluded.customer_wa_id, public.quotation_briefs.customer_wa_id
                   )
+              where not (
+                  public.quotation_briefs.status in ('collecting', 'ready')
+                  and public.quotation_briefs.updated_at
+                      > now() - make_interval(hours => %s)
+                  and jsonb_typeof(public.quotation_briefs.brief -> 'items') = 'array'
+                  and jsonb_array_length(public.quotation_briefs.brief -> 'items') > 0
+              )
             returning id, conversation_id, customer_wa_id, status, brief,
                       missing_fields, created_at, updated_at
             """,
@@ -964,9 +977,22 @@ def start_brief(
                 _text(customer_wa_id, "WhatsApp identity", max_length=200, required=False),
                 Jsonb({"items": []}),
                 ["items"],
+                BRIEF_MAX_AGE_HOURS,
             ),
         )
-        return _brief_row(cursor, cursor.fetchone())
+        row = cursor.fetchone()
+        if row is not None:
+            return {**_brief_row(cursor, row), "resumed": False}
+        cursor.execute(
+            """
+            select id, conversation_id, customer_wa_id, status, brief,
+                   missing_fields, created_at, updated_at
+            from public.quotation_briefs
+            where tenant_id = app.current_tenant_id() and conversation_id = %s
+            """,
+            (str(conversation_id),),
+        )
+        return {**_brief_row(cursor, cursor.fetchone()), "resumed": True}
 
 
 def clear_brief(
