@@ -398,6 +398,27 @@ def mentions_unknown_item(text: str) -> bool:
     return len(re.findall(r"[A-Za-z]{3,}", stripped)) > 0
 
 
+def unmatched_parts(text: str, products: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Clauses of ``text`` that name no catalogue product but do name something.
+
+    Review follow-up F1: "2 Black Forest and a unicorn cake" matches Black Forest, and
+    the "a unicorn cake" clause must not be silently dropped. Clauses are split the same
+    way as :func:`match_items` (commas, "and", "plus", ...); sizes, counts, references and
+    request words alone ("2 kg each", "just one please") are not reported.
+    """
+    names = [_core_tokens(p.get("name")) for p in products if p.get("name")]
+    parts: list[str] = []
+    for segment in _segments(text or ""):
+        normalized = _normalize(segment)
+        if any(tokens and _token_pattern(tokens).search(normalized) for tokens in names):
+            continue
+        if is_delivery_enquiry(segment):
+            continue  # "delivered tomorrow" is about delivery, not a product
+        if mentions_unknown_item(interpretation.strip_sizes(segment)):
+            parts.append(segment.strip()[:200])
+    return parts
+
+
 def is_fragment(text: str) -> bool:
     """True when ``text`` names nothing beyond counts, references and request words.
 

@@ -421,14 +421,26 @@ def run(
             progressed = True
 
     unlisted: list[str] = []
-    if explicit and not match.items and intent.mentions_unknown_item(text):
+    # Review follow-up F1: a message that names catalogue products AND something else
+    # ("2 Black Forest and a unicorn cake") also gets the extraction call, so the unknown
+    # part goes to staff instead of being silently dropped.
+    leftover = intent.unmatched_parts(text, products) if match.items else []
+    if explicit and ((not match.items and intent.mentions_unknown_item(text)) or leftover):
         extraction = _extract(provider, text, products, items)
         if extraction is not None:
-            if extraction.items:
+            if extraction.items and not match.items:
+                # The catalogue matcher already read matched products; its reading wins.
                 _merge(items, extraction.items)
                 progressed = True
             # Audit fix D4: a fragment of the message is never an unlisted product.
             unlisted = [u for u in extraction.unlisted if not intent.is_fragment(u)]
+            if match.items:
+                # F1: only names taken from the unmatched part of the message count.
+                leftover_words = {w.lower() for part in leftover
+                                  for w in re.findall(r"[A-Za-z]{3,}", part)}
+                unlisted = [u for u in unlisted
+                            if leftover_words & {w.lower() for w in
+                                                 re.findall(r"[A-Za-z]{3,}", u)}]
 
     if not explicit and not progressed:
         # Not about the open request: let the AI answer; the request stays open.
@@ -440,10 +452,11 @@ def run(
         # handle the unlisted part; with nothing valid it is closed as before.
         resumable = bool(items)
         missing: list[str] = []
+        pending: Mapping[str, Any] | None = None
         if resumable:
             try:
-                missing = list(saas_quotations.evaluate_brief(
-                    settings, tenant_id, {"items": items}).get("missing") or [])
+                pending = saas_quotations.evaluate_brief(settings, tenant_id, {"items": items})
+                missing = list(pending.get("missing") or [])
             except saas_quotations.QuotationError:
                 missing = ["items"]
         try:
@@ -456,11 +469,25 @@ def run(
         except Exception as error:  # noqa: BLE001 - the handover itself still happens
             logger.error("Quotation request save failed tenant=%s error=%s",
                          tenant_id, type(error).__name__)
-        return FlowStep(
-            "staff",
+        text_out = (
             f"Thanks. {request[:1].upper() + request[1:]} is not on our standard menu, "
             "so I've passed your request to our team. They will confirm the price with "
-            "you here.",
+            "you here."
+        )
+        if resumable:
+            # F1/D5: say what is kept, and ask for whatever it still needs.
+            kept = ", ".join(
+                (f"{i['quantity']} x {i['product_name']}" if i.get("quantity")
+                 else str(i.get("product_name")))
+                for i in items[:10] if i.get("product_name"))
+            text_out += f" I've kept the rest of your request ({kept})."
+            if pending is not None and missing:
+                text_out += " " + _question(pending, items, products)
+            elif pending is not None:
+                text_out += " Send \"quote please\" when you'd like its quotation."
+        return FlowStep(
+            "staff",
+            text_out,
             reason="unlisted_product",
             request=f"Quotation request: {request}",
             details={"source": "quotation_flow", "items": items, "unlisted": unlisted},

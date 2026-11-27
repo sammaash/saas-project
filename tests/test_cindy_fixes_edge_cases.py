@@ -116,6 +116,55 @@ class D9_MenuSaysTheRequestIsKept(CindyCatalogueBase):
         self.assertIn("Black Forest", self._last_text())
 
 
+class F1_MixedKnownAndUnknown(CindyCatalogueBase):
+    """Review follow-up F1: a known product plus an unknown one in the same message."""
+
+    def _extraction_calls(self):
+        return len(self.provider.requests)
+
+    def test_unknown_part_goes_to_staff_and_known_part_continues(self):
+        self.provider.replies = [json.dumps({"items": [], "unlisted": ["unicorn cake"]})]
+        self._post("Quote for 2 Black Forest and a unicorn cake")
+        self.assertEqual(self._staff_unlisted(), 1)
+        self.assertEqual(self._brief()[0], "collecting")
+        self.assertEqual([(i.get("product_name"), i.get("quantity")) for i in self._items()],
+                         [("Black Forest", 2)])
+        self.assertIn("I've kept the rest of your request", self._last_text())
+        self.assertRegex(self._last_text(), r"(?:size|option).*Black Forest")
+        self._post("2 kg")
+        self.assertEqual(len(self._quotations()), 1, f"bot said {self._texts()}")
+
+    def test_complete_known_part_is_quoted_on_request(self):
+        self.provider.replies = [json.dumps({"items": [], "unlisted": ["unicorn cake"]})]
+        self._post("Quote for 2 Black Forest 2 kg and a unicorn cake")
+        self.assertEqual(self._staff_unlisted(), 1)
+        self.assertIn("quote please", self._last_text())
+        self._post("quote please")
+        self.assertEqual(len(self._quotations()), 1, f"bot said {self._texts()}")
+
+    def test_model_names_outside_the_unmatched_part_are_ignored(self):
+        self.provider.replies = [json.dumps({"items": [], "unlisted": ["wedding tower"]})]
+        self._post("Quote for 2 Black Forest and a unicorn cake")
+        self.assertEqual(self._staff_unlisted(), 0)
+        self.assertEqual([i.get("product_name") for i in self._items()], ["Black Forest"])
+
+    def test_model_item_guesses_never_override_the_catalogue_match(self):
+        self.provider.replies = [json.dumps({"items": [{"product_name": "Vanilla",
+                                                         "quantity": 9}],
+                                             "unlisted": ["unicorn cake"]})]
+        self._post("Quote for 2 Black Forest and a unicorn cake")
+        self.assertEqual([(i.get("product_name"), i.get("quantity")) for i in self._items()],
+                         [("Black Forest", 2)])
+
+    def test_sizes_counts_and_delivery_clauses_make_no_extraction_call(self):
+        for text in ("Quote for 2 Black Forest, 2 kg each please",
+                     "Quote for 2 Black Forest, delivered tomorrow",
+                     "Quote for 2 Vanilla and 1 Chocolate"):
+            self._post(text)
+        self.assertEqual(self._extraction_calls(), 0)
+        self.assertEqual(self._staff_unlisted(), 0)
+
+
 class PureHelpers(unittest.TestCase):
     def test_fragments(self):
         for text in ("Just one, get me a quote", "3 such cakes", "the same again please"):
@@ -137,6 +186,19 @@ class PureHelpers(unittest.TestCase):
         self.assertTrue(interpretation.is_correction("Actually make it Vanilla"))
         self.assertTrue(interpretation.is_correction("No, I meant chocolate"))
         self.assertFalse(interpretation.is_correction("2 vanilla cakes please"))
+
+    def test_unmatched_parts(self):
+        products = [{"name": n} for n in ("Black Forest", "Vanilla", "Chocolate")]
+        cases = {
+            "Quote for 2 Black Forest and a unicorn cake": ["a unicorn cake"],
+            "Quote for 2 Black Forest, 2 kg each": [],
+            "quote 2 Vanilla and 1 Chocolate": [],
+            "quote 2 Black Forest, just one please": [],
+            "quote 2 Black Forest, delivered tomorrow": [],
+            "quote 2 Black Forest for my daughter's birthday": [],
+        }
+        for text, expected in cases.items():
+            self.assertEqual(intent.unmatched_parts(text, products), expected, text)
 
     def test_product_listing_stays_within_budget(self):
         products = [{"name": f"Product number {n:03d} with a long name"} for n in range(300)]
