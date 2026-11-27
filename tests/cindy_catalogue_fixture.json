@@ -1,0 +1,386 @@
+{
+ "product_columns": [
+  "id",
+  "tenant_id",
+  "name",
+  "name_normalized",
+  "description",
+  "category",
+  "is_active",
+  "sort_order",
+  "attributes",
+  "created_at",
+  "updated_at"
+ ],
+ "variant_columns": [
+  "id",
+  "tenant_id",
+  "product_id",
+  "code",
+  "name",
+  "price",
+  "attributes",
+  "is_active",
+  "sort_order",
+  "created_at",
+  "updated_at",
+  "sku",
+  "availability",
+  "stock_quantity",
+  "reorder_level"
+ ],
+ "products": [
+  {
+   "name": "Black Forest",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-BLACK-FOREST-1KG",
+     "price": "3100.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-BLACK-FOREST-2KG",
+     "price": "4700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-BLACK-FOREST-3KG",
+     "price": "6000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Blueberry",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-BLUEBERRY-1KG",
+     "price": "2700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-BLUEBERRY-2KG",
+     "price": "4550.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-BLUEBERRY-3KG",
+     "price": "5800.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Caramel",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-CARAMEL-1KG",
+     "price": "3100.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-CARAMEL-2KG",
+     "price": "4700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-CARAMEL-3KG",
+     "price": "6000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Carrot",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-CARROT-1KG",
+     "price": "2500.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-CARROT-2KG",
+     "price": "4200.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-CARROT-3KG",
+     "price": "5600.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Chocolate",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-CHOCOLATE-1KG",
+     "price": "3100.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-CHOCOLATE-2KG",
+     "price": "4700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-CHOCOLATE-3KG",
+     "price": "6000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Lemon",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-LEMON-1KG",
+     "price": "2500.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-LEMON-2KG",
+     "price": "4200.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-LEMON-3KG",
+     "price": "5600.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Orange",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-ORANGE-1KG",
+     "price": "2500.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-ORANGE-2KG",
+     "price": "4200.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-ORANGE-3KG",
+     "price": "5600.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Rainbow",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-RAINBOW-1KG",
+     "price": "3750.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-RAINBOW-2KG",
+     "price": "5000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-RAINBOW-3KG",
+     "price": "6700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Red Velvet",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-RED-VELVET-1KG",
+     "price": "3100.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-RED-VELVET-2KG",
+     "price": "4700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-RED-VELVET-3KG",
+     "price": "6000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "Vanilla",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-VANILLA-1KG",
+     "price": "2500.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-VANILLA-2KG",
+     "price": "4200.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-VANILLA-3KG",
+     "price": "5600.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  },
+  {
+   "name": "White Forest",
+   "is_active": true,
+   "category": "standard-cake",
+   "has_description": false,
+   "variants": [
+    {
+     "name": "1 kg",
+     "code": "CINDY-WHITE-FOREST-1KG",
+     "price": "3100.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "2 kg",
+     "code": "CINDY-WHITE-FOREST-2KG",
+     "price": "4700.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    },
+    {
+     "name": "3 kg",
+     "code": "CINDY-WHITE-FOREST-3KG",
+     "price": "6000.00",
+     "is_active": true,
+     "availability": "MADE_TO_ORDER",
+     "attributes": {}
+    }
+   ]
+  }
+ ]
+}
