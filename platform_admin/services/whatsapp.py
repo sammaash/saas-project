@@ -363,7 +363,9 @@ def save_conversation(
             on conflict (tenant_id, customer_key) do update
             set history = excluded.history, updated_at = now()
             """,
-            # Store the same window the model receives (S2, D7): 12 turns.
+            # Store the same number of turns the model receives (S2, D7): 12. Each turn is
+            # already cut to 1,000 characters by the callers; the model's 6,000-character
+            # total cap is applied when the history is read (BotResponseEngine._history).
             (customer_key, Jsonb(history[-MAX_HISTORY_TURNS:])),
         )
 
